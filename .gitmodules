@@ -1,0 +1,6 @@
+[submodule "robot_usds"]
+	path = robot_usds
+	url = git@github.com:fiveages-sim/robot_usds.git
+[submodule "environment/fiveages_env"]
+	path = environment/fiveages_env
+	url = git@github.com:fiveages-sim/fiveages-env-usds.git
