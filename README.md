@@ -14,7 +14,7 @@ cd FaSim-Isaac
 ### 2. 运行初始化脚本
 
 ```bash
-bash init_repo.sh
+./init_repo.sh
 ```
 
 运行后会提示选择初始化模式：
