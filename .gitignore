@@ -1,0 +1,30 @@
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Isaac Sim / Omniverse cache
+.nvidia-omniverse/
+_cache/
+.usd_cache/
+*.usd_bak
+*.usda_bak
+
+# Temporary files
+*.tmp
+*.temp
+*.log
