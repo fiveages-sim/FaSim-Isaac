@@ -1,5 +1,5 @@
-[submodule "robot_usds"]
-	path = robot_usds
+[submodule "robots"]
+	path = robots
 	url = git@github.com:fiveages-sim/robot_usds.git
 [submodule "environment/fiveages_env"]
 	path = environment/fiveages_env
