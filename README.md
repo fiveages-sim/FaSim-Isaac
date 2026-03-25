@@ -34,10 +34,11 @@ FaSim-Isaac/
 ├── submodules_visibility.conf    # 嵌套子模块 public / private 配置
 ├── robot_usds/                   # 机器人 USD 资产（Git 子模块）
 └── environment/
-    └── fiveages_env/             # 场景 USD 资产（Git 子模块）
+    ├── fiveages_env/             # 场景 USD 资产（Git 子模块）
+    └── fa-project-usd/           # Fa Project USD 资产（Git 子模块）
 ```
 
-`robot_usds` 内按类型分子目录：人形、机械臂、夹爪、灵巧手、移动底盘、移动机械臂、传感器等；`fiveages_env` 内为场景与任务相关资产。具体机型与文件名可直接在对应目录中查看。
+`robot_usds` 内按类型分子目录：人形、机械臂、夹爪、灵巧手、移动底盘、移动机械臂、传感器等；`environment` 下为场景与项目相关 USD。具体机型与文件名可直接在对应目录中查看。
 
 ---
 

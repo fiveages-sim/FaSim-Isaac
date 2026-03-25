@@ -60,9 +60,10 @@ fi
 
 trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:space:]]}"}"; }
 
-# 从配置文件加载嵌套子模块列表
+# 从配置文件加载嵌套子模块列表（父目录 “.” 表示顶层子模块）
 NESTED_PUBLIC_SPECS=()
 NESTED_PRIVATE_SPECS=()
+TOP_LEVEL_PRIVATE_PATHS=()
 while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     line="${line#"${line%%[![:space:]]*}"}"
@@ -76,7 +77,12 @@ while IFS= read -r line || [ -n "$line" ]; do
     spec="${parent_dir}:${gitmodules_file}:${relative_path}"
     case "$visibility" in
         public)  NESTED_PUBLIC_SPECS+=("$spec") ;;
-        private) NESTED_PRIVATE_SPECS+=("$spec") ;;
+        private)
+            NESTED_PRIVATE_SPECS+=("$spec")
+            if [ "$parent_dir" = "." ]; then
+                TOP_LEVEL_PRIVATE_PATHS+=("$relative_path")
+            fi
+            ;;
         *)       print_warn "未知可见性 '$visibility'，跳过: $parent_dir/$relative_path" ;;
     esac
 done < "$VISIBILITY_CONF"
@@ -87,9 +93,36 @@ echo ""
 print_info "同步子模块配置..."
 git submodule sync
 
-# 初始化并拉取所有第一层子模块
+# 初始化第一层子模块（public 模式下不拉取配置为 private 的顶层子模块）
 print_info "初始化子模块..."
-git submodule update --init
+all_top_paths=$(git config --file .gitmodules --get-regexp path 2>/dev/null | awk '{print $2}')
+top_paths_to_init=()
+for p in $all_top_paths; do
+    if [ "$INIT_MODE" = "private" ]; then
+        top_paths_to_init+=("$p")
+        continue
+    fi
+    skip=false
+    for priv in "${TOP_LEVEL_PRIVATE_PATHS[@]}"; do
+        if [ "$p" = "$priv" ]; then
+            skip=true
+            break
+        fi
+    done
+    if [ "$skip" = false ]; then
+        top_paths_to_init+=("$p")
+    fi
+done
+if [ ${#top_paths_to_init[@]} -gt 0 ]; then
+    git submodule update --init "${top_paths_to_init[@]}"
+else
+    print_warn ".gitmodules 中无待初始化的顶层子模块路径"
+fi
+if [ "$INIT_MODE" = "public" ] && [ ${#TOP_LEVEL_PRIVATE_PATHS[@]} -gt 0 ]; then
+    for priv in "${TOP_LEVEL_PRIVATE_PATHS[@]}"; do
+        print_info "已跳过 private 顶层子模块（可选用模式 2 拉取）: $priv"
+    done
+fi
 
 # 初始化嵌套子模块（根据 submodules_visibility.conf）
 print_info "初始化嵌套子模块（根据配置文件）..."

@@ -4,3 +4,6 @@
 [submodule "environment/fiveages_env"]
 	path = environment/fiveages_env
 	url = git@github.com:fiveages-sim/fiveages-env-usds.git
+[submodule "environment/fa-project-usd"]
+	path = environment/fa-project-usd
+	url = git@github.com:fiveages-sim/fa-project-usd.git
