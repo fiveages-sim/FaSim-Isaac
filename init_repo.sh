@@ -281,6 +281,13 @@ else
     print_info "开始克隆: $ROS_WS_REPO_SSH"
     if git clone "$ROS_WS_REPO_SSH" "$ROS_WS_DIR"; then
         print_info "✓ 克隆完成: $ROS_WS_DIR"
+        print_info "初始化子模块（git submodule update --init --recursive）..."
+        if (cd "$ROS_WS_DIR" && git submodule update --init --recursive); then
+            print_info "✓ IsaacSim-ros_workspaces 子模块初始化完成"
+        else
+            print_warn "子模块初始化失败，请手动执行："
+            print_warn "  (cd \"$ROS_WS_DIR\" && git submodule update --init --recursive)"
+        fi
     else
         print_warn "克隆失败。请确认你已配置 GitHub SSH key 且具备访问权限。"
         print_warn "你也可以改用 HTTPS："
@@ -369,15 +376,7 @@ if [ ! -d "$JAZZY_DST" ]; then
 else
     cd "$JAZZY_DST"
 
-    # 1. 初始化子模块
-    print_info "步骤 1/2：初始化子模块（git submodule update --init --recursive）..."
-    if git submodule update --init --recursive; then
-        print_info "✓ 子模块初始化完成"
-    else
-        print_warn "子模块初始化失败，继续后续步骤（可能影响构建）"
-    fi
-
-    # 2. 初始化 rosdep（首次使用时需要 init）
+    # 1. 初始化 rosdep（首次使用时需要 init）
     if ! [ -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
         print_info "首次运行 rosdep，执行 rosdep init..."
         sudo rosdep init 2>/dev/null || print_warn "rosdep init 失败（可能已初始化过，忽略）"
@@ -385,16 +384,16 @@ else
     print_info "更新 rosdep 数据库..."
     rosdep update || print_warn "rosdep update 失败，继续..."
 
-    # 3. 安装 ROS 依赖
-    print_info "步骤 2/2：安装 ROS 依赖（rosdep install -i --from-path src --rosdistro jazzy -y）..."
+    # 2. 安装 ROS 依赖
+    print_info "步骤 1/2：安装 ROS 依赖（rosdep install -i --from-path src --rosdistro jazzy -y）..."
     if rosdep install -i --from-path src --rosdistro jazzy -y; then
         print_info "✓ ROS 依赖安装完成"
     else
         print_warn "rosdep install 失败，请检查 src/ 目录是否存在或网络是否正常"
     fi
 
-    # 4. 构建工作空间
-    print_info "步骤 3/3：构建工作空间（colcon build）..."
+    # 3. 构建工作空间
+    print_info "步骤 2/2：构建工作空间（colcon build）..."
     if colcon build; then
         print_info "✓ colcon build 完成"
     else
