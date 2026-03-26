@@ -261,3 +261,176 @@ git submodule status
 echo ""
 print_info "如需更新子模块到最新提交，可以运行："
 print_info "  git submodule update --remote"
+
+echo ""
+print_info "=========================================="
+print_info "继续克隆 IsaacSim ROS workspaces..."
+print_info "=========================================="
+
+ROS_WS_REPO_SSH="git@github.com:isaac-sim/IsaacSim-ros_workspaces.git"
+ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
+
+if [ -d "$ROS_WS_DIR/.git" ]; then
+    print_info "已存在仓库目录，跳过克隆: $ROS_WS_DIR"
+    print_info "如需更新可执行："
+    print_info "  (cd \"$ROS_WS_DIR\" && git pull --ff-only)"
+elif [ -e "$ROS_WS_DIR" ]; then
+    print_warn "目标路径已存在但不是 git 仓库，跳过克隆: $ROS_WS_DIR"
+    print_warn "请手动清理/改名后重新运行脚本，或自行克隆到其他目录。"
+else
+    print_info "开始克隆: $ROS_WS_REPO_SSH"
+    if git clone "$ROS_WS_REPO_SSH" "$ROS_WS_DIR"; then
+        print_info "✓ 克隆完成: $ROS_WS_DIR"
+    else
+        print_warn "克隆失败。请确认你已配置 GitHub SSH key 且具备访问权限。"
+        print_warn "你也可以改用 HTTPS："
+        print_warn "  git clone https://github.com/isaac-sim/IsaacSim-ros_workspaces.git \"$ROS_WS_DIR\""
+    fi
+fi
+
+echo ""
+print_info "=========================================="
+print_info "迁移 jazzy_ws 到 ~/libraries/isaac_jazzy_ws..."
+print_info "=========================================="
+
+JAZZY_SRC="$ROS_WS_DIR/jazzy_ws"
+JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
+
+if [ ! -d "$JAZZY_SRC" ]; then
+    print_warn "未找到源目录: $JAZZY_SRC，跳过迁移（可能克隆失败或目录名有变化）"
+elif [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
+    print_warn "目标目录已存在且非空，跳过迁移: $JAZZY_DST"
+    print_warn "如需重新迁移，请先手动删除或备份该目录："
+    print_warn "  rm -rf \"$JAZZY_DST\""
+else
+    mkdir -p "$HOME/libraries"
+    if mv "$JAZZY_SRC" "$JAZZY_DST"; then
+        print_info "✓ 迁移完成: $JAZZY_SRC -> $JAZZY_DST"
+    else
+        print_warn "迁移失败，请手动执行："
+        print_warn "  mv \"$JAZZY_SRC\" \"$JAZZY_DST\""
+    fi
+fi
+
+echo ""
+print_info "=========================================="
+print_info "安装 rosdep / colcon 依赖（apt）..."
+print_info "=========================================="
+
+# 提前获取 sudo 密码并缓存，避免后续 apt 命令多次弹出密码提示
+if command -v sudo >/dev/null 2>&1; then
+    echo -n "[sudo] 请输入当前用户密码以执行 apt 安装: "
+    read -rs SUDO_PASS
+    echo ""
+    if ! echo "$SUDO_PASS" | sudo -S -v 2>/dev/null; then
+        print_warn "密码验证失败，apt 安装步骤可能需要你手动输入密码。"
+        unset SUDO_PASS
+    else
+        print_info "密码验证成功，sudo 凭证已缓存。"
+        # 包装 sudo 以自动传入密码
+        _sudo() { echo "$SUDO_PASS" | sudo -S "$@"; }
+    fi
+fi
+
+if command -v apt >/dev/null 2>&1; then
+    missing_pkgs=()
+    for pkg in python3-rosdep build-essential python3-colcon-common-extensions; do
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            print_info "已安装: $pkg"
+        else
+            missing_pkgs+=("$pkg")
+        fi
+    done
+
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        print_info "所需依赖已全部安装，跳过 apt install"
+    else
+        if command -v sudo >/dev/null 2>&1; then
+            print_info "将安装缺失依赖: ${missing_pkgs[*]}"
+            if declare -f _sudo >/dev/null 2>&1; then
+                _sudo apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
+            else
+                sudo apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
+            fi
+        else
+            print_warn "未找到 sudo，无法自动安装依赖。请手动执行："
+            print_warn "  apt install -y ${missing_pkgs[*]}"
+        fi
+    fi
+else
+    print_warn "未检测到 apt（可能不是 Ubuntu/Debian）。请按你的发行版手动安装："
+    print_warn "  python3-rosdep build-essential python3-colcon-common-extensions"
+fi
+
+# 清除内存中的密码
+unset SUDO_PASS
+unset -f _sudo 2>/dev/null || true
+
+echo ""
+print_info "=========================================="
+print_info "初始化 isaac_jazzy_ws 工作空间..."
+print_info "=========================================="
+
+JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
+
+if [ ! -d "$JAZZY_DST" ]; then
+    print_warn "未找到工作空间目录: $JAZZY_DST，跳过后续步骤"
+    print_warn "请确认 jazzy_ws 迁移步骤已成功完成"
+else
+    cd "$JAZZY_DST"
+
+    # 1. 初始化子模块
+    print_info "步骤 1/2：初始化子模块（git submodule update --init --recursive）..."
+    if git submodule update --init --recursive; then
+        print_info "✓ 子模块初始化完成"
+    else
+        print_warn "子模块初始化失败，继续后续步骤（可能影响构建）"
+    fi
+
+    # 2. 初始化 rosdep（首次使用时需要 init）
+    if ! [ -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+        print_info "首次运行 rosdep，执行 rosdep init..."
+        sudo rosdep init 2>/dev/null || print_warn "rosdep init 失败（可能已初始化过，忽略）"
+    fi
+    print_info "更新 rosdep 数据库..."
+    rosdep update || print_warn "rosdep update 失败，继续..."
+
+    # 3. 安装 ROS 依赖
+    print_info "步骤 2/2：安装 ROS 依赖（rosdep install -i --from-path src --rosdistro jazzy -y）..."
+    if rosdep install -i --from-path src --rosdistro jazzy -y; then
+        print_info "✓ ROS 依赖安装完成"
+    else
+        print_warn "rosdep install 失败，请检查 src/ 目录是否存在或网络是否正常"
+    fi
+
+    # 4. 构建工作空间
+    print_info "步骤 3/3：构建工作空间（colcon build）..."
+    if colcon build; then
+        print_info "✓ colcon build 完成"
+    else
+        print_warn "colcon build 失败，请检查构建日志：$JAZZY_DST/log/"
+    fi
+
+    # 5. 将 setup.bash 写入 ~/.bashrc
+    SETUP_LINE="source \$HOME/libraries/isaac_jazzy_ws/install/setup.bash"
+    if grep -qF "$SETUP_LINE" "$HOME/.bashrc" 2>/dev/null; then
+        print_info "~/.bashrc 中已存在 setup.bash source 行，跳过写入"
+    else
+        echo "" >> "$HOME/.bashrc"
+        echo "# Isaac Jazzy workspace" >> "$HOME/.bashrc"
+        echo "$SETUP_LINE" >> "$HOME/.bashrc"
+        print_info "✓ 已写入 ~/.bashrc: $SETUP_LINE"
+        print_info "  新终端中将自动生效，当前终端请执行: source ~/.bashrc"
+    fi
+
+    cd "$REPO_DIR"
+fi
+
+echo ""
+print_info "=========================================="
+print_info "全部初始化步骤已完成！"
+print_info "=========================================="
+echo ""
+print_info "现在可以通过以下指令启动 Isaac Sim："
+echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
+echo ""
