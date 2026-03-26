@@ -317,41 +317,35 @@ print_info "=========================================="
 print_info "安装 rosdep / colcon 依赖（apt）..."
 print_info "=========================================="
 
-# 提前获取 sudo 密码并缓存，避免后续 apt 命令多次弹出密码提示
-if command -v sudo >/dev/null 2>&1; then
-    echo -n "[sudo] 请输入当前用户密码以执行 apt 安装: "
-    read -rs SUDO_PASS
-    echo ""
-    if ! echo "$SUDO_PASS" | sudo -S -v 2>/dev/null; then
-        print_warn "密码验证失败，apt 安装步骤可能需要你手动输入密码。"
-        unset SUDO_PASS
-    else
-        print_info "密码验证成功，sudo 凭证已缓存。"
-        # 包装 sudo 以自动传入密码
-        _sudo() { echo "$SUDO_PASS" | sudo -S "$@"; }
-    fi
-fi
-
 if command -v apt >/dev/null 2>&1; then
+    # 先检测缺失包
     missing_pkgs=()
     for pkg in python3-rosdep build-essential python3-colcon-common-extensions; do
         if dpkg -s "$pkg" >/dev/null 2>&1; then
             print_info "已安装: $pkg"
         else
             missing_pkgs+=("$pkg")
+            print_warn "未安装: $pkg"
         fi
     done
 
     if [ ${#missing_pkgs[@]} -eq 0 ]; then
         print_info "所需依赖已全部安装，跳过 apt install"
     else
+        # 有缺失包时才提示输入密码
+        print_info "将安装缺失依赖: ${missing_pkgs[*]}"
         if command -v sudo >/dev/null 2>&1; then
-            print_info "将安装缺失依赖: ${missing_pkgs[*]}"
-            if declare -f _sudo >/dev/null 2>&1; then
-                _sudo apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
-            else
+            echo -n "[sudo] 请输入当前用户密码以执行 apt 安装: "
+            read -rs SUDO_PASS
+            echo ""
+            if ! echo "$SUDO_PASS" | sudo -S -v 2>/dev/null; then
+                print_warn "密码验证失败，尝试普通 sudo（可能再次弹出密码提示）"
                 sudo apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
+            else
+                print_info "密码验证成功，开始安装..."
+                echo "$SUDO_PASS" | sudo -S apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
             fi
+            unset SUDO_PASS
         else
             print_warn "未找到 sudo，无法自动安装依赖。请手动执行："
             print_warn "  apt install -y ${missing_pkgs[*]}"
@@ -361,10 +355,6 @@ else
     print_warn "未检测到 apt（可能不是 Ubuntu/Debian）。请按你的发行版手动安装："
     print_warn "  python3-rosdep build-essential python3-colcon-common-extensions"
 fi
-
-# 清除内存中的密码
-unset SUDO_PASS
-unset -f _sudo 2>/dev/null || true
 
 echo ""
 print_info "=========================================="
