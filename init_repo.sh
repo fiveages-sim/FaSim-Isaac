@@ -43,9 +43,11 @@ echo ""
 echo "请选择初始化模式："
 echo "  1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
 echo "  2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
-read -rp "请输入选项 [1/2]（默认: 1）: " mode_choice
+echo "  3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
+read -rp "请输入选项 [1/2/3]（默认: 1）: " mode_choice
 case "$mode_choice" in
     2) INIT_MODE="private" ;;
+    3) INIT_MODE="w2" ;;
     *) INIT_MODE="public" ;;
 esac
 print_info "初始化模式: $INIT_MODE"
@@ -64,6 +66,11 @@ trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:spac
 NESTED_PUBLIC_SPECS=()
 NESTED_PRIVATE_SPECS=()
 TOP_LEVEL_PRIVATE_PATHS=()
+W2_TARGET_PRIVATE_KEYS=(
+    "robots|manipulators/Marvin"
+    "robots|humannoid/FiveAges_W2"
+)
+W2_SELECTED_PRIVATE_SPECS=()
 while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     line="${line#"${line%%[![:space:]]*}"}"
@@ -89,6 +96,23 @@ done < "$VISIBILITY_CONF"
 print_info "已从 $VISIBILITY_CONF 加载嵌套子模块配置（public: ${#NESTED_PUBLIC_SPECS[@]} 项, private: ${#NESTED_PRIVATE_SPECS[@]} 项）"
 echo ""
 
+# W2 模式下仅选择指定 private 子模块
+for spec in "${NESTED_PRIVATE_SPECS[@]}"; do
+    parent_dir="${spec%%:*}"
+    rest="${spec#*:}"
+    relative_path="${rest#*:}"
+    spec_key="${parent_dir}|${relative_path}"
+    for w2_key in "${W2_TARGET_PRIVATE_KEYS[@]}"; do
+        if [ "$spec_key" = "$w2_key" ]; then
+            W2_SELECTED_PRIVATE_SPECS+=("$spec")
+            break
+        fi
+    done
+done
+if [ "$INIT_MODE" = "w2" ]; then
+    print_info "W2 模式仅拉取指定 private 子模块（匹配: ${#W2_SELECTED_PRIVATE_SPECS[@]} 项）"
+fi
+
 # 同步子模块配置
 print_info "同步子模块配置..."
 git submodule sync
@@ -99,6 +123,10 @@ all_top_paths=$(git config --file .gitmodules --get-regexp path 2>/dev/null | aw
 top_paths_to_init=()
 for p in $all_top_paths; do
     if [ "$INIT_MODE" = "private" ]; then
+        top_paths_to_init+=("$p")
+        continue
+    elif [ "$INIT_MODE" = "w2" ]; then
+        # W2 模式下顶层三个子模块全部初始化
         top_paths_to_init+=("$p")
         continue
     fi
@@ -124,24 +152,41 @@ if [ "$INIT_MODE" = "public" ] && [ ${#TOP_LEVEL_PRIVATE_PATHS[@]} -gt 0 ]; then
     done
 fi
 
+# W2 模式下对 robots 做稀疏检出，只保留所需目录
+if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1); then
+    print_info "W2 模式：配置 robots 稀疏检出..."
+    if (
+        cd "$REPO_DIR/robots" &&
+        git sparse-checkout init --no-cone &&
+        git sparse-checkout set --no-cone \
+            "/.gitmodules" \
+            "/humannoid/FiveAges_W2/" \
+            "/manipulators/Marvin/" \
+            "/sensors/" \
+            "/grippers/" \
+            "/dexhands/"
+    ); then
+        print_info "✓ robots 稀疏检出已生效（保留 W2 相关目录 + sensors/grippers/dexhands）"
+    else
+        print_warn "robots 稀疏检出配置失败，将按常规工作区继续"
+    fi
+fi
+
 # 初始化嵌套子模块（根据 submodules_visibility.conf）
 print_info "初始化嵌套子模块（根据配置文件）..."
-for spec in "${NESTED_PUBLIC_SPECS[@]}"; do
+NESTED_SPECS_TO_PROCESS=("${NESTED_PUBLIC_SPECS[@]}")
+if [ "$INIT_MODE" = "private" ]; then
+    NESTED_SPECS_TO_PROCESS+=("${NESTED_PRIVATE_SPECS[@]}")
+elif [ "$INIT_MODE" = "w2" ]; then
+    NESTED_SPECS_TO_PROCESS+=("${W2_SELECTED_PRIVATE_SPECS[@]}")
+fi
+for spec in "${NESTED_SPECS_TO_PROCESS[@]}"; do
     parent_dir="${spec%%:*}"
     rest="${spec#*:}"
     relative_path="${rest#*:}"
     [ ! -d "$parent_dir" ] && continue
     (cd "$parent_dir" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
 done
-if [ "$INIT_MODE" = "private" ]; then
-    for spec in "${NESTED_PRIVATE_SPECS[@]}"; do
-        parent_dir="${spec%%:*}"
-        rest="${spec#*:}"
-        relative_path="${rest#*:}"
-        [ ! -d "$parent_dir" ] && continue
-        (cd "$parent_dir" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
-    done
-fi
 
 # 遍历所有第一层子模块，切换到 main 分支并拉取最新提交
 print_info "将子模块切换到 main 分支最新提交..."
@@ -208,6 +253,8 @@ print_info "将嵌套子模块切换到对应分支..."
 nested_specs=("${NESTED_PUBLIC_SPECS[@]}")
 if [ "$INIT_MODE" = "private" ]; then
     nested_specs+=("${NESTED_PRIVATE_SPECS[@]}")
+elif [ "$INIT_MODE" = "w2" ]; then
+    nested_specs+=("${W2_SELECTED_PRIVATE_SPECS[@]}")
 fi
 for nested_spec in "${nested_specs[@]}"; do
     parent_dir="${nested_spec%%:*}"
