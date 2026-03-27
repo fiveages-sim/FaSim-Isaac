@@ -43,9 +43,11 @@ echo ""
 echo "请选择初始化模式："
 echo "  1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
 echo "  2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
-read -rp "请输入选项 [1/2]（默认: 1）: " mode_choice
+echo "  3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
+read -rp "请输入选项 [1/2/3]（默认: 1）: " mode_choice
 case "$mode_choice" in
     2) INIT_MODE="private" ;;
+    3) INIT_MODE="w2" ;;
     *) INIT_MODE="public" ;;
 esac
 print_info "初始化模式: $INIT_MODE"
@@ -64,6 +66,11 @@ trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:spac
 NESTED_PUBLIC_SPECS=()
 NESTED_PRIVATE_SPECS=()
 TOP_LEVEL_PRIVATE_PATHS=()
+W2_TARGET_PRIVATE_KEYS=(
+    "robots|manipulators/Marvin"
+    "robots|humannoid/FiveAges_W2"
+)
+W2_SELECTED_PRIVATE_SPECS=()
 while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     line="${line#"${line%%[![:space:]]*}"}"
@@ -89,6 +96,23 @@ done < "$VISIBILITY_CONF"
 print_info "已从 $VISIBILITY_CONF 加载嵌套子模块配置（public: ${#NESTED_PUBLIC_SPECS[@]} 项, private: ${#NESTED_PRIVATE_SPECS[@]} 项）"
 echo ""
 
+# W2 模式下仅选择指定 private 子模块
+for spec in "${NESTED_PRIVATE_SPECS[@]}"; do
+    parent_dir="${spec%%:*}"
+    rest="${spec#*:}"
+    relative_path="${rest#*:}"
+    spec_key="${parent_dir}|${relative_path}"
+    for w2_key in "${W2_TARGET_PRIVATE_KEYS[@]}"; do
+        if [ "$spec_key" = "$w2_key" ]; then
+            W2_SELECTED_PRIVATE_SPECS+=("$spec")
+            break
+        fi
+    done
+done
+if [ "$INIT_MODE" = "w2" ]; then
+    print_info "W2 模式仅拉取指定 private 子模块（匹配: ${#W2_SELECTED_PRIVATE_SPECS[@]} 项）"
+fi
+
 # 同步子模块配置
 print_info "同步子模块配置..."
 git submodule sync
@@ -99,6 +123,10 @@ all_top_paths=$(git config --file .gitmodules --get-regexp path 2>/dev/null | aw
 top_paths_to_init=()
 for p in $all_top_paths; do
     if [ "$INIT_MODE" = "private" ]; then
+        top_paths_to_init+=("$p")
+        continue
+    elif [ "$INIT_MODE" = "w2" ]; then
+        # W2 模式下顶层三个子模块全部初始化
         top_paths_to_init+=("$p")
         continue
     fi
@@ -124,24 +152,41 @@ if [ "$INIT_MODE" = "public" ] && [ ${#TOP_LEVEL_PRIVATE_PATHS[@]} -gt 0 ]; then
     done
 fi
 
+# W2 模式下对 robots 做稀疏检出，只保留所需目录
+if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1); then
+    print_info "W2 模式：配置 robots 稀疏检出..."
+    if (
+        cd "$REPO_DIR/robots" &&
+        git sparse-checkout init --no-cone &&
+        git sparse-checkout set --no-cone \
+            "/.gitmodules" \
+            "/humannoid/FiveAges_W2/" \
+            "/manipulators/Marvin/" \
+            "/sensors/" \
+            "/grippers/" \
+            "/dexhands/"
+    ); then
+        print_info "✓ robots 稀疏检出已生效（保留 W2 相关目录 + sensors/grippers/dexhands）"
+    else
+        print_warn "robots 稀疏检出配置失败，将按常规工作区继续"
+    fi
+fi
+
 # 初始化嵌套子模块（根据 submodules_visibility.conf）
 print_info "初始化嵌套子模块（根据配置文件）..."
-for spec in "${NESTED_PUBLIC_SPECS[@]}"; do
+NESTED_SPECS_TO_PROCESS=("${NESTED_PUBLIC_SPECS[@]}")
+if [ "$INIT_MODE" = "private" ]; then
+    NESTED_SPECS_TO_PROCESS+=("${NESTED_PRIVATE_SPECS[@]}")
+elif [ "$INIT_MODE" = "w2" ]; then
+    NESTED_SPECS_TO_PROCESS+=("${W2_SELECTED_PRIVATE_SPECS[@]}")
+fi
+for spec in "${NESTED_SPECS_TO_PROCESS[@]}"; do
     parent_dir="${spec%%:*}"
     rest="${spec#*:}"
     relative_path="${rest#*:}"
     [ ! -d "$parent_dir" ] && continue
     (cd "$parent_dir" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
 done
-if [ "$INIT_MODE" = "private" ]; then
-    for spec in "${NESTED_PRIVATE_SPECS[@]}"; do
-        parent_dir="${spec%%:*}"
-        rest="${spec#*:}"
-        relative_path="${rest#*:}"
-        [ ! -d "$parent_dir" ] && continue
-        (cd "$parent_dir" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
-    done
-fi
 
 # 遍历所有第一层子模块，切换到 main 分支并拉取最新提交
 print_info "将子模块切换到 main 分支最新提交..."
@@ -208,6 +253,8 @@ print_info "将嵌套子模块切换到对应分支..."
 nested_specs=("${NESTED_PUBLIC_SPECS[@]}")
 if [ "$INIT_MODE" = "private" ]; then
     nested_specs+=("${NESTED_PRIVATE_SPECS[@]}")
+elif [ "$INIT_MODE" = "w2" ]; then
+    nested_specs+=("${W2_SELECTED_PRIVATE_SPECS[@]}")
 fi
 for nested_spec in "${nested_specs[@]}"; do
     parent_dir="${nested_spec%%:*}"
@@ -261,3 +308,165 @@ git submodule status
 echo ""
 print_info "如需更新子模块到最新提交，可以运行："
 print_info "  git submodule update --remote"
+
+echo ""
+print_info "=========================================="
+print_info "继续克隆 IsaacSim ROS workspaces..."
+print_info "=========================================="
+
+ROS_WS_REPO_SSH="git@github.com:isaac-sim/IsaacSim-ros_workspaces.git"
+ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
+
+if [ -d "$ROS_WS_DIR/.git" ]; then
+    print_info "已存在仓库目录，跳过克隆: $ROS_WS_DIR"
+    print_info "如需更新可执行："
+    print_info "  (cd \"$ROS_WS_DIR\" && git pull --ff-only)"
+elif [ -e "$ROS_WS_DIR" ]; then
+    print_warn "目标路径已存在但不是 git 仓库，跳过克隆: $ROS_WS_DIR"
+    print_warn "请手动清理/改名后重新运行脚本，或自行克隆到其他目录。"
+else
+    print_info "开始克隆: $ROS_WS_REPO_SSH"
+    if git clone "$ROS_WS_REPO_SSH" "$ROS_WS_DIR"; then
+        print_info "✓ 克隆完成: $ROS_WS_DIR"
+        print_info "初始化子模块（git submodule update --init --recursive）..."
+        if (cd "$ROS_WS_DIR" && git submodule update --init --recursive); then
+            print_info "✓ IsaacSim-ros_workspaces 子模块初始化完成"
+        else
+            print_warn "子模块初始化失败，请手动执行："
+            print_warn "  (cd \"$ROS_WS_DIR\" && git submodule update --init --recursive)"
+        fi
+    else
+        print_warn "克隆失败。请确认你已配置 GitHub SSH key 且具备访问权限。"
+        print_warn "你也可以改用 HTTPS："
+        print_warn "  git clone https://github.com/isaac-sim/IsaacSim-ros_workspaces.git \"$ROS_WS_DIR\""
+    fi
+fi
+
+echo ""
+print_info "=========================================="
+print_info "迁移 jazzy_ws 到 ~/libraries/isaac_jazzy_ws..."
+print_info "=========================================="
+
+JAZZY_SRC="$ROS_WS_DIR/jazzy_ws"
+JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
+
+if [ ! -d "$JAZZY_SRC" ]; then
+    print_warn "未找到源目录: $JAZZY_SRC，跳过迁移（可能克隆失败或目录名有变化）"
+elif [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
+    print_warn "目标目录已存在且非空，跳过迁移: $JAZZY_DST"
+    print_warn "如需重新迁移，请先手动删除或备份该目录："
+    print_warn "  rm -rf \"$JAZZY_DST\""
+else
+    mkdir -p "$HOME/libraries"
+    if mv "$JAZZY_SRC" "$JAZZY_DST"; then
+        print_info "✓ 迁移完成: $JAZZY_SRC -> $JAZZY_DST"
+    else
+        print_warn "迁移失败，请手动执行："
+        print_warn "  mv \"$JAZZY_SRC\" \"$JAZZY_DST\""
+    fi
+fi
+
+echo ""
+print_info "=========================================="
+print_info "安装 rosdep / colcon 依赖（apt）..."
+print_info "=========================================="
+
+if command -v apt >/dev/null 2>&1; then
+    # 先检测缺失包
+    missing_pkgs=()
+    for pkg in python3-rosdep build-essential python3-colcon-common-extensions; do
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            print_info "已安装: $pkg"
+        else
+            missing_pkgs+=("$pkg")
+            print_warn "未安装: $pkg"
+        fi
+    done
+
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        print_info "所需依赖已全部安装，跳过 apt install"
+    else
+        # 有缺失包时才提示输入密码
+        print_info "将安装缺失依赖: ${missing_pkgs[*]}"
+        if command -v sudo >/dev/null 2>&1; then
+            echo -n "[sudo] 请输入当前用户密码以执行 apt 安装: "
+            read -rs SUDO_PASS
+            echo ""
+            if ! echo "$SUDO_PASS" | sudo -S -v 2>/dev/null; then
+                print_warn "密码验证失败，尝试普通 sudo（可能再次弹出密码提示）"
+                sudo apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
+            else
+                print_info "密码验证成功，开始安装..."
+                echo "$SUDO_PASS" | sudo -S apt install -y "${missing_pkgs[@]}" || print_warn "apt install 失败，请检查网络/权限/软件源"
+            fi
+            unset SUDO_PASS
+        else
+            print_warn "未找到 sudo，无法自动安装依赖。请手动执行："
+            print_warn "  apt install -y ${missing_pkgs[*]}"
+        fi
+    fi
+else
+    print_warn "未检测到 apt（可能不是 Ubuntu/Debian）。请按你的发行版手动安装："
+    print_warn "  python3-rosdep build-essential python3-colcon-common-extensions"
+fi
+
+echo ""
+print_info "=========================================="
+print_info "初始化 isaac_jazzy_ws 工作空间..."
+print_info "=========================================="
+
+JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
+
+if [ ! -d "$JAZZY_DST" ]; then
+    print_warn "未找到工作空间目录: $JAZZY_DST，跳过后续步骤"
+    print_warn "请确认 jazzy_ws 迁移步骤已成功完成"
+else
+    cd "$JAZZY_DST"
+
+    # 1. 初始化 rosdep（首次使用时需要 init）
+    if ! [ -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+        print_info "首次运行 rosdep，执行 rosdep init..."
+        sudo rosdep init 2>/dev/null || print_warn "rosdep init 失败（可能已初始化过，忽略）"
+    fi
+    print_info "更新 rosdep 数据库..."
+    rosdep update || print_warn "rosdep update 失败，继续..."
+
+    # 2. 安装 ROS 依赖
+    print_info "步骤 1/2：安装 ROS 依赖（rosdep install -i --from-path src --rosdistro jazzy -y）..."
+    if rosdep install -i --from-path src --rosdistro jazzy -y; then
+        print_info "✓ ROS 依赖安装完成"
+    else
+        print_warn "rosdep install 失败，请检查 src/ 目录是否存在或网络是否正常"
+    fi
+
+    # 3. 构建工作空间
+    print_info "步骤 2/2：构建工作空间（colcon build）..."
+    if colcon build; then
+        print_info "✓ colcon build 完成"
+    else
+        print_warn "colcon build 失败，请检查构建日志：$JAZZY_DST/log/"
+    fi
+
+    # 5. 将 setup.bash 写入 ~/.bashrc
+    SETUP_LINE="source \$HOME/libraries/isaac_jazzy_ws/install/setup.bash"
+    if grep -qF "$SETUP_LINE" "$HOME/.bashrc" 2>/dev/null; then
+        print_info "~/.bashrc 中已存在 setup.bash source 行，跳过写入"
+    else
+        echo "" >> "$HOME/.bashrc"
+        echo "# Isaac Jazzy workspace" >> "$HOME/.bashrc"
+        echo "$SETUP_LINE" >> "$HOME/.bashrc"
+        print_info "✓ 已写入 ~/.bashrc: $SETUP_LINE"
+        print_info "  新终端中将自动生效，当前终端请执行: source ~/.bashrc"
+    fi
+
+    cd "$REPO_DIR"
+fi
+
+echo ""
+print_info "=========================================="
+print_info "全部初始化步骤已完成！"
+print_info "=========================================="
+echo ""
+print_info "现在可以通过以下指令启动 Isaac Sim："
+echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
+echo ""
