@@ -38,21 +38,38 @@ if [ ! -d ".git" ]; then
     exit 1
 fi
 
-# 选择初始化模式
+# 选择操作类型
 echo ""
-echo "请选择初始化模式："
-echo "  1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
-echo "  2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
-echo "  3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
-echo "  4) 配置 Isaac ROS2 Jazzy Workspace（克隆 ROS workspaces、迁移工作空间、安装依赖并构建）"
-read -rp "请输入选项 [1/2/3/4]（默认: 1）: " mode_choice
-case "$mode_choice" in
-    2) INIT_MODE="private" ;;
-    3) INIT_MODE="w2" ;;
-    4) INIT_MODE="ros2_jazzy" ;;
-    *) INIT_MODE="public" ;;
+echo "请选择操作类型："
+echo "  1) 初始化仓库（拉取子模块并切换到目标分支）"
+echo "  2) 配置环境（安装 ROS2 工作空间及依赖）"
+read -rp "请输入选项 [1/2]（默认: 1）: " top_choice
+
+case "$top_choice" in
+    2)
+        echo ""
+        echo "请选择配置项："
+        echo "  1) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
+        read -rp "请输入选项 [1]（默认: 1）: " env_choice
+        case "$env_choice" in
+            *) INIT_MODE="ros2_jazzy" ;;
+        esac
+        ;;
+    *)
+        echo ""
+        echo "请选择初始化模式："
+        echo "  1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
+        echo "  2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
+        echo "  3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
+        read -rp "请输入选项 [1/2/3]（默认: 1）: " repo_choice
+        case "$repo_choice" in
+            2) INIT_MODE="private" ;;
+            3) INIT_MODE="w2" ;;
+            *) INIT_MODE="public" ;;
+        esac
+        ;;
 esac
-print_info "初始化模式: $INIT_MODE"
+print_info "当前模式: $INIT_MODE"
 echo ""
 
 if [ "$INIT_MODE" != "ros2_jazzy" ]; then
@@ -166,6 +183,7 @@ if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir 
             "/.gitmodules" \
             "/humannoid/FiveAges_W2/" \
             "/manipulators/Marvin/" \
+            "/stands/Dual_Stand1/" \
             "/sensors/" \
             "/grippers/" \
             "/dexhands/"
@@ -319,52 +337,59 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
     echo ""
     print_info "=========================================="
-    print_info "继续克隆 IsaacSim ROS workspaces..."
+    print_info "下载 IsaacSim ROS workspaces..."
     print_info "=========================================="
 
-    ROS_WS_REPO_SSH="git@github.com:isaac-sim/IsaacSim-ros-workspaces.git"
-    ROS_WS_BRANCH="IsaacSim-5.1.0"
-    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros-workspaces"
+    ROS_WS_ZIP_URL="https://github.com/isaac-sim/IsaacSim-ros_workspaces/archive/refs/tags/IsaacSim-5.1.0.zip"
+    ROS_WS_ZIP_FILE="$REPO_DIR/IsaacSim-ros_workspaces-IsaacSim-5.1.0.zip"
+    ROS_WS_EXTRACTED_DIR="$REPO_DIR/IsaacSim-ros_workspaces-IsaacSim-5.1.0"
+    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
 
-    if [ -d "$ROS_WS_DIR/.git" ]; then
-        print_info "已存在仓库目录，跳过克隆: $ROS_WS_DIR"
-        print_info "如需更新可执行："
-        print_info "  (cd \"$ROS_WS_DIR\" && git pull --ff-only)"
-    elif [ -e "$ROS_WS_DIR" ]; then
-        print_warn "目标路径已存在但不是 git 仓库，跳过克隆: $ROS_WS_DIR"
-        print_warn "请手动清理/改名后重新运行脚本，或自行克隆到其他目录。"
+    if [ -d "$ROS_WS_DIR" ] && [ "$(ls -A "$ROS_WS_DIR" 2>/dev/null)" ]; then
+        print_info "已存在目录，跳过下载: $ROS_WS_DIR"
+        print_info "如需重新下载，请先手动删除该目录："
+        print_info "  rm -rf \"$ROS_WS_DIR\""
     else
-        print_info "开始克隆: $ROS_WS_REPO_SSH (branch: $ROS_WS_BRANCH)"
-        if git clone --branch "$ROS_WS_BRANCH" --depth 1 "$ROS_WS_REPO_SSH" "$ROS_WS_DIR"; then
-            print_info "✓ 克隆完成: $ROS_WS_DIR"
+        print_info "开始下载: $ROS_WS_ZIP_URL"
+        if wget -q --show-progress -O "$ROS_WS_ZIP_FILE" "$ROS_WS_ZIP_URL"; then
+            print_info "✓ 下载完成，正在解压..."
+            if unzip -q "$ROS_WS_ZIP_FILE" -d "$REPO_DIR"; then
+                if [ -d "$ROS_WS_EXTRACTED_DIR" ]; then
+                    mv "$ROS_WS_EXTRACTED_DIR" "$ROS_WS_DIR"
+                fi
+                rm -f "$ROS_WS_ZIP_FILE"
+                print_info "✓ 解压完成: $ROS_WS_DIR"
+            else
+                print_warn "解压失败，请检查 zip 文件是否完整"
+                rm -f "$ROS_WS_ZIP_FILE"
+            fi
         else
-            print_warn "克隆失败。请确认你已配置 GitHub SSH key 且具备访问权限。"
-            print_warn "你也可以改用 HTTPS："
-            print_warn "  git clone --branch $ROS_WS_BRANCH --depth 1 https://github.com/isaac-sim/IsaacSim-ros-workspaces.git \"$ROS_WS_DIR\""
+            print_warn "下载失败。请检查网络连接或手动下载："
+            print_warn "  wget -O \"$ROS_WS_ZIP_FILE\" \"$ROS_WS_ZIP_URL\""
+            rm -f "$ROS_WS_ZIP_FILE"
         fi
     fi
 
     echo ""
     print_info "=========================================="
-    print_info "迁移 jazzy_ws 到 ~/libraries/isaac_jazzy_ws..."
+    print_info "提取 jazzy_ws 到 FaSim-Isaac 目录..."
     print_info "=========================================="
 
-    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros-workspaces"
+    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
     JAZZY_SRC="$ROS_WS_DIR/jazzy_ws"
-    JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
+    JAZZY_DST="$REPO_DIR/isaac_jazzy_ws"
 
     if [ ! -d "$JAZZY_SRC" ]; then
-        print_warn "未找到源目录: $JAZZY_SRC，跳过迁移（可能克隆失败或目录名有变化）"
+        print_warn "未找到源目录: $JAZZY_SRC，跳过提取（可能下载失败或目录名有变化）"
     elif [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
-        print_warn "目标目录已存在且非空，跳过迁移: $JAZZY_DST"
-        print_warn "如需重新迁移，请先手动删除或备份该目录："
+        print_warn "目标目录已存在且非空，跳过提取: $JAZZY_DST"
+        print_warn "如需重新提取，请先手动删除或备份该目录："
         print_warn "  rm -rf \"$JAZZY_DST\""
     else
-        mkdir -p "$HOME/libraries"
         if mv "$JAZZY_SRC" "$JAZZY_DST"; then
-            print_info "✓ 迁移完成: $JAZZY_SRC -> $JAZZY_DST"
+            print_info "✓ 提取完成: $JAZZY_SRC -> $JAZZY_DST"
         else
-            print_warn "迁移失败，请手动执行："
+            print_warn "提取失败，请手动执行："
             print_warn "  mv \"$JAZZY_SRC\" \"$JAZZY_DST\""
         fi
     fi
@@ -416,31 +441,39 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     print_info "初始化 isaac_jazzy_ws 工作空间..."
     print_info "=========================================="
 
-    JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
+    JAZZY_DST="$REPO_DIR/isaac_jazzy_ws"
+
+    SETUP_LINE="source $REPO_DIR/isaac_jazzy_ws/install/setup.bash"
 
     if [ ! -d "$JAZZY_DST" ]; then
         print_warn "未找到工作空间目录: $JAZZY_DST，跳过后续步骤"
-        print_warn "请确认 jazzy_ws 迁移步骤已成功完成"
+        print_warn "请确认 jazzy_ws 提取步骤已成功完成"
+    elif [ -f "$JAZZY_DST/install/setup.bash" ] && grep -qF "$SETUP_LINE" "$HOME/.bashrc" 2>/dev/null; then
+        print_info "环境已配置完成（install/setup.bash 存在且 ~/.bashrc 已写入），跳过构建步骤"
     else
         cd "$JAZZY_DST"
 
-        # 步骤 1/3：初始化 rosdep
-        if ! [ -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
-            print_info "首次运行 rosdep，执行 rosdep init..."
-            sudo rosdep init 2>/dev/null || print_warn "rosdep init 失败（可能已初始化过，忽略）"
+        if command -v rosdepc >/dev/null 2>&1; then
+            ROSDEP_CMD="rosdepc"
+            print_info "检测到 rosdepc（国内加速），优先使用"
+        else
+            ROSDEP_CMD="rosdep"
         fi
-        print_info "更新 rosdep 数据库..."
-        rosdep update || print_warn "rosdep update 失败，继续..."
 
-        # 步骤 2/3：安装 ROS 依赖
-        print_info "步骤 1/2：安装 ROS 依赖（rosdep install --from-paths src --ignore-src -r -y）..."
-        if rosdep install --from-paths src --ignore-src -r -y; then
+        if ! [ -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+            print_info "首次运行 $ROSDEP_CMD，执行 $ROSDEP_CMD init..."
+            sudo "$ROSDEP_CMD" init 2>/dev/null || print_warn "$ROSDEP_CMD init 失败（可能已初始化过，忽略）"
+        fi
+        print_info "更新 $ROSDEP_CMD 数据库..."
+        "$ROSDEP_CMD" update || print_warn "$ROSDEP_CMD update 失败，继续..."
+
+        print_info "步骤 1/2：安装 ROS 依赖（$ROSDEP_CMD install --from-paths src --ignore-src -r -y）..."
+        if "$ROSDEP_CMD" install --from-paths src --ignore-src -r -y; then
             print_info "✓ ROS 依赖安装完成"
         else
-            print_warn "rosdep install 失败，请检查 src/ 目录是否存在或网络是否正常"
+            print_warn "$ROSDEP_CMD install 失败，请检查 src/ 目录是否存在或网络是否正常"
         fi
 
-        # 步骤 3/3：构建工作空间
         print_info "步骤 2/2：构建工作空间（colcon build）..."
         if colcon build; then
             print_info "✓ colcon build 完成"
@@ -448,8 +481,6 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
             print_warn "colcon build 失败，请检查构建日志：$JAZZY_DST/log/"
         fi
 
-        # 将 setup.bash 写入 ~/.bashrc
-        SETUP_LINE="source \$HOME/libraries/isaac_jazzy_ws/install/setup.bash"
         if grep -qF "$SETUP_LINE" "$HOME/.bashrc" 2>/dev/null; then
             print_info "~/.bashrc 中已存在 setup.bash source 行，跳过写入"
         else
@@ -463,13 +494,36 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         cd "$REPO_DIR"
     fi
 
+    echo ""
+    print_info "=========================================="
+    print_info "清理中间文件..."
+    print_info "=========================================="
+
+    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
+    ROS_WS_ZIP_FILE="$REPO_DIR/IsaacSim-ros_workspaces-IsaacSim-5.1.0.zip"
+
+    if [ -f "$ROS_WS_ZIP_FILE" ]; then
+        rm -f "$ROS_WS_ZIP_FILE"
+        print_info "✓ 已删除 zip 包: $ROS_WS_ZIP_FILE"
+    fi
+
+    if [ -d "$ROS_WS_DIR" ]; then
+        rm -rf "$ROS_WS_DIR"
+        print_info "✓ 已删除解压目录: $ROS_WS_DIR"
+    fi
+
 fi
 
 echo ""
 print_info "=========================================="
-print_info "全部初始化步骤已完成！"
+print_info "全部步骤已完成！"
 print_info "=========================================="
 echo ""
-print_info "现在可以通过以下指令启动 Isaac Sim："
-echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
+if [ "$INIT_MODE" = "ros2_jazzy" ]; then
+    print_info "现在可以通过以下指令启动 Isaac Sim："
+    echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
+else
+    print_info "仓库初始化完成，如需更新子模块到最新提交，可以运行："
+    echo -e "  ${GREEN}git submodule update --remote${NC}"
+fi
 echo ""

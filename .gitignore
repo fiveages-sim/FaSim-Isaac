@@ -28,3 +28,9 @@ _cache/
 *.tmp
 *.temp
 *.log
+
+# Isaac ROS workspaces (downloaded zip, extracted archive, final workspace)
+IsaacSim-ros_workspaces-IsaacSim-*.zip
+IsaacSim-ros_workspaces/
+IsaacSim-ros_workspaces-*/
+isaac_jazzy_ws/
