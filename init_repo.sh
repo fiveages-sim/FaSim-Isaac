@@ -55,6 +55,8 @@ esac
 print_info "初始化模式: $INIT_MODE"
 echo ""
 
+if [ "$INIT_MODE" != "ros2_jazzy" ]; then
+
 # 嵌套子模块可见性配置文件
 VISIBILITY_CONF="$REPO_DIR/submodules_visibility.conf"
 if [ ! -f "$VISIBILITY_CONF" ]; then
@@ -310,6 +312,8 @@ git submodule status
 echo ""
 print_info "如需更新子模块到最新提交，可以运行："
 print_info "  git submodule update --remote"
+
+fi  # end of [ "$INIT_MODE" != "ros2_jazzy" ]
 
 if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
