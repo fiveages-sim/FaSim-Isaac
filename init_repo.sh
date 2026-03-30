@@ -431,8 +431,8 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         rosdep update || print_warn "rosdep update 失败，继续..."
 
         # 步骤 2/3：安装 ROS 依赖
-        print_info "步骤 1/2：安装 ROS 依赖（rosdep install -i --from-path src --rosdistro jazzy -y）..."
-        if rosdep install -i --from-path src --rosdistro jazzy -y; then
+        print_info "步骤 1/2：安装 ROS 依赖（rosdep install --from-paths src --ignore-src -r -y）..."
+        if rosdep install --from-paths src --ignore-src -r -y; then
             print_info "✓ ROS 依赖安装完成"
         else
             print_warn "rosdep install 失败，请检查 src/ 目录是否存在或网络是否正常"
