@@ -322,8 +322,9 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     print_info "继续克隆 IsaacSim ROS workspaces..."
     print_info "=========================================="
 
-    ROS_WS_REPO_SSH="git@github.com:isaac-sim/IsaacSim-ros_workspaces.git"
-    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
+    ROS_WS_REPO_SSH="git@github.com:isaac-sim/IsaacSim-ros-workspaces.git"
+    ROS_WS_BRANCH="IsaacSim-5.1.0"
+    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros-workspaces"
 
     if [ -d "$ROS_WS_DIR/.git" ]; then
         print_info "已存在仓库目录，跳过克隆: $ROS_WS_DIR"
@@ -333,13 +334,13 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         print_warn "目标路径已存在但不是 git 仓库，跳过克隆: $ROS_WS_DIR"
         print_warn "请手动清理/改名后重新运行脚本，或自行克隆到其他目录。"
     else
-        print_info "开始克隆: $ROS_WS_REPO_SSH"
-        if git clone "$ROS_WS_REPO_SSH" "$ROS_WS_DIR"; then
+        print_info "开始克隆: $ROS_WS_REPO_SSH (branch: $ROS_WS_BRANCH)"
+        if git clone --branch "$ROS_WS_BRANCH" --depth 1 "$ROS_WS_REPO_SSH" "$ROS_WS_DIR"; then
             print_info "✓ 克隆完成: $ROS_WS_DIR"
         else
             print_warn "克隆失败。请确认你已配置 GitHub SSH key 且具备访问权限。"
             print_warn "你也可以改用 HTTPS："
-            print_warn "  git clone https://github.com/isaac-sim/IsaacSim-ros_workspaces.git \"$ROS_WS_DIR\""
+            print_warn "  git clone --branch $ROS_WS_BRANCH --depth 1 https://github.com/isaac-sim/IsaacSim-ros-workspaces.git \"$ROS_WS_DIR\""
         fi
     fi
 
@@ -348,6 +349,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     print_info "迁移 jazzy_ws 到 ~/libraries/isaac_jazzy_ws..."
     print_info "=========================================="
 
+    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros-workspaces"
     JAZZY_SRC="$ROS_WS_DIR/jazzy_ws"
     JAZZY_DST="$HOME/libraries/isaac_jazzy_ws"
 
