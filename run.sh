@@ -51,6 +51,40 @@ else
     echo -e "  ${GREEN}export RMW_IMPLEMENTATION=rmw_zenoh_cpp${NC}"
 fi
 
-print_info "启动 Isaac Sim..."
-cd "$HOME/isaacsim" || { print_error "未找到目录: ~/isaacsim"; exit 1; }
-./isaac-sim.sh
+ISAACSIM_DIR="$HOME/isaacsim"
+
+if [ ! -d "${ISAACSIM_DIR}" ]; then
+    print_error "未找到目录: ~/isaacsim，请确认 Isaac Sim 安装路径。"
+    exit 1
+fi
+
+echo ""
+echo "请选择 Isaac Sim 启动模式:"
+echo "  1) 正常启动 (isaac-sim.sh)"
+echo "  2) Headless Streaming 模式 (isaac-sim.streaming.sh，仅仿真，不启动控制)"
+echo ""
+read -r -p "请输入选项 [1-2] (默认: 1): " isaac_mode
+if [ -z "${isaac_mode}" ]; then
+    isaac_mode="1"
+fi
+
+cd "${ISAACSIM_DIR}" || { print_error "无法进入目录: ~/isaacsim"; exit 1; }
+
+case "${isaac_mode}" in
+    1)
+        print_info "启动 Isaac Sim（正常模式）..."
+        ./isaac-sim.sh
+        ;;
+    2)
+        if [ ! -x "./isaac-sim.streaming.sh" ]; then
+            print_error "未找到可执行文件 ~/isaacsim/isaac-sim.streaming.sh，请确认脚本存在且有执行权限。"
+            exit 1
+        fi
+        print_info "启动 Isaac Sim（Headless Streaming 模式）..."
+        ./isaac-sim.streaming.sh
+        ;;
+    *)
+        print_error "无效选项: ${isaac_mode}"
+        exit 1
+        ;;
+esac
