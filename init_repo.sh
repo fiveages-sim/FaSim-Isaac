@@ -173,6 +173,15 @@ if [ "$INIT_MODE" = "public" ] && [ ${#TOP_LEVEL_PRIVATE_PATHS[@]} -gt 0 ]; then
     done
 fi
 
+# 非 W2 模式下，如果 robots 之前开启了稀疏检出，则关闭它以恢复完整工作区
+if [ "$INIT_MODE" != "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1); then
+    if (cd "$REPO_DIR/robots" && git config core.sparseCheckout 2>/dev/null | grep -q true); then
+        print_info "检测到 robots 存在稀疏检出配置，正在禁用以恢复完整工作区..."
+        (cd "$REPO_DIR/robots" && git sparse-checkout disable)
+        print_info "✓ robots 稀疏检出已禁用，工作区已恢复完整"
+    fi
+fi
+
 # W2 模式下对 robots 做稀疏检出，只保留所需目录
 if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1); then
     print_info "W2 模式：配置 robots 稀疏检出..."
