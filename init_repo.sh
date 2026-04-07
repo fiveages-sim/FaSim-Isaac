@@ -362,7 +362,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         print_info "开始下载: $ROS_WS_ZIP_URL"
         if wget -q --show-progress -O "$ROS_WS_ZIP_FILE" "$ROS_WS_ZIP_URL"; then
             print_info "✓ 下载完成，正在解压..."
-            if unzip -q "$ROS_WS_ZIP_FILE" -d "$REPO_DIR"; then
+            if unzip "$ROS_WS_ZIP_FILE" -d "$REPO_DIR"; then
                 if [ -d "$ROS_WS_EXTRACTED_DIR" ]; then
                     mv "$ROS_WS_EXTRACTED_DIR" "$ROS_WS_DIR"
                 fi
