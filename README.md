@@ -61,7 +61,7 @@ FaSim-Isaac/
 └── isaac_jazzy_ws/               # ROS2 Jazzy 工作空间（由 init_repo.sh 操作 2 生成）
 ```
 
-`robots` 内按类型分子目录：人形（humannoid）、机械臂（manipulators）、夹爪（grippers）、灵巧手（dexhands）、传感器（sensors）、支架（stands）等；`environment` 下为场景与项目相关 USD。具体机型与文件名可直接在对应目录中查看。
+`robots` 内按类型分子目录：人形（humanoid）、机械臂（manipulators）、夹爪（grippers）、灵巧手（dexhands）、传感器（sensors）、支架（stands）等；`environment` 下为场景与项目相关 USD。具体机型与文件名可直接在对应目录中查看。
 
 ---
 
