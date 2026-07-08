@@ -25,7 +25,7 @@ cd FaSim-Isaac
 
 - **模式 1（默认）**：仅拉取 public 资产，适用于外部用户，无需内部仓库访问权限
 - **模式 2**：拉取全部资产（含 private），需要内部仓库访问权限
-- **模式 3（W2）**：顶层子模块全部拉取，`robots` 目录使用稀疏检出只保留 W2 相关目录（FiveAges_W2、Marvin、Dual_Stand1、sensors、grippers、dexhands），并仅初始化对应的 private 嵌套子模块
+- **模式 3（W2）**：顶层子模块全部拉取，`robots` 目录使用稀疏检出只保留 W2 相关目录（FiveAges_W2、Marvin 子模块、`manipulators/Tianji` 仓库内资源、Dual_Stand1、sensors、grippers、dexhands），并仅初始化对应的 private 嵌套子模块
 
 脚本会自动完成子模块初始化、分支切换并更新到最新提交。
 

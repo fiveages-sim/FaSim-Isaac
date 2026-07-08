@@ -89,6 +89,7 @@ NESTED_PRIVATE_SPECS=()
 TOP_LEVEL_PRIVATE_PATHS=()
 W2_TARGET_PRIVATE_KEYS=(
     "robots|manipulators/Marvin"
+    "robots|humanoid/FiveAges"
     "robots|humanoid/FiveAges_W2"
 )
 W2_SELECTED_PRIVATE_SPECS=()
@@ -190,8 +191,10 @@ if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir 
         git sparse-checkout init --no-cone &&
         git sparse-checkout set --no-cone \
             "/.gitmodules" \
+            "/humanoid/FiveAges/" \
             "/humanoid/FiveAges_W2/" \
             "/manipulators/Marvin/" \
+            "/manipulators/Tianji/" \
             "/stands/Dual_Stand1/" \
             "/sensors/" \
             "/grippers/" \
