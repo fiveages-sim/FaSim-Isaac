@@ -27,6 +27,26 @@ print_error() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$SCRIPT_DIR"
 
+# 共用配置（参考 fa_w2_ws：config/*.conf，bash source）
+FA_SIM_CONFIG="${REPO_DIR}/config/fa_sim.conf"
+FA_SIM_LOCAL_CONFIG="${REPO_DIR}/config/fa_sim.local.conf"
+
+load_fa_sim_config() {
+    if [ ! -f "$FA_SIM_CONFIG" ]; then
+        print_error "找不到配置文件: $FA_SIM_CONFIG"
+        exit 1
+    fi
+    # shellcheck source=config/fa_sim.conf
+    source "$FA_SIM_CONFIG"
+    if [ -f "$FA_SIM_LOCAL_CONFIG" ]; then
+        # shellcheck source=/dev/null
+        source "$FA_SIM_LOCAL_CONFIG"
+        print_info "已加载本机覆盖: config/fa_sim.local.conf"
+    fi
+}
+
+load_fa_sim_config
+
 print_info "仓库目录: $REPO_DIR"
 cd "$REPO_DIR"
 
@@ -40,36 +60,99 @@ fi
 
 # 选择操作类型
 echo ""
-echo "请选择操作类型："
-echo "  1) 初始化仓库（拉取子模块并切换到目标分支）"
-echo "  2) 配置环境（安装 ROS2 工作空间及依赖）"
-read -rp "请输入选项 [1/2]（默认: 1）: " top_choice
+echo "请选择要执行的操作"
+echo
+echo "  [仓库初始化]"
+echo "    1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
+echo "    2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
+echo "    3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
+echo
+echo "  [环境配置]"
+echo "    4) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
+echo
+echo "  [其他]"
+echo "    q) 退出"
+echo
+read -rp "输入选项 [1-4/q]: " choice
 
-case "$top_choice" in
-    2)
-        echo ""
-        echo "请选择配置项："
-        echo "  1) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
-        read -rp "请输入选项 [1]（默认: 1）: " env_choice
-        case "$env_choice" in
-            *) INIT_MODE="ros2_jazzy" ;;
-        esac
+case "$choice" in
+    1|"") INIT_MODE="public" ;;
+    2) INIT_MODE="private" ;;
+    3) INIT_MODE="w2" ;;
+    4) INIT_MODE="ros2_jazzy" ;;
+    q|Q)
+        echo "已退出。"
+        exit 0
         ;;
     *)
-        echo ""
-        echo "请选择初始化模式："
-        echo "  1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
-        echo "  2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
-        echo "  3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
-        read -rp "请输入选项 [1/2/3]（默认: 1）: " repo_choice
-        case "$repo_choice" in
-            2) INIT_MODE="private" ;;
-            3) INIT_MODE="w2" ;;
-            *) INIT_MODE="public" ;;
-        esac
+        print_error "无效选项: ${choice}"
+        exit 1
         ;;
 esac
+
+# Isaac Sim ROS Workspace 版本选择（仅环境配置模式）
+# 优先：环境变量 ISAAC_SIM_VERSION > 菜单 > ISAAC_SIM_DEFAULT_VERSION
+ISAAC_SIM_VERSION="${ISAAC_SIM_VERSION:-}"
+if [ "$INIT_MODE" = "ros2_jazzy" ]; then
+    if [ -z "$ISAAC_SIM_VERSION" ]; then
+        echo ""
+        echo "请选择 Isaac Sim ROS Workspace 版本"
+        echo
+        echo "  [版本]"
+        ver_idx=1
+        for ver in "${ISAAC_SIM_VERSIONS[@]}"; do
+            suffix=""
+            if [ "$ver" = "$ISAAC_SIM_DEFAULT_VERSION" ]; then
+                suffix="（默认）"
+            fi
+            echo "    ${ver_idx}) ${ver}${suffix}"
+            ver_idx=$((ver_idx + 1))
+        done
+        custom_idx=$ver_idx
+        echo "    ${custom_idx}) 自定义版本号（如 6.1.0）"
+        echo
+        echo "  [其他]"
+        echo "    q) 退出"
+        echo
+        read -rp "输入选项 [1-${custom_idx}/q]（默认: ${ISAAC_SIM_DEFAULT_VERSION}）: " ver_choice
+        case "${ver_choice}" in
+            "" )
+                ISAAC_SIM_VERSION="$ISAAC_SIM_DEFAULT_VERSION"
+                ;;
+            q|Q)
+                echo "已退出。"
+                exit 0
+                ;;
+            *)
+                if [ "$ver_choice" = "$custom_idx" ]; then
+                    read -rp "输入版本号（例如 6.1.0 或 IsaacSim-6.1.0）: " custom_ver
+                    custom_ver="${custom_ver#IsaacSim-}"
+                    custom_ver="${custom_ver#v}"
+                    if [ -z "$custom_ver" ]; then
+                        print_error "版本号不能为空"
+                        exit 1
+                    fi
+                    ISAAC_SIM_VERSION="$custom_ver"
+                elif [[ "$ver_choice" =~ ^[0-9]+$ ]] \
+                    && [ "$ver_choice" -ge 1 ] \
+                    && [ "$ver_choice" -lt "$custom_idx" ]; then
+                    ISAAC_SIM_VERSION="${ISAAC_SIM_VERSIONS[$((ver_choice - 1))]}"
+                else
+                    print_error "无效选项: ${ver_choice}"
+                    exit 1
+                fi
+                ;;
+        esac
+    else
+        ISAAC_SIM_VERSION="${ISAAC_SIM_VERSION#IsaacSim-}"
+        ISAAC_SIM_VERSION="${ISAAC_SIM_VERSION#v}"
+    fi
+fi
+
 print_info "当前模式: $INIT_MODE"
+if [ "$INIT_MODE" = "ros2_jazzy" ]; then
+    print_info "Isaac Sim 版本: $ISAAC_SIM_VERSION"
+fi
 echo ""
 
 if [ "$INIT_MODE" != "ros2_jazzy" ]; then
@@ -87,11 +170,6 @@ trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:spac
 NESTED_PUBLIC_SPECS=()
 NESTED_PRIVATE_SPECS=()
 TOP_LEVEL_PRIVATE_PATHS=()
-W2_TARGET_PRIVATE_KEYS=(
-    "robots|manipulators/Marvin"
-    "robots|humanoid/FiveAges"
-    "robots|humanoid/FiveAges_W2"
-)
 W2_SELECTED_PRIVATE_SPECS=()
 while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
@@ -347,17 +425,40 @@ fi  # end of [ "$INIT_MODE" != "ros2_jazzy" ]
 
 if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
+    ISAAC_SIM_TAG="${ISAAC_ROS_WS_TAG_PREFIX}${ISAAC_SIM_VERSION}"
+    # shellcheck disable=SC2059
+    ROS_WS_ZIP_URL="$(printf "$ISAAC_ROS_WS_ZIP_URL_TEMPLATE" "$ISAAC_SIM_TAG")"
+    ROS_WS_ZIP_FILE="$REPO_DIR/${ISAAC_ROS_WS_DIR_NAME}-${ISAAC_SIM_TAG}.zip"
+    ROS_WS_EXTRACTED_DIR="$REPO_DIR/${ISAAC_ROS_WS_DIR_NAME}-${ISAAC_SIM_TAG}"
+    ROS_WS_DIR="$REPO_DIR/${ISAAC_ROS_WS_DIR_NAME}"
+    JAZZY_DST="$REPO_DIR/${ISAAC_JAZZY_WS_NAME}"
+    EXISTING_VERSION=""
+    if [ -f "$JAZZY_DST/.isaac_sim_version" ]; then
+        EXISTING_VERSION="$(tr -d '[:space:]' < "$JAZZY_DST/.isaac_sim_version")"
+    elif [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
+        EXISTING_VERSION="unknown"
+    fi
+
+    if [ -n "$EXISTING_VERSION" ] && [ "$EXISTING_VERSION" != "$ISAAC_SIM_VERSION" ]; then
+        print_info "检测到已有工作空间版本 (${EXISTING_VERSION}) 与目标 (${ISAAC_SIM_VERSION}) 不同，清除旧目录后重新配置..."
+        rm -rf "$JAZZY_DST"
+        if [ -d "$ROS_WS_DIR" ]; then
+            rm -rf "$ROS_WS_DIR"
+            print_info "✓ 已清除中间目录: $ROS_WS_DIR"
+        fi
+        print_info "✓ 已清除旧工作空间: $JAZZY_DST"
+        EXISTING_VERSION=""
+    fi
+
     echo ""
     print_info "=========================================="
-    print_info "下载 IsaacSim ROS workspaces..."
+    print_info "下载 IsaacSim ROS workspaces（${ISAAC_SIM_TAG}）..."
     print_info "=========================================="
 
-    ROS_WS_ZIP_URL="https://github.com/isaac-sim/IsaacSim-ros_workspaces/archive/refs/tags/IsaacSim-5.1.0.zip"
-    ROS_WS_ZIP_FILE="$REPO_DIR/IsaacSim-ros_workspaces-IsaacSim-5.1.0.zip"
-    ROS_WS_EXTRACTED_DIR="$REPO_DIR/IsaacSim-ros_workspaces-IsaacSim-5.1.0"
-    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
-
-    if [ -d "$ROS_WS_DIR" ] && [ "$(ls -A "$ROS_WS_DIR" 2>/dev/null)" ]; then
+    if [ -n "$EXISTING_VERSION" ] && [ "$EXISTING_VERSION" = "$ISAAC_SIM_VERSION" ] \
+        && [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
+        print_info "已存在匹配版本的工作空间 (${ISAAC_SIM_VERSION})，跳过下载"
+    elif [ -d "$ROS_WS_DIR" ] && [ "$(ls -A "$ROS_WS_DIR" 2>/dev/null)" ]; then
         print_info "已存在目录，跳过下载: $ROS_WS_DIR"
         print_info "如需重新下载，请先手动删除该目录："
         print_info "  rm -rf \"$ROS_WS_DIR\""
@@ -368,6 +469,14 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
             if unzip "$ROS_WS_ZIP_FILE" -d "$REPO_DIR"; then
                 if [ -d "$ROS_WS_EXTRACTED_DIR" ]; then
                     mv "$ROS_WS_EXTRACTED_DIR" "$ROS_WS_DIR"
+                else
+                    # GitHub 偶发按 commit 命名解压目录，兜底匹配
+                    found_dir="$(find "$REPO_DIR" -maxdepth 1 -type d -name "${ISAAC_ROS_WS_DIR_NAME}-*" | head -n 1)"
+                    if [ -n "$found_dir" ] && [ -d "$found_dir" ]; then
+                        mv "$found_dir" "$ROS_WS_DIR"
+                    else
+                        print_warn "未找到解压目录，期望: $ROS_WS_EXTRACTED_DIR"
+                    fi
                 fi
                 rm -f "$ROS_WS_ZIP_FILE"
                 print_info "✓ 解压完成: $ROS_WS_DIR"
@@ -376,7 +485,8 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
                 rm -f "$ROS_WS_ZIP_FILE"
             fi
         else
-            print_warn "下载失败。请检查网络连接或手动下载："
+            print_warn "下载失败。请检查网络连接，或确认版本标签是否存在："
+            print_warn "  https://github.com/isaac-sim/IsaacSim-ros_workspaces/releases"
             print_warn "  wget -O \"$ROS_WS_ZIP_FILE\" \"$ROS_WS_ZIP_URL\""
             rm -f "$ROS_WS_ZIP_FILE"
         fi
@@ -384,22 +494,24 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
     echo ""
     print_info "=========================================="
-    print_info "提取 jazzy_ws 到 FaSim-Isaac 目录..."
+    print_info "提取 jazzy_ws 到 FaSim-Isaac 目录（${ISAAC_SIM_TAG}）..."
     print_info "=========================================="
 
-    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
     JAZZY_SRC="$ROS_WS_DIR/jazzy_ws"
-    JAZZY_DST="$REPO_DIR/isaac_jazzy_ws"
 
-    if [ ! -d "$JAZZY_SRC" ]; then
+    if [ -n "$EXISTING_VERSION" ] && [ "$EXISTING_VERSION" = "$ISAAC_SIM_VERSION" ] \
+        && [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
+        print_info "已存在匹配版本的工作空间 (${ISAAC_SIM_VERSION})，跳过提取"
+    elif [ ! -d "$JAZZY_SRC" ]; then
         print_warn "未找到源目录: $JAZZY_SRC，跳过提取（可能下载失败或目录名有变化）"
     elif [ -d "$JAZZY_DST" ] && [ "$(ls -A "$JAZZY_DST" 2>/dev/null)" ]; then
         print_warn "目标目录已存在且非空，跳过提取: $JAZZY_DST"
-        print_warn "如需重新提取，请先手动删除或备份该目录："
+        print_warn "如需强制重新提取，请先手动删除："
         print_warn "  rm -rf \"$JAZZY_DST\""
     else
         if mv "$JAZZY_SRC" "$JAZZY_DST"; then
             print_info "✓ 提取完成: $JAZZY_SRC -> $JAZZY_DST"
+            echo "$ISAAC_SIM_VERSION" > "$JAZZY_DST/.isaac_sim_version"
         else
             print_warn "提取失败，请手动执行："
             print_warn "  mv \"$JAZZY_SRC\" \"$JAZZY_DST\""
@@ -413,7 +525,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
     if command -v apt >/dev/null 2>&1; then
         missing_pkgs=()
-        for pkg in python3-rosdep build-essential python3-colcon-common-extensions; do
+        for pkg in "${ISAAC_ROS_APT_PACKAGES[@]}"; do
             if dpkg -s "$pkg" >/dev/null 2>&1; then
                 print_info "已安装: $pkg"
             else
@@ -445,17 +557,15 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         fi
     else
         print_warn "未检测到 apt（可能不是 Ubuntu/Debian）。请按你的发行版手动安装："
-        print_warn "  python3-rosdep build-essential python3-colcon-common-extensions"
+        print_warn "  ${ISAAC_ROS_APT_PACKAGES[*]}"
     fi
 
     echo ""
     print_info "=========================================="
-    print_info "初始化 isaac_jazzy_ws 工作空间..."
+    print_info "初始化 ${ISAAC_JAZZY_WS_NAME} 工作空间..."
     print_info "=========================================="
 
-    JAZZY_DST="$REPO_DIR/isaac_jazzy_ws"
-
-    SETUP_LINE="source $REPO_DIR/isaac_jazzy_ws/install/setup.bash"
+    SETUP_LINE="source $REPO_DIR/${ISAAC_JAZZY_WS_NAME}/install/setup.bash"
 
     if [ ! -d "$JAZZY_DST" ]; then
         print_warn "未找到工作空间目录: $JAZZY_DST，跳过后续步骤"
@@ -497,7 +607,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
             print_info "~/.bashrc 中已存在 setup.bash source 行，跳过写入"
         else
             echo "" >> "$HOME/.bashrc"
-            echo "# Isaac Jazzy workspace" >> "$HOME/.bashrc"
+            echo "# Isaac Jazzy workspace (${ISAAC_SIM_TAG})" >> "$HOME/.bashrc"
             echo "$SETUP_LINE" >> "$HOME/.bashrc"
             print_info "✓ 已写入 ~/.bashrc: $SETUP_LINE"
             print_info "  新终端中将自动生效，当前终端请执行: source ~/.bashrc"
@@ -510,9 +620,6 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     print_info "=========================================="
     print_info "清理中间文件..."
     print_info "=========================================="
-
-    ROS_WS_DIR="$REPO_DIR/IsaacSim-ros_workspaces"
-    ROS_WS_ZIP_FILE="$REPO_DIR/IsaacSim-ros_workspaces-IsaacSim-5.1.0.zip"
 
     if [ -f "$ROS_WS_ZIP_FILE" ]; then
         rm -f "$ROS_WS_ZIP_FILE"
@@ -532,6 +639,7 @@ print_info "全部步骤已完成！"
 print_info "=========================================="
 echo ""
 if [ "$INIT_MODE" = "ros2_jazzy" ]; then
+    print_info "Isaac ROS2 Workspace 已按 ${ISAAC_SIM_TAG} 配置完成"
     print_info "现在可以通过以下指令启动 Isaac Sim："
     echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
 else
