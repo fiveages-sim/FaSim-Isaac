@@ -35,7 +35,7 @@ target’s own layers (or legacy binary mounts via `Sdf.Layer.ExportToString`).
 
 ```
 - [ ] 1. Audit target vs reference gaps
-- [ ] 2. Rewrite payloads/Physics/mujoco.usda (+ gravcomp where needed)
+- [ ] 2. Rewrite payloads/Physics/mujoco.usda: MjcJoint only, strip DriveAPI (+ gravcomp)
 - [ ] 3. Wire root *.usda Physics=mujoco + Gripper/EE; Physics first in variantSets
 - [ ] 4. Text EE mounts nested under tip/tcp (one prim path; preserve Side flange orients)
 - [ ] 5. Port Side left/right MuJoCo + Gripper/EE selection
@@ -49,12 +49,16 @@ target’s own layers (or legacy binary mounts via `Sdf.Layer.ExportToString`).
 | Piece | Expectation |
 |-------|-------------|
 | Root variants | `Physics` includes `mujoco`; `Gripper` or `EE` registered on root |
-| `Physics/mujoco.usda` | `subLayers = [@./physics.usda@]` + `MjcJointAPI` + actuators for **default** joints only |
+| `Physics/mujoco.usda` | `subLayers = [@./physics.usda@]` + **MjcJointAPI only** (no DriveAPI) + actuators for default + strip Side joint drives |
 | EE mounts | Text `.usda`; **nested under tip/tcp** (see §4); same child prim name all Sides |
 | Side left/right | Rename joints; `MjcJointAPI` on side joints; side actuators; `active=false` default actuators |
 | Isaac rels | Gripper/EE variant prepends `isaac:physics:robotJoints/Links` to **composed EE path** |
 
-## 2. `mujoco.usda` (default Side only)
+## 2. `mujoco.usda` — MjcJoint only (strip PhysX Drive)
+
+Under `Physics=mujoco`, joints must **not** keep PhysX `PhysicsDriveAPI` / drive params. Control is **only** via `MjcJointAPI` + `MjcActuator`.
+
+`delete apiSchemas = ["PhysicsDriveAPI:…"]` alone is **not enough**: values from `physics.usda` (and Side joint `def`s that still author drives) remain as residual `drive:*` attributes. **Block** them in `mujoco.usda`:
 
 ```usda
 subLayers = [ @./physics.usda@ ]
@@ -65,16 +69,33 @@ def "RobotRoot" {
       prepend apiSchemas = ["MjcJointAPI"]
       delete apiSchemas = ["PhysicsJointStateAPI:angular", "PhysicsDriveAPI:angular"]
     ) {
+      /* strip PhysX drive opinions left by physics.usda */
+      float drive:angular:physics:damping = None
+      float drive:angular:physics:maxForce = None
+      float drive:angular:physics:stiffness = None
+      float drive:angular:physics:targetPosition = None
+      uniform token drive:angular:physics:type = None
       /* mjc:armature/damping/actuatorfrcrange from maxForce */
-      uniform bool mjc:actuatorgravcomp = 1   /* arm / torso joints that need Newton G-comp */
+      uniform bool mjc:actuatorgravcomp = 1
     }
+
+    /* Side joints: Physics is stronger than Side — strip Drive here too */
+    over "left_jointN" (
+      prepend apiSchemas = ["MjcJointAPI"]
+      delete apiSchemas = ["PhysicsJointStateAPI:angular", "PhysicsDriveAPI:angular", "PhysxJointAPI"]
+    ) {
+      float drive:angular:physics:damping = None
+      float drive:angular:physics:maxForce = None
+      float drive:angular:physics:stiffness = None
+      float drive:angular:physics:targetPosition = None
+      uniform token drive:angular:physics:type = None
+    }
+    /* same pattern for right_jointN */
   }
-  over "linkN" { uniform float mjc:gravcomp = 1 }  /* matching rigid bodies */
+  over "linkN" { uniform float mjc:gravcomp = 1 }
   over "root_joint" ( prepend apiSchemas = ["NewtonArticulationRootAPI"] ) { ... }
   def Scope "actuators" {
-    def MjcActuator "jointN" {
-      /* gainPrm / biasPrm from PhysX stiffness/damping */
-      /* forceRange = ±maxForce; ctrlRange = limits from physics.usda */
+    def MjcActuator "jointN" { /* default Side only */
       rel mjc:target = </RobotRoot/joints/jointN>
     }
   }
@@ -82,10 +103,12 @@ def "RobotRoot" {
 ```
 
 Rules:
-- Only define actuators for joints that exist on **default** Side (`joint1`…).
-- Side-specific actuators go in `Side/left.usda` / `right.usda`, not here.
+- Joint schemas under mujoco: **`MjcJointAPI` only** for actuation (no `PhysicsDriveAPI` / prefer no living `drive:*`).
+- Prismatic grippers: use `PhysicsDriveAPI:linear` / `drive:linear:physics:* = None` analogously.
+- Only define actuators for **default** Side joints (`joint1`…); Side actuators stay in `Side/left|right.usda`.
 - Do not over non-existent finger/gripper prims on the arm base.
-- Map PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso 5000/500; wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
+- Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso may be 60000/6000; wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
+- Reference strip pattern: `Marvin_M6_CCS/payloads/Physics/mujoco.usda`.
 
 ### Newton gravity compensation
 
@@ -165,12 +188,14 @@ def PhysicsRevoluteJoint "left_joint1" (
 ) {
   uniform double mjc:armature = 0.01
   uniform bool mjc:actuatorgravcomp = 1
+  /* PhysX drives may still be authored here for Physics=physx; mujoco.usda must block them (§2) */
   ...
 }
 ```
 
 4. `over "actuators"`: `active=false` on default actuators; `def MjcActuator "left_jointN"` targeting side joints.
 5. `variantSet "Gripper"`/`EE` → left/right mounts, rels to **same** tip/tcp EE path.
+6. Prefer putting PhysX `drive:*` for Side joints only where `Physics=physx` wins; under `Physics=mujoco`, §2 overs must strip Drive so only MjcJoint + MjcActuator remain.
 
 Same merge rule for **gripper** Side files (mimic + Mjc in one `def`).
 
@@ -203,15 +228,17 @@ For each `Side ∈ {default,left,right}` and `Physics ∈ {physx,mujoco}` with E
 
 - EE prim under expected **tip/tcp** (or documented legacy sibling path); `AssemblerFixedJoint` + isaac rels match
 - Active arm/EE joints match Side naming
-- `Physics=mujoco`: actuators resolve; for G-comp assets check `mjc:actuatorgravcomp` / `mjc:gravcomp`
+- `Physics=mujoco`: actuators resolve; **no live PhysX drive** (`PhysicsDriveAPI` gone; `drive:*` blocked / `Get() is None`); for G-comp check `mjc:actuatorgravcomp` / `mjc:gravcomp`
+- `Physics=physx`: DriveAPI + stiffness/damping still present on default and Side joints
 - No **Duplicate prim** / **Cycle detected**
 
-Note: without Isaac schema plugins loaded, `GetAppliedSchemas()` may omit `MjcJointAPI` / `NewtonArticulationRootAPI` even when layer opinions exist — trust prim stack + resolved `mjc:target`.
+Note: without Isaac schema plugins loaded, `GetAppliedSchemas()` may omit `MjcJointAPI` / `NewtonArticulationRootAPI` even when layer opinions exist — trust prim stack + resolved `mjc:target` / blocked `drive:*`.
 
 ### Known USD pitfalls
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
+| Mujoco still shows stiffness/damping | Only deleted DriveAPI schema; attrs remain from `physics`/Side | In `mujoco.usda` set `drive:* = None` (+ Side joint overs) |
 | Side payload fails / EE missing | Duplicate `def`+`over` same name in one layer | Merge into single `def` |
 | Gripper UI option gone | Gripper only inside Side payload, not root | Register `Gripper`/`EE` on root |
 | Actuator unresolved target | All-Side actuators in shared `mujoco.usda` | Default-only in mujoco; side acts in Side; disable the other set |
