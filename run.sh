@@ -144,18 +144,72 @@ if [ ! -d "${ISAACSIM_DIR}" ]; then
     exit 1
 fi
 
-echo ""
-echo "请选择 Isaac Sim 启动模式"
-echo
-echo "  [启动]"
-echo "    1) 正常启动 PhysX (${ISAACSIM_LAUNCH_NORMAL})"
-echo "    2) Newton 物理引擎 (${ISAACSIM_LAUNCH_NEWTON})"
-echo "    3) Headless Streaming (${ISAACSIM_LAUNCH_STREAMING}，仅仿真，不启动控制)"
-echo
-echo "  [其他]"
-echo "    q) 退出"
-echo
-read -r -p "输入选项 [1-3/q]: " isaac_mode
+# 用法: ./run.sh [模式] [实例序号]
+#   模式: 1=PhysX  2=Newton  3=Headless Streaming  q=退出
+#   实例序号仅对 Headless 生效；也可用 FA_SIM_INSTANCE=N
+CLI_MODE="${1:-}"
+CLI_INSTANCE="${2:-}"
+
+is_nonneg_int() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+resolve_streaming_instance() {
+    local instance="${FA_SIM_INSTANCE:-0}"
+    if [ -n "${CLI_INSTANCE}" ]; then
+        instance="${CLI_INSTANCE}"
+    elif [ -z "${CLI_MODE}" ]; then
+        read -r -p "Headless 实例序号 FA_SIM_INSTANCE [${instance}]: " instance_input
+        if [ -n "${instance_input}" ]; then
+            instance="${instance_input}"
+        fi
+    fi
+    if ! is_nonneg_int "${instance}"; then
+        print_error "实例序号必须是非负整数，当前: ${instance}"
+        exit 1
+    fi
+    FA_SIM_INSTANCE="${instance}"
+}
+
+apply_streaming_isolation() {
+    local signal_port stream_port domain_id
+    signal_port=$((STREAM_SIGNAL_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
+    stream_port=$((STREAM_STREAM_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
+    domain_id=$((ROS_DOMAIN_ID_BASE + FA_SIM_INSTANCE))
+
+    if [ "${domain_id}" -gt 232 ]; then
+        print_error "ROS_DOMAIN_ID=${domain_id} 超出有效范围 0–232（BASE=${ROS_DOMAIN_ID_BASE}, INSTANCE=${FA_SIM_INSTANCE}）"
+        exit 1
+    fi
+
+    export ROS_DOMAIN_ID="${domain_id}"
+    STREAM_SIGNAL_PORT="${signal_port}"
+    STREAM_STREAM_PORT="${stream_port}"
+
+    print_info "Headless 多实例隔离已应用:"
+    print_info "  FA_SIM_INSTANCE=${FA_SIM_INSTANCE}"
+    print_info "  livestream signalPort(TCP)=${STREAM_SIGNAL_PORT}"
+    print_info "  livestream streamPort(UDP)=${STREAM_STREAM_PORT}"
+    print_info "  ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
+}
+
+if [ -z "${CLI_MODE}" ]; then
+    echo ""
+    echo "请选择 Isaac Sim 启动模式"
+    echo
+    echo "  [启动]"
+    echo "    1) 正常启动 PhysX (${ISAACSIM_LAUNCH_NORMAL})"
+    echo "    2) Newton 物理引擎 (${ISAACSIM_LAUNCH_NEWTON})"
+    echo "    3) Headless Streaming (${ISAACSIM_LAUNCH_STREAMING}，仅仿真，不启动控制)"
+    echo "       多实例: 端口/ROS_DOMAIN_ID 按 FA_SIM_INSTANCE 累加"
+    echo
+    echo "  [其他]"
+    echo "    q) 退出"
+    echo
+    read -r -p "输入选项 [1-3/q]: " isaac_mode
+else
+    isaac_mode="${CLI_MODE}"
+fi
 
 cd "${ISAACSIM_DIR}" || { print_error "无法进入目录: ${ISAACSIM_DIR}"; exit 1; }
 
@@ -182,8 +236,12 @@ case "${isaac_mode:-1}" in
             print_error "未找到可执行文件 ${ISAACSIM_DIR}/${ISAACSIM_LAUNCH_STREAMING}，请确认脚本存在且有执行权限。"
             exit 1
         fi
+        resolve_streaming_instance
+        apply_streaming_isolation
         print_info "启动 Isaac Sim（Headless Streaming 模式）..."
-        "./${ISAACSIM_LAUNCH_STREAMING}"
+        "./${ISAACSIM_LAUNCH_STREAMING}" \
+            --/exts/omni.kit.livestream.app/primaryStream/signalPort="${STREAM_SIGNAL_PORT}" \
+            --/exts/omni.kit.livestream.app/primaryStream/streamPort="${STREAM_STREAM_PORT}"
         ;;
     q|Q)
         echo "已退出。"
@@ -191,6 +249,7 @@ case "${isaac_mode:-1}" in
         ;;
     *)
         print_error "无效选项: ${isaac_mode}"
+        print_info "用法: ./run.sh [1|2|3|q] [FA_SIM_INSTANCE]"
         exit 1
         ;;
 esac
