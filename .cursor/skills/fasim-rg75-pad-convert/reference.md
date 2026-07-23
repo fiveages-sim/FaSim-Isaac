@@ -166,8 +166,9 @@ prepend rel material:binding:physics = </RG75/Looks/PadMaterials>
 5. **保留 mesh 内部 0.001 scale / 180° 旋转**  
    写在 `pad_*.usda` 的 mesh xform；mount 容器再叠 finger/base 相对 TF。
 
-6. **双臂勿用 `scale=-1` 镜像整套 tip**  
-   优先独立 CAD 或旋转。源资产指间偶发负 scale：PhysX 可保留；本 skill 不要求为 Newton bake。
+6. **勿用 mount `scale=-1`；不规则 tip 走 Track C**  
+   人工两份 tip usdc（`pad.usdc` + `pad_right.usdc`）+ cube 碰撞；Side 用 nested `arm` 互换文件。见 [track-c-simplified-collision.md](track-c-simplified-collision.md)。  
+   **禁止**再做 AI `pad_mirror` bake 当主路径。
 
 6b. **先比 L/R mesh hash，再决定是否分 `left/`/`right/`**  
    文件级 `md5 geometries.usd` 常因元数据差 1 字节而不同；以 **Mesh points/indices hash** + **pad_* 文本块** 为准。load_type1（原 PTC）：全 mesh 相同、pad 块相同 → 单包，无 arm sticky。

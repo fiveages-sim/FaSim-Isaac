@@ -104,6 +104,30 @@ Pad/heavy_carry/right/...
 
 ---
 
+## Example: load_type2（Track C — 人工 cube 碰撞 + 双 usdc）
+
+**输入（人已做好）：** `pad.usdc`、`pad_right.usdc`（各含 `/root/collision/Cube*`，`boundingCube`）。  
+**输出：** `load_type2.usda` 分挂左右；nested `arm` + Side sticky；无 `pad_mirror`、无 mount 负 scale。
+
+### 任务澄清（易混点）
+
+| 现象 | 原因 | 正确做法 |
+|------|------|----------|
+| 左右 Stage 同时出现 collision | 两指都 payload 同一 `pad.usdc` | 右指改 `@./pad_right.usdc@` |
+| mesh 与 cube 都碰 | mount 曾给视觉 mesh 开 convexDecomposition | 关 mesh 碰撞；只用 cubes |
+| 需要镜像 | 形状不规则，不能靠旋转 | 人 Save As 第二份 usdc 手调；不要 AI bake |
+
+### Agent 已做适配
+
+- 左指 → `pad_right.usdc` + `(-90,0,0)`；右指 → `pad.usdc` + `(-90,180,0)`；`scale=(1,1,1)`
+  （`pad_right.usdc` ≈ 旧左指 `pad.usdc*scale(-1,1,1)`；勿按文件名挂右指）
+- `arm=left/right` **同内容**（不按 side 互换 tip；scanner 在 base 上，互换会把 pad 相对 scanner 翻面）
+- 视觉 mesh 无碰撞；已删 `pad_mirror.usdc`
+
+细则与 GUI 前置步骤：[track-c-simplified-collision.md](track-c-simplified-collision.md)。
+
+---
+
 ## Example: 下一款「对称双指」pad（预期流程）
 
 1. **先** L/R mesh hash + pad 块 diff。  

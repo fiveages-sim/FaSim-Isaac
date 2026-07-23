@@ -1,13 +1,11 @@
 ---
 name: fasim-rg75-pad-convert
 description: >-
-  Converts legacy Jodell RG75-with-pad gripper USD assets (Asset Transformer USDA
-  start) into modern Pad payloads on robots/grippers/Jodell/RG75: extract pad
-  prims, bake geometries, register purpose-named Pad variants (e.g. heavy_carry,
-  load_type1), Side sticky L/R meshes, and joint rename via side. Validated for
-  PhysX. Use when converting old RG75 pads, heavy_carry / type1 / load_type1
-  (legacy PTC) fingers, Pad variants, Side sticky arm pads, Asset Transformer
-  gripper USDA, or dual-arm W2/M6 RG75 EE mounts.
+  Converts legacy Jodell RG75-with-pad gripper USD assets into modern Pad
+  payloads on robots/grippers/Jodell/RG75. Tracks: A bake from Asset Transformer;
+  B thin USDC mount; C human cube-collider tip USDCs (pad.usdc + pad_right.usdc,
+  Side sticky swap, no scale=-1). Use for heavy_carry, type1, load_type1,
+  load_type2, detector pads, simplified Cube collision tips, Side sticky arm.
 ---
 
 # FaSim RG75 Pad Convert
@@ -19,11 +17,27 @@ description: >-
 - 根与 variants：`robots/grippers/Jodell/RG75/RG75.usda`
 - 对称双指同 mesh：`payloads/Pad/type1/`（`type1.usda` + `pad.usdc`）
 - 非对称 + 左右 CAD + Side sticky：`payloads/Pad/heavy_carry/`
-- type1-like 多件 tip（用途名）：`payloads/Pad/load_type1/`（旧称 PTC）
+- type1-like bake：`payloads/Pad/load_type1/`
+- **USDC 薄挂载**：`payloads/Pad/detector_type1/`
+- **Track C 简化碰撞**：`payloads/Pad/load_type2/`（`pad.usdc` + `pad_right.usdc` + cube colliders）
 - Side 关节前缀：`payloads/Side/left.usda` | `right.usda`
+- Sensor 扫码器例：`payloads/Sensor/scanner_type1/`
+
+## 三轨起点
+
+| Track | 何时用 | 产物 |
+|-------|--------|------|
+| **A — bake** | 有左右整爪 Asset Transformer USDA | geometries + instances，体积大，少负 scale |
+| **B — USDC** | 现成 tip usdc + 已知 TF；可用旋转对齐 | 单/`N` 个 tip usdc + 薄 mount；**禁止** mount `scale=-1` |
+| **C — 简化碰撞 USDC** | 人已在 tip usdc 里摆好 `/root/collision/Cube*`；不规则只能镜像 | `pad.usdc` + `pad_right.usdc`；mount 只挂碰撞 cube；`arm`+Side 互换文件 |
+
+**拿到已简化碰撞的 tip usdc → 走 Track C**，细则：[track-c-simplified-collision.md](track-c-simplified-collision.md)。  
+`load_type2` 是 Track C golden（已弃用 AI `pad_mirror`）。
+
+Track B/C 视觉：`finger_support` 默认 **`inherited`**（对齐 `detector_type1`）；勿照抄 type1 的 `invisible`。
 
 **验收引擎：PhysX（主路径）。**  
-`heavy_carry` / `type1` / `load_type1` 等在 **PhysX + ROS2 运控** 下验收。本 skill **不负责** Newton/MJWarp tip 调参。
+本 skill **不负责** Newton/MJWarp tip 调参。
 
 ## Pad variant 命名（按用途 / 场景）
 
@@ -41,7 +55,7 @@ description: >-
 **硬约束：**
 - 不破坏 `type1`；尽量只 **新增** `Pad/<purpose_name>/` + 在 `RG75.usda` 登记同名 variant +（必要时）Side sticky；heavy 可按需在共享 `Physics/mujoco.usda` 留 collision overs（与已提交版一致）。
 - **不要**用整爪替换底座；只抽 pad。
-- 双臂 L/R：**优先独立 CAD 或合法旋转**；勿用 `scale=-1` 做臂间镜像（源资产指间负 scale 在 PhysX 可保留，见 examples）。
+- 双臂 L/R：**优先独立 CAD 或合法旋转**；勿用 mount `scale=-1`。不规则 tip → **Track C** 两份 usdc（人工 cube 碰撞），见 [track-c-simplified-collision.md](track-c-simplified-collision.md)。
 - 不要为某一款 pad 改 RG75 相对 TCP 的全局朝向（会搞坏其他 Pad）。
 - 双臂父机（W2/M6）：优先只改 EE/Pad **payload 或 variant sticky**；勿改父机核心代码/非 payload 层。
 
