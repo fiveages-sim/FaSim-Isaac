@@ -270,8 +270,6 @@ if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir 
         git sparse-checkout set --no-cone \
             "/.gitmodules" \
             "/humanoid/FiveAges/" \
-            "/humanoid/FiveAges_W2/" \
-            "/manipulators/Marvin/" \
             "/manipulators/Tianji/" \
             "/stands/Dual_Stand1/" \
             "/sensors/" \
