@@ -24,7 +24,7 @@ prim path, MuJoCo actuators only for existing joints.
 - `robots/grippers/Jodell/RG75/`, `robots/grippers/ChangingTek/AG2F120S/` — gripper mujoco + Side
 - `robots/humanoid/Galaxea_R1/` — torso + SteerChassis mujoco; dual A1 arms
 - `robots/humanoid/FiveAges/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
-- `robots/mobile_base/Linkhou_S2_V1/` — four-steer / four-wheel mujoco
+- `../../../robots/mobile_base/Linkhou/S2_V1/` — four-steer / four-wheel mujoco
 - `robots/manipulators/ARX 6.0/X5/` — Side → EE mount shape (`payloads/EE/`, shared EE prim)
 
 **Do not** blind-copy A1X joint axes / `localPos` / limits / **EE flange quats**. Port
@@ -210,7 +210,7 @@ Standalone grippers (RG75, AG2F120S, …): own `Physics=mujoco`, Side rename, mi
 
 ## 7. Composite parents (dual / embedded arms)
 
-Examples: `Galaxea_R1`; `FiveAges/W2` (torso + `Head_V1` + `Linkhou_S2_V1` + dual `Marvin_M6_CCS`).
+Examples: `Galaxea_R1`; `FiveAges/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `Marvin_M6_CCS`).
 
 | Topic | Rule |
 |-------|------|
