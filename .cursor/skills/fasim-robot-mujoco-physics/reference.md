@@ -212,3 +212,13 @@ Prim rename (`Galaxea_A1` → `Galaxea_A1_Left`) remaps absolute paths under the
 - Root may omit a sticky `Physics=` opinion if auto-switching from Newton is required (session layer).
 - Child EE / child arm Physics is usually flipped by VariantSwitcher when parent uses Newton/MuJoCo — avoid stacking conflicting child Physics selections in parent Physics variants or in Arm mounts unless tested.
 - Prefer sticky `Robot=` / `Chassis=` on composites so envs that only set a subset of variants still compose arms.
+
+## Nested chassis (Tracer / Cobot Magic)
+
+Match Galaxea_R1: Chassis adapter payloads the shared base, welds `AssemblerFixedJoint`, zeros wheel joint states. Sticky `ROS=enable` + Graph retarget on the mount or parent root `over`; **never** sticky `Physics` on the mount.
+
+- ArticulationRoot: delete on the prim that has it (Tracer: child root; SteerChassis: `base_link`). Arms: `root_joint` `active=false` only.
+- Parent Physics payloads must `over` Tracer / X5 / R5 / nested grippers with matching `Physics=` (X5/R5 have no default).
+- Nested `ArticulationController`: author `token[] inputs:jointNames`; ConstructArray v1 output does not resolve under payload → `Invalid DOF name ()`.
+- **Illegal USDA:** `delete token[] inputs:jointNames.connect` (no `= </…>`) fails the **entire** adapter parse; mounted child is empty. Always `Sdf.Layer.FindOrOpen` the adapter.
+- PhysX wheel velocity drive (`stiffness=0`, `damping=1e5`) stays in `physx.usda`. MuJoCo wheels: damping-bias actuators only — do not copy `1e5`.

@@ -120,11 +120,55 @@ After renaming variant **options**, update env selections or components never lo
 
 | Item | PhysX / OCS2 need |
 |------|-------------------|
-| One root | Chassis `PhysicsArticulationRootAPI` |
-| Child roots | Deleted on assembled child `base_link` / gripper `root_joint` |
-| `robotJoints` | Includes arms + **active** gripper joints under merged tree |
-| Controller target | OmniGraph `ArticulationController` → chassis `base_link` |
-| Joint names | Match URDF / OCS2 (`left_gripper_joint`, `left_joint1`, …) |
+| One root | Parent `PhysicsArticulationRootAPI` (chassis `base_link` or composite root) |
+| Chassis child root | Delete ArticulationRoot on the prim that **has** it (SteerChassis `base_link`; Tracer child root). Galaxea: `PhysicsArticulationRootAPI` only |
+| Arm / EE child root | `root_joint` `active = false` **only** — do not delete ArticulationRoot APIs |
+| `robotJoints` | Includes chassis + arms + **active** gripper joints under merged tree |
+| Controller target | Nested chassis `ArticulationController.targetPrim` → **parent root** (merged DOFs) |
+| Odometry | Nested `ComputeOdometry.chassisPrim` → parent `base_footprint` / `base_link` |
+| Joint names | Authored `token[]`, matching URDF / OCS2 / wheel names |
+
+---
+
+## Nested chassis ROS (Cobot Magic / Galaxea_R1)
+
+Child chassis graphs (`cmd_vel`, `/odom`) stay on the child asset. After merge they must be **retargeted** from the parent (mount adapter or root `over "ChassisPrim"` like `Galaxea_R1.usda`):
+
+```usda
+over "ArticulationController"
+{
+    custom token[] inputs:jointNames = ["left_wheel", "right_wheel"]
+    custom rel inputs:targetPrim = </ParentRoot>
+}
+over "ComputeOdometry"
+{
+    custom rel inputs:chassisPrim = </ParentRoot/base_footprint>
+}
+```
+
+Sticky child `ROS=enable` on the chassis mount (or parent root over). Do **not** sticky `Physics` there.
+
+### `Invalid DOF name ()`
+
+`OgnIsaacArticulationController` `get_dof_indices` with an empty string. `targetPrim` may already be the merged parent (Available DOFs include wheels **and** arm joints) — the bug is **empty `jointNames`**, not a missing wheel.
+
+Cause: `omni.graph.nodes.ConstructArray` v1 `outputs:array` is an unresolved extended `token` (template even authors `custom token`, not `token[]`). Nested as payload, OG often fails to resolve → `jointNames` becomes `()` / `[""]`.
+
+Fix: author `token[] inputs:jointNames = ["left_wheel", "right_wheel"]` on the controller. Drop the ArrayNames connection. Do **not** use joint **indices** (they shift when arms are added/removed).
+
+### USDA: never `delete token[] attr.connect`
+
+```usda
+delete token[] inputs:jointNames.connect    # ILLEGAL — no connect target
+```
+
+Parser error (`matching … KeywordConnect … Assignment … ConnectValue at ''`). **The whole adapter layer fails to open.** Chassis payload does not load; child prim is `defined=False`, empty children — looks like the mounted robot was “ruined”.
+
+- Do not write `delete <type> <attr>.connect` without `= </Path.outputs:…>`.
+- If the child graph no longer has a connection, a stronger-layer **value** is enough.
+- Always `Sdf.Layer.FindOrOpen(adapter)` after editing USDA. `Usd.Stage.Open(parent)` will only warn; the child looks missing.
+
+PhysX wheel `damping=1e5` is **not** a MuJoCo actuator gain. Wheels: `stiffness=0` → damping-bias `MjcActuator`; do not copy PhysX damping into `mujoco.usda`.
 
 ---
 
@@ -136,22 +180,28 @@ After renaming variant **options**, update env selections or components never lo
 | PhysX open OK, close fails (OCS2) | Adaptive force feedback vs `maxForce` | Lower PhysX `maxForce` below threshold; widen mimic follower limits |
 | Only one finger moves | Soft/wrong PhysX mimic (`gearing`/`NF`) | Match `left_physic.usd`: `gearing=-1`, `NF=0` |
 | Physics won’t auto-switch after rename | Env still selects old option `"base"` | Update `empty.usda` selections to new names |
-| Child Physics stuck | Sticky Physics on mount/env | Remove sticky; use nested overs or VariantSwitcher only |
+| Child Physics stuck | Sticky Physics on mount/env | Remove sticky; push from parent Physics payload or VariantSwitcher |
 | Mimic error on EE change | Hot-load during sim | Stop sim before EE variant change |
 | Arms freeze under Newton | Side DriveAPI still live | `mujoco.usda` strip Drive; Physics before Side |
+| Nested `CreateJoint - no bodies` | Child arm has no Physics default; mount did not sticky Physics (correct) | Parent `Physics/*.usda` `over` child `Physics=physx\|mujoco` |
+| Arm joints vanish after mount | Deleted ArticulationRoot APIs on arm `root_joint` | `active = false` only |
+| `Invalid DOF name ()` | ConstructArray `jointNames` empty when nested | Author `token[] inputs:jointNames` on the controller |
+| Mounted chassis empty / “ruined” | Adapter USDA parse error (often illegal `delete …connect`) | `Sdf.Layer.FindOrOpen` the adapter; remove illegal delete |
 
 ---
 
 ## Compose smoke test (isaacsim python)
 
 ```python
-from pxr import Usd
+from pxr import Usd, Sdf
+assert Sdf.Layer.FindOrOpen(".../payloads/Chassis/tracer_v1.usda")
 stage = Usd.Stage.Open(".../env/empty.usda")
 root = stage.GetPrimAtPath("/World/ARX_LIFT2S")
 root.GetVariantSets().GetVariantSet("Physics").SetVariantSelection("physx")
 # Assert nested AC_One_Base / Arm_* / Gripper_* / omnia_150 Physics == "physx"
 # Assert left_gripper_joint maxForce / stiffness; left_joint8 gearing / limits
 # Print GetPropertyStack for maxForce (physx.usda should beat Side)
+# Nested chassis: child prim IsDefined(); ArticulationController jointNames + targetPrim
 ```
 
 Repeat with `"mujoco"` and confirm Drive stripped / actuators resolve.

@@ -4,10 +4,11 @@ description: >-
   Ports FaSim-Isaac manipulator/gripper/composite USD assets to MuJoCo/Newton:
   Physics=mujoco, Side left/right MjcActuators, tip/tcp-nested seamless EE mounts,
   VariantSwitcher-friendly child Physics, actuator gravity compensation, and
-  composite parents (Galaxea_R1, FiveAges W2). Use when adding or fixing mujoco
-  physics, Newton, Gripper/EE mounts, Side joint renaming / mount orientation,
-  parent↔child Sensor/Physics policy, or converting robots to match Galaxea_A1X /
-  Marvin_M6_CCS / FiveAges_W2 patterns.
+  composite parents (Galaxea_R1, FiveAges W2, Cobot Magic V1). Use when adding or
+  fixing mujoco physics, Newton, Gripper/EE mounts, Side joint renaming / mount
+  orientation, parent↔child Sensor/Physics policy, nested chassis ROS, or
+  converting robots to match Galaxea_A1X / Marvin_M6_CCS / FiveAges_W2 / Tracer_V1
+  patterns.
 ---
 
 # FaSim Robot MuJoCo / Physics Port
@@ -24,7 +25,9 @@ prim path, MuJoCo actuators only for existing joints.
 - `robots/grippers/Jodell/RG75/`, `robots/grippers/ChangingTek/AG2F120S/` — gripper mujoco + Side
 - `robots/humanoid/Galaxea_R1/` — torso + SteerChassis mujoco; dual A1 arms
 - `robots/humanoid/FiveAges/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
+- `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual ARX X5/R5
 - `../../../robots/mobile_base/Linkhou/S2_V1/` — four-steer / four-wheel mujoco
+- `robots/mobile_base/Agilex/Tracer_V1/` — differential wheels; PhysX velocity drive ≠ MuJoCo actuator
 - `robots/manipulators/ARX 6.0/X5/` — Side → EE mount shape (`payloads/EE/`, shared EE prim)
 
 **Do not** blind-copy A1X joint axes / `localPos` / limits / **EE flange quats**. Port
@@ -108,6 +111,7 @@ Rules:
 - Only define actuators for **default** Side joints (`joint1`…); Side actuators stay in `Side/left|right.usda`.
 - Do not over non-existent finger/gripper prims on the arm base.
 - Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso may be 60000/6000; wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
+- **Do not** copy PhysX wheel `damping=1e5` into MuJoCo actuators (that number is PhysX velocity-drive damping, not MJC `gainPrm`).
 - Reference strip pattern: `Marvin_M6_CCS/payloads/Physics/mujoco.usda`.
 
 ### Newton gravity compensation
@@ -210,17 +214,20 @@ Standalone grippers (RG75, AG2F120S, …): own `Physics=mujoco`, Side rename, mi
 
 ## 7. Composite parents (dual / embedded arms)
 
-Examples: `Galaxea_R1`; `FiveAges/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `Marvin_M6_CCS`).
+Examples: `Galaxea_R1`; `FiveAges/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `Marvin_M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5).
 
 | Topic | Rule |
 |-------|------|
 | Arm Side | Sticky `Side=left` / `right` on each child arm payload |
 | Gripper/EE | On child arm (or its default); seamless path including tip/tcp if arm uses that pattern |
-| Sensor override | Parent mount may sticky child EE `Sensor` when assembly default differs (e.g. R1 → d435) |
-| Physics | Parent: torso (+ head/chassis) own `mujoco`; **do not bake** child `Physics=mujoco` — VariantSwitcher |
-| Chassis | Drop child ArticulationRoot + FixedJoint into parent; steer position-PD vs wheel damping-bias |
+| Sensor override | Parent mount may sticky child EE `Sensor` when assembly default differs (e.g. R1 / Cobot Magic → d435) |
+| Physics | Parent Physics **payloads** `over` children `Physics=…`; **never** sticky Physics on Chassis/Arm **mounts** (VariantSwitcher) |
+| Child no Physics default | X5/R5-style arms: parent **must** push Physics or PhysX `CreateJoint - no bodies` |
+| Arm `root_joint` | `active = false` only — do not delete ArticulationRoot APIs |
+| Chassis | Drop child ArticulationRoot on the prim that has it + FixedJoint; steer position-PD vs wheel damping-bias |
+| Nested ROS | Retarget `targetPrim` → parent root, `chassisPrim` → parent base; author `token[] jointNames` (no ConstructArray v1) |
 | Order | Parent `prepend variantSets` starts with `Physics` |
-| Validation | Compose full stack; set child `Physics=mujoco` in the test script to assert remapped actuators |
+| Validation | `Sdf.Layer.FindOrOpen` adapters; compose full stack; assert child Physics + remapped actuators |
 
 ## 8. Validate
 
@@ -243,12 +250,18 @@ Note: without Isaac schema plugins loaded, `GetAppliedSchemas()` may omit `MjcJo
 | Gripper UI option gone | Gripper only inside Side payload, not root | Register `Gripper`/`EE` on root |
 | Actuator unresolved target | All-Side actuators in shared `mujoco.usda` | Default-only in mujoco; side acts in Side; disable the other set |
 | Seamless Side break | Different EE prim names per Side | Unify path under tip/tcp; switch via EE Side |
-| Child Physics won’t flip | Parent sticky / authoring-layer Physics opinion | Remove overlay; let VariantSwitcher write session |
+| Child Physics won’t flip | Parent sticky / authoring-layer Physics opinion | Remove overlay; let VariantSwitcher write session; push from parent Physics payload |
 | Gripper “not on tcp” | Root-sibling mount | Nest under tip/tcp; fix rels + relative xform |
 | G-comp no effect | Only `actuatorgravcomp` without body `gravcomp` | Set both |
 | Composition cycle | `physics.usda` subLayers robot root | Remove that subLayer |
 | Left/right flange identical | Copied default flange into all mounts | Restore Side-specific orient/`localRot*` |
+| Nested `CreateJoint - no bodies` | Child Physics unset; mount correctly unsticky | Parent `Physics/*.usda` overs child Physics |
+| Arm joints gone after weld | Deleted ArticulationRoot on arm `root_joint` | `active = false` only |
+| `Invalid DOF name ()` | Nested ConstructArray `jointNames` empty | Author `token[] inputs:jointNames` on controller |
+| Mounted chassis empty | Adapter USDA parse fail (`delete …connect` without target) | Open adapter with `Sdf.Layer.FindOrOpen`; fix USDA |
+| MJC wheels explode / overdamped | Copied PhysX `damping=1e5` into actuators | `stiffness=0` → small gain + damping-bias only |
 
 ## Extra detail
 
-- Mount/actuator templates, A1 flange notes, R1/W2 sketches: [reference.md](reference.md)
+- Mount/actuator templates, A1 flange notes, R1/W2/Cobot Magic chassis: [reference.md](reference.md)
+- Nested chassis ROS / illegal USDA `delete …connect`: companion `USDA-OCS2-PhysX-Mujoco` [reference.md](../USDA-OCS2-PhysX-Mujoco/reference.md)

@@ -5,8 +5,10 @@ description: >-
   Assembler, builds Physics/Side/component variants, and tunes PhysX + MuJoCo
   layers for stable OCS2 / ros2_control. Use when importing URDF, Asset
   Transformer, Robot Assembler, variantSets, VariantSwitcher, Physics=physx|
-  mujoco, gripper mimic/drive, AdaptiveGripperController, Newton vs PhysX, or
-  ARX Lift2S / LunarBot style mobile manipulators.
+  mujoco, gripper mimic/drive, AdaptiveGripperController, Newton vs PhysX,
+  nested Chassis/arm ROS graphs, ArticulationController jointNames, USDA parse
+  errors on adapter payloads, Cobot Magic / Tracer / ARX Lift2S / LunarBot
+  mobile manipulators.
 ---
 
 # Isaac URDF → USDA → Variants → OCS2 Physics
@@ -19,6 +21,9 @@ End-to-end workflow for ROS robots in **Isaac Sim 6**: import, assemble, variant
 
 | Robot | Path |
 |-------|------|
+| Galaxea_R1 | `robots/humanoid/Galaxea_R1/` — Chassis + nested ROS retarget |
+| Cobot Magic V1 | `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual X5/R5 |
+| Tracer V1 | `robots/mobile_base/Agilex/Tracer_V1/` |
 | ARX Lift2S 6.0 | `FaSim-Isaac/robots/mobile_manipulator/ARX_Lift_2S_6.0/ARX_LIFT2S/` |
 | Old ARX Lift2S PhysX | `FaSim-Isaac/robots/mobile_manipulator/ARX_Lift2S/` + `manipulators/ARX/ARX5_Gripper_2025/configuration/left_physic.usd` |
 | Notes | `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md` |
@@ -34,7 +39,9 @@ End-to-end workflow for ROS robots in **Isaac Sim 6**: import, assemble, variant
 - [ ] 6. Nested Physics propagation OR VariantSwitcher-friendly (no sticky child Physics on mounts)
 - [ ] 7. Env selections match variant *option* names after renames
 - [ ] 8. PhysX drives/mimic + Side robotJoints; MuJoCo strip Drive + MjcActuator
-- [ ] 9. Validate OCS2 open/close + arms under PhysX and Newton separately
+- [ ] 9. Nested ROS: retarget targetPrim/chassisPrim; author jointNames (no ConstructArray)
+- [ ] 10. `Sdf.Layer.FindOrOpen` every new adapter USDA before blaming the child asset
+- [ ] 11. Validate OCS2 open/close + arms under PhysX and Newton separately
 ```
 
 ---
@@ -73,14 +80,14 @@ Prefer file import over ROS2 URDF node (Fast DDS vs Zenoh mismatches).
 
 1. Attach **child → parent** with xacro mount pose (prefer named robot links/sites).
 2. Set **Assembly Namespace** to the prim name used in variants (e.g. `AC_One_Base`, `Arm_Left`).
-3. On the child: **delete** `PhysicsArticulationRootAPI` / `PhysxArticulationAPI` / `NewtonArticulationRootAPI` from child root; Assembler adds `AssemblerFixedJoint`.
-4. Parent should keep a single articulation root (e.g. chassis `base_link`).
-5. Merge DOFs with `isaac:physics:robotJoints` / `robotLinks` pointing at composed child paths.
-6. **Do not** hot-swap gripper EE mid-sim (PhysxMimicJoint fails). Assemble with EE selected, or stop sim before changing EE.
+3. Parent keeps a single articulation root. Merge DOFs with `isaac:physics:robotJoints` / `robotLinks` at composed child paths.
+4. **Do not** hot-swap gripper EE mid-sim (PhysxMimicJoint fails). Assemble with EE selected, or stop sim before changing EE.
+
+**Chassis** — delete ArticulationRoot on the prim that actually has it (Galaxea SteerChassis: `base_link`; Tracer: child **root**). Galaxea only deletes `PhysicsArticulationRootAPI`. Assembler adds `AssemblerFixedJoint`.
 
 ```usda
 over "base_link" (
-    delete apiSchemas = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI", "NewtonArticulationRootAPI"]
+    delete apiSchemas = ["PhysicsArticulationRootAPI"]
 ) {
     def PhysicsFixedJoint "AssemblerFixedJoint" {
         rel physics:body0 = </Parent/.../mount_link>
@@ -89,6 +96,8 @@ over "base_link" (
     }
 }
 ```
+
+**Arms / EE** — `over "root_joint" ( active = false )` **only**. Do **not** `delete apiSchemas` ArticulationRoot on the arm `root_joint` (that dropped child joints / `CreateJoint - no bodies`).
 
 ---
 
@@ -140,8 +149,9 @@ Isaac `omni.physics.isaacsimready` **VariantSwitcher** sets `Physics` on the **s
 Rules:
 
 - Do **not** sticky `Physics=` on the edit/authoring layer of env files for prims you want auto-switched.
-- Do **not** bake conflicting child `Physics=` on arm/EE **mount** adapters (fights session clears).
-- Composite roots may **push** child Physics inside the root’s Physics variant body so nested arms/grippers/wheels flip with the parent:
+- Do **not** bake conflicting child `Physics=` on Chassis/arm/EE **mount** adapters (fights session clears).
+- Parent **Physics payloads** push nested children (`over "Child" ( variants = { Physics = physx } )`). Arms like ARX X5/R5 often have **no authored Physics default** (VariantSwitcher); without the push, nested joints lack RigidBody → PhysX `CreateJoint - no bodies`.
+- Same nested overs may live in the root `variantSet "Physics"` body:
 
 ```usda
 variantSet "Physics" = {
@@ -175,7 +185,8 @@ variantSet "Physics" = {
 ### 4.1 PhysX (OCS2 / ArticulationController)
 
 - Position joints: `drive:*:physics:type = "force"`, stiffness/damping/maxForce tuned.
-- Single articulation root on chassis; children roots deleted.
+- Continuous wheels: `stiffness=0`, high PhysX damping (e.g. `1e5`); **do not** copy that damping into MuJoCo actuators.
+- Single parent articulation root; chassis child ArticulationRoot deleted on the prim that has it; arm/EE `root_joint` is `active=false` only.
 - Grippers: see [reference.md](reference.md) § Gripper PhysX + OCS2.
 - Side left/right: `robotJoints` must list **active** renamed joints (`left_gripper_joint`), not deactivated `gripper_joint`.
 
@@ -191,9 +202,10 @@ variantSet "Physics" = {
 
 Typical stack:
 
-- Isaac OmniGraph: `ROS2SubscribeJointState` → `IsaacArticulationController` on chassis `base_link`.
+- Isaac OmniGraph: `ROS2SubscribeJointState` → `IsaacArticulationController` on the **merged** articulation prim (parent root / chassis `base_link`).
 - Publish `joint_states` via `IsaacReadJointState`.
 - Host: `topic_based_ros2_control` + `ocs2_arm_controller` + `adaptive_gripper_controller`.
+- Nested chassis `cmd_vel` graphs: retarget + author `jointNames` — see [reference.md](reference.md) § Nested chassis ROS.
 
 Gripper AdaptiveGripperController:
 
@@ -221,6 +233,6 @@ Play checklist:
 
 ## Additional resources
 
-- [reference.md](reference.md) — gripper PhysX/OCS2, mimic gearing, VariantSwitcher skip rules, troubleshooting
+- [reference.md](reference.md) — gripper PhysX/OCS2, nested chassis ROS, USDA `delete …connect` parse trap, VariantSwitcher
 - Project notes: `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md`
 - NVIDIA: [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/latest/robot_setup/asset_structure.html)
