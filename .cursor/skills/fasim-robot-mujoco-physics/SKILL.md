@@ -24,7 +24,7 @@ prim path, MuJoCo actuators only for existing joints.
 - `robots/manipulators/Tianji/Marvin_M6_CCS/` — **recommended EE hierarchy** (prim under `link7/tcp`) + EE variant
 - `robots/grippers/Jodell/RG75/`, `robots/grippers/ChangingTek/AG2F120S/` — gripper mujoco + Side
 - `robots/humanoid/Galaxea_R1/` — torso + SteerChassis mujoco; dual A1 arms
-- `robots/humanoid/FiveAges/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
+- `robots/humanoid/FiveAges/Gen2/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
 - `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual ARX X5/R5
 - `../../../robots/mobile_base/Linkhou/S2_V1/` — four-steer / four-wheel mujoco
 - `robots/mobile_base/Agilex/Tracer_V1/` — differential wheels; PhysX velocity drive ≠ MuJoCo actuator
@@ -214,7 +214,7 @@ Standalone grippers (RG75, AG2F120S, …): own `Physics=mujoco`, Side rename, mi
 
 ## 7. Composite parents (dual / embedded arms)
 
-Examples: `Galaxea_R1`; `FiveAges/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `Marvin_M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5).
+Examples: `Galaxea_R1`; `FiveAges/Gen2/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `Marvin_M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5).
 
 | Topic | Rule |
 |-------|------|

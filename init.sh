@@ -295,7 +295,7 @@ for spec in "${NESTED_SPECS_TO_PROCESS[@]}"; do
     rest="${spec#*:}"
     relative_path="${rest#*:}"
     [ ! -d "$parent_dir" ] && continue
-    (cd "$parent_dir" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
+    (cd "$parent_dir" && git submodule sync -- "$relative_path" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
 done
 
 # 遍历所有第一层子模块，切换到 main 分支并拉取最新提交
@@ -382,6 +382,7 @@ for nested_spec in "${nested_specs[@]}"; do
     fi
     branch_name=${branch_name:-main}
     print_info "处理嵌套子模块: $parent_dir/$relative_path -> 分支: $branch_name"
+    (cd "$REPO_DIR/$parent_dir" && git submodule sync -- "$relative_path") || true
     cd "$full_path"
     git fetch origin 2>/dev/null || print_warn "  获取远程更新失败，继续..."
     if git ls-remote --exit-code --heads origin "$branch_name" >/dev/null 2>&1; then
