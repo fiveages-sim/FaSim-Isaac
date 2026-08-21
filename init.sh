@@ -58,28 +58,275 @@ if [ ! -d ".git" ]; then
     exit 1
 fi
 
+trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:space:]]}"}"; }
+
+NESTED_PUBLIC_SPECS=()
+NESTED_PRIVATE_SPECS=()
+TOP_LEVEL_PRIVATE_PATHS=()
+CATALOG_PARENT=()
+CATALOG_PATH=()
+CATALOG_VIS=()
+CATALOG_KIND=()
+CATALOG_SEL=()
+CATALOG_N=0
+
+load_visibility_conf() {
+    NESTED_PUBLIC_SPECS=()
+    NESTED_PRIVATE_SPECS=()
+    TOP_LEVEL_PRIVATE_PATHS=()
+    local line parent_dir relative_path visibility gitmodules_file spec
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(trim "$line")"
+        [ -z "$line" ] && continue
+        IFS='|' read -r parent_dir relative_path visibility <<< "$line"
+        parent_dir=$(trim "$parent_dir")
+        relative_path=$(trim "$relative_path")
+        visibility=$(trim "$visibility")
+        gitmodules_file="${parent_dir}/.gitmodules"
+        spec="${parent_dir}:${gitmodules_file}:${relative_path}"
+        case "$visibility" in
+            public) NESTED_PUBLIC_SPECS+=("$spec") ;;
+            private)
+                NESTED_PRIVATE_SPECS+=("$spec")
+                if [ "$parent_dir" = "." ]; then
+                    TOP_LEVEL_PRIVATE_PATHS+=("$relative_path")
+                fi
+                ;;
+            *) print_warn "未知可见性 '$visibility'，跳过: $parent_dir/$relative_path" ;;
+        esac
+    done < "$VISIBILITY_CONF"
+}
+
+catalog_add() {
+    local parent="$1" path="$2" vis="$3" kind="$4"
+    CATALOG_PARENT+=("$parent")
+    CATALOG_PATH+=("$path")
+    CATALOG_VIS+=("$vis")
+    CATALOG_KIND+=("$kind")
+    if [ "$vis" = "public" ]; then
+        CATALOG_SEL+=(1)
+    else
+        CATALOG_SEL+=(0)
+    fi
+    CATALOG_N=$((CATALOG_N + 1))
+}
+
+catalog_label() {
+    local i="$1"
+    if [ "${CATALOG_KIND[$i]}" = "top" ]; then
+        echo "${CATALOG_PATH[$i]}"
+    else
+        echo "${CATALOG_PARENT[$i]}/${CATALOG_PATH[$i]}"
+    fi
+}
+
+build_submodule_catalog() {
+    CATALOG_PARENT=()
+    CATALOG_PATH=()
+    CATALOG_VIS=()
+    CATALOG_KIND=()
+    CATALOG_SEL=()
+    CATALOG_N=0
+    local p vis priv spec parent_dir rest relative_path
+    local all_top_paths
+    all_top_paths=$(git config --file .gitmodules --get-regexp path 2>/dev/null | awk '{print $2}')
+    for p in $all_top_paths; do
+        vis="public"
+        for priv in "${TOP_LEVEL_PRIVATE_PATHS[@]+"${TOP_LEVEL_PRIVATE_PATHS[@]}"}"; do
+            if [ "$p" = "$priv" ]; then
+                vis="private"
+                break
+            fi
+        done
+        catalog_add "." "$p" "$vis" "top"
+    done
+    for spec in "${NESTED_PUBLIC_SPECS[@]+"${NESTED_PUBLIC_SPECS[@]}"}" "${NESTED_PRIVATE_SPECS[@]+"${NESTED_PRIVATE_SPECS[@]}"}"; do
+        [ -z "${spec:-}" ] && continue
+        parent_dir="${spec%%:*}"
+        [ "$parent_dir" = "." ] && continue
+        rest="${spec#*:}"
+        relative_path="${rest#*:}"
+        vis="private"
+        for s in "${NESTED_PUBLIC_SPECS[@]+"${NESTED_PUBLIC_SPECS[@]}"}"; do
+            [ "$s" = "$spec" ] && vis="public" && break
+        done
+        catalog_add "$parent_dir" "$relative_path" "$vis" "nested"
+    done
+}
+
+catalog_reset_public() {
+    local i
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_VIS[$i]}" = "public" ]; then
+            CATALOG_SEL[$i]=1
+        else
+            CATALOG_SEL[$i]=0
+        fi
+    done
+}
+
+catalog_select_all() {
+    local i
+    for ((i = 0; i < CATALOG_N; i++)); do
+        CATALOG_SEL[$i]=1
+    done
+}
+
+ensure_parents_selected() {
+    local i j parent
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_KIND[$i]}" = "nested" ] && [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            parent="${CATALOG_PARENT[$i]}"
+            for ((j = 0; j < CATALOG_N; j++)); do
+                if [ "${CATALOG_KIND[$j]}" = "top" ] && [ "${CATALOG_PATH[$j]}" = "$parent" ]; then
+                    CATALOG_SEL[$j]=1
+                fi
+            done
+        fi
+    done
+}
+
+draw_catalog() {
+    local i mark vis_tag cursor
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            mark="[x]"
+        else
+            mark="[ ]"
+        fi
+        vis_tag="${CATALOG_VIS[$i]}"
+        if [ "$i" -eq "$1" ]; then
+            cursor=">"
+            printf " %s %s [%s]  %s\n" "$cursor" "$mark" "$vis_tag" "$(catalog_label "$i")"
+        else
+            printf "   %s [%s]  %s\n" "$mark" "$vis_tag" "$(catalog_label "$i")"
+        fi
+    done
+}
+
+pick_submodules_tty() {
+    local idx=0 key k2 k3 total drawn=0
+    local old_stty
+    old_stty=$(stty -g)
+    restore_picker() {
+        stty "$old_stty" 2>/dev/null || true
+        printf '\033[?25h'
+    }
+    trap restore_picker EXIT INT TERM
+    stty -echo -icanon
+    printf '\033[?25l'
+    echo "请勾选要初始化的子模块"
+    echo "  ↑/↓ 移动  空格 勾选  a 全选  n 仅 public  Enter 确认  q 取消"
+    echo ""
+    total=$((3 + CATALOG_N))
+    draw_catalog "$idx"
+    while true; do
+        IFS= read -rsn1 key || key=""
+        if [ "$key" = $'\x1b' ]; then
+            IFS= read -rsn1 -t 0.05 k2 || k2=""
+            IFS= read -rsn1 -t 0.05 k3 || k3=""
+            if [ "$k3" = "A" ] || [ "$k2" = "A" ]; then
+                idx=$(( (idx - 1 + CATALOG_N) % CATALOG_N ))
+            elif [ "$k3" = "B" ] || [ "$k2" = "B" ]; then
+                idx=$(( (idx + 1) % CATALOG_N ))
+            fi
+        elif [ "$key" = " " ]; then
+            CATALOG_SEL[$idx]=$((1 - CATALOG_SEL[$idx]))
+        elif [ "$key" = "a" ] || [ "$key" = "A" ]; then
+            catalog_select_all
+        elif [ "$key" = "n" ] || [ "$key" = "N" ]; then
+            catalog_reset_public
+        elif [ "$key" = "q" ] || [ "$key" = "Q" ]; then
+            restore_picker
+            trap - EXIT INT TERM
+            echo ""
+            echo "已取消。"
+            exit 0
+        elif [ -z "$key" ]; then
+            restore_picker
+            trap - EXIT INT TERM
+            echo ""
+            break
+        fi
+        printf '\033[%sA' "$total"
+        echo "请勾选要初始化的子模块"
+        echo "  ↑/↓ 移动  空格 勾选  a 全选  n 仅 public  Enter 确认  q 取消"
+        echo ""
+        draw_catalog "$idx"
+    done
+}
+
+pick_submodules_notty() {
+    local i mark vis_tag input n
+    echo "请勾选要初始化的子模块（非交互终端）"
+    echo "  回车=仅 public    a=全选    序号=在 public 之外额外勾选"
+    echo ""
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            mark="[x]"
+        else
+            mark="[ ]"
+        fi
+        vis_tag="${CATALOG_VIS[$i]}"
+        printf "  %2d) %s [%s]  %s\n" "$((i + 1))" "$mark" "$vis_tag" "$(catalog_label "$i")"
+    done
+    echo ""
+    read -rp "输入序号（空格分隔）: " input
+    case "$input" in
+        a|A) catalog_select_all ;;
+        "") ;;
+        *)
+            catalog_reset_public
+            for n in $input; do
+                if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$CATALOG_N" ]; then
+                    CATALOG_SEL[$((n - 1))]=1
+                else
+                    print_warn "忽略无效序号: $n"
+                fi
+            done
+            ;;
+    esac
+}
+
+pick_submodules() {
+    if [ "$CATALOG_N" -eq 0 ]; then
+        print_error "未找到任何子模块"
+        exit 1
+    fi
+    if [ -t 0 ] && [ -t 1 ]; then
+        pick_submodules_tty
+    else
+        pick_submodules_notty
+    fi
+    ensure_parents_selected
+    local i
+    print_info "将初始化以下子模块："
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            print_info "  - [$(catalog_label "$i")] (${CATALOG_VIS[$i]})"
+        fi
+    done
+}
+
 # 选择操作类型
 echo ""
 echo "请选择要执行的操作"
 echo
 echo "  [仓库初始化]"
-echo "    1) 仅初始化 public 仓库（适用于外部用户，无需私有仓库访问权限）"
-echo "    2) 初始化所有仓库，包含 private 仓库（需要内部仓库访问权限）"
-echo "    3) 初始化 W2 模式（顶层全拉取，robots 仅拉取指定 private 子模块）"
+echo "    1) 初始化仓库（勾选要拉取的子模块，public 默认勾选）"
 echo
 echo "  [环境配置]"
-echo "    4) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
+echo "    2) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
 echo
 echo "  [其他]"
 echo "    q) 退出"
 echo
-read -rp "输入选项 [1-4/q]: " choice
+read -rp "输入选项 [1-2/q]: " choice
 
 case "$choice" in
-    1|"") INIT_MODE="public" ;;
-    2) INIT_MODE="private" ;;
-    3) INIT_MODE="w2" ;;
-    4) INIT_MODE="ros2_jazzy" ;;
+    1|"") INIT_MODE="repo" ;;
+    2) INIT_MODE="ros2_jazzy" ;;
     q|Q)
         echo "已退出。"
         exit 0
@@ -157,187 +404,86 @@ echo ""
 
 if [ "$INIT_MODE" != "ros2_jazzy" ]; then
 
-# 嵌套子模块可见性配置文件
 VISIBILITY_CONF="$REPO_DIR/submodules_visibility.conf"
 if [ ! -f "$VISIBILITY_CONF" ]; then
     print_error "未找到配置文件: $VISIBILITY_CONF"
     exit 1
 fi
 
-trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:space:]]}"}"; }
-
-# 从配置文件加载嵌套子模块列表（父目录 “.” 表示顶层子模块）
-NESTED_PUBLIC_SPECS=()
-NESTED_PRIVATE_SPECS=()
-TOP_LEVEL_PRIVATE_PATHS=()
-W2_SELECTED_PRIVATE_SPECS=()
-while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [ -z "$line" ] && continue
-    IFS='|' read -r parent_dir relative_path visibility <<< "$line"
-    parent_dir=$(trim "$parent_dir")
-    relative_path=$(trim "$relative_path")
-    visibility=$(trim "$visibility")
-    gitmodules_file="${parent_dir}/.gitmodules"
-    spec="${parent_dir}:${gitmodules_file}:${relative_path}"
-    case "$visibility" in
-        public)  NESTED_PUBLIC_SPECS+=("$spec") ;;
-        private)
-            NESTED_PRIVATE_SPECS+=("$spec")
-            if [ "$parent_dir" = "." ]; then
-                TOP_LEVEL_PRIVATE_PATHS+=("$relative_path")
-            fi
-            ;;
-        *)       print_warn "未知可见性 '$visibility'，跳过: $parent_dir/$relative_path" ;;
-    esac
-done < "$VISIBILITY_CONF"
+load_visibility_conf
 print_info "已从 $VISIBILITY_CONF 加载嵌套子模块配置（public: ${#NESTED_PUBLIC_SPECS[@]} 项, private: ${#NESTED_PRIVATE_SPECS[@]} 项）"
 echo ""
 
-# W2 模式下仅选择指定 private 子模块
-for spec in "${NESTED_PRIVATE_SPECS[@]}"; do
-    parent_dir="${spec%%:*}"
-    rest="${spec#*:}"
-    relative_path="${rest#*:}"
-    spec_key="${parent_dir}|${relative_path}"
-    for w2_key in "${W2_TARGET_PRIVATE_KEYS[@]}"; do
-        if [ "$spec_key" = "$w2_key" ]; then
-            W2_SELECTED_PRIVATE_SPECS+=("$spec")
-            break
-        fi
-    done
-done
-if [ "$INIT_MODE" = "w2" ]; then
-    print_info "W2 模式仅拉取指定 private 子模块（匹配: ${#W2_SELECTED_PRIVATE_SPECS[@]} 项）"
-fi
+build_submodule_catalog
+pick_submodules
+echo ""
 
-# 同步子模块配置
 print_info "同步子模块配置..."
 git submodule sync
 
-# 初始化第一层子模块（public 模式下不拉取配置为 private 的顶层子模块）
-print_info "初始化子模块..."
-all_top_paths=$(git config --file .gitmodules --get-regexp path 2>/dev/null | awk '{print $2}')
+print_info "初始化选中的顶层子模块（追加，不卸载已有项）..."
 top_paths_to_init=()
-for p in $all_top_paths; do
-    if [ "$INIT_MODE" = "private" ]; then
-        top_paths_to_init+=("$p")
-        continue
-    elif [ "$INIT_MODE" = "w2" ]; then
-        # W2 模式下顶层三个子模块全部初始化
-        top_paths_to_init+=("$p")
-        continue
-    fi
-    skip=false
-    for priv in "${TOP_LEVEL_PRIVATE_PATHS[@]}"; do
-        if [ "$p" = "$priv" ]; then
-            skip=true
-            break
-        fi
-    done
-    if [ "$skip" = false ]; then
-        top_paths_to_init+=("$p")
+for ((i = 0; i < CATALOG_N; i++)); do
+    if [ "${CATALOG_KIND[$i]}" = "top" ] && [ "${CATALOG_SEL[$i]}" = "1" ]; then
+        top_paths_to_init+=("${CATALOG_PATH[$i]}")
     fi
 done
 if [ ${#top_paths_to_init[@]} -gt 0 ]; then
     git submodule update --init "${top_paths_to_init[@]}"
 else
-    print_warn ".gitmodules 中无待初始化的顶层子模块路径"
-fi
-if [ "$INIT_MODE" = "public" ] && [ ${#TOP_LEVEL_PRIVATE_PATHS[@]} -gt 0 ]; then
-    for priv in "${TOP_LEVEL_PRIVATE_PATHS[@]}"; do
-        print_info "已跳过 private 顶层子模块（可选用模式 2 拉取）: $priv"
-    done
+    print_warn "未勾选任何顶层子模块"
 fi
 
-# 非 W2 模式下，如果 robots 之前开启了稀疏检出，则关闭它以恢复完整工作区
-if [ "$INIT_MODE" != "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1); then
-    if (cd "$REPO_DIR/robots" && git config core.sparseCheckout 2>/dev/null | grep -q true); then
-        print_info "检测到 robots 存在稀疏检出配置，正在禁用以恢复完整工作区..."
-        (cd "$REPO_DIR/robots" && git sparse-checkout disable)
-        print_info "✓ robots 稀疏检出已禁用，工作区已恢复完整"
+# 旧版 W2 稀疏检出可能仍开着，会挡住完整 robots 工作区（例如 Gen3）
+if [ -d "$REPO_DIR/robots" ] &&
+   (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1) &&
+   (cd "$REPO_DIR/robots" && git config --bool core.sparseCheckout 2>/dev/null | grep -qx true); then
+    print_info "检测到 robots 仍启用稀疏检出（旧模式遗留），正在关闭..."
+    (cd "$REPO_DIR/robots" && git sparse-checkout disable)
+    print_info "✓ robots 已恢复为完整工作区"
+fi
+
+print_info "初始化选中的嵌套子模块（追加，不卸载已有项）..."
+for ((i = 0; i < CATALOG_N; i++)); do
+    if [ "${CATALOG_KIND[$i]}" != "nested" ] || [ "${CATALOG_SEL[$i]}" != "1" ]; then
+        continue
     fi
-fi
-
-# W2 模式下对 robots 做稀疏检出，只保留所需目录
-if [ "$INIT_MODE" = "w2" ] && (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1); then
-    print_info "W2 模式：配置 robots 稀疏检出..."
-    if (
-        cd "$REPO_DIR/robots" &&
-        git sparse-checkout init --no-cone &&
-        git sparse-checkout set --no-cone \
-            "/.gitmodules" \
-            "/humanoid/FiveAges/" \
-            "/manipulators/Tianji/" \
-            "/stands/Dual_Stand1/" \
-            "/sensors/" \
-            "/grippers/" \
-            "/dexhands/"
-    ); then
-        print_info "✓ robots 稀疏检出已生效（保留 W2 相关目录 + sensors/grippers/dexhands）"
-    else
-        print_warn "robots 稀疏检出配置失败，将按常规工作区继续"
-    fi
-fi
-
-# 初始化嵌套子模块（根据 submodules_visibility.conf）
-print_info "初始化嵌套子模块（根据配置文件）..."
-NESTED_SPECS_TO_PROCESS=("${NESTED_PUBLIC_SPECS[@]}")
-if [ "$INIT_MODE" = "private" ]; then
-    NESTED_SPECS_TO_PROCESS+=("${NESTED_PRIVATE_SPECS[@]}")
-elif [ "$INIT_MODE" = "w2" ]; then
-    NESTED_SPECS_TO_PROCESS+=("${W2_SELECTED_PRIVATE_SPECS[@]}")
-fi
-for spec in "${NESTED_SPECS_TO_PROCESS[@]}"; do
-    parent_dir="${spec%%:*}"
-    rest="${spec#*:}"
-    relative_path="${rest#*:}"
+    parent_dir="${CATALOG_PARENT[$i]}"
+    relative_path="${CATALOG_PATH[$i]}"
     [ ! -d "$parent_dir" ] && continue
-    (cd "$parent_dir" && git submodule sync -- "$relative_path" && git submodule update --init "$relative_path") || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
+    (cd "$parent_dir" && git submodule sync -- "$relative_path" && git submodule update --init "$relative_path") \
+        || print_warn "$parent_dir/$relative_path 初始化失败，跳过"
 done
 
-# 遍历所有第一层子模块，切换到 main 分支并拉取最新提交
-print_info "将子模块切换到 main 分支最新提交..."
-
-submodule_paths=$(git config --file .gitmodules --get-regexp path | awk '{print $2}')
-
-for submodule_path in $submodule_paths; do
+print_info "将勾选的顶层子模块切换到目标分支最新提交..."
+for ((i = 0; i < CATALOG_N; i++)); do
+    if [ "${CATALOG_KIND[$i]}" != "top" ] || [ "${CATALOG_SEL[$i]}" != "1" ]; then
+        continue
+    fi
+    submodule_path="${CATALOG_PATH[$i]}"
     branch_name=$(git config --file .gitmodules --get "submodule.$submodule_path.branch" 2>/dev/null || echo "main")
-
     if [ ! -d "$submodule_path" ]; then
         print_warn "子模块路径不存在: $submodule_path"
         continue
     fi
-
     print_info "处理子模块: $submodule_path -> 分支: $branch_name"
     cd "$submodule_path"
-
     if ! git rev-parse --git-dir > /dev/null 2>&1; then
         print_warn "  $submodule_path 不是有效的 git 仓库，跳过"
         cd "$REPO_DIR"
         continue
     fi
-
-    # 检查本地修改，先暂存
     if ! git diff-index --quiet HEAD -- 2>/dev/null; then
         print_warn "  检测到本地修改，先暂存..."
         git stash push -m "Auto-stash before branch switch" || git reset --hard HEAD || true
     fi
-
-    # 获取远程更新
     print_info "  获取远程更新..."
     git fetch origin || print_warn "  获取远程更新失败，继续..."
-
-    # 检查远程分支是否存在
     if ! git ls-remote --exit-code --heads origin "$branch_name" > /dev/null 2>&1; then
         print_warn "  远程分支 $branch_name 不存在，跳过 $submodule_path"
         cd "$REPO_DIR"
         continue
     fi
-
-    # 切换到目标分支
     current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
     if [ "$current_branch" = "$branch_name" ]; then
         print_info "  已在 $branch_name 分支"
@@ -349,28 +495,20 @@ for submodule_path in $submodule_paths; do
             git checkout -b "$branch_name" "origin/$branch_name" 2>/dev/null || print_error "  无法创建/切换到 $branch_name 分支"
         fi
     fi
-
-    # 拉取最新提交
     print_info "  更新到最新提交..."
     git pull origin "$branch_name" || print_warn "  拉取更新失败"
-
     cd "$REPO_DIR"
     print_info "✓ $submodule_path 已切换到 $branch_name 分支"
 done
 
-# 将嵌套子模块切换到对应分支并更新到最新提交
-print_info "将嵌套子模块切换到对应分支..."
-nested_specs=("${NESTED_PUBLIC_SPECS[@]}")
-if [ "$INIT_MODE" = "private" ]; then
-    nested_specs+=("${NESTED_PRIVATE_SPECS[@]}")
-elif [ "$INIT_MODE" = "w2" ]; then
-    nested_specs+=("${W2_SELECTED_PRIVATE_SPECS[@]}")
-fi
-for nested_spec in "${nested_specs[@]}"; do
-    parent_dir="${nested_spec%%:*}"
-    rest="${nested_spec#*:}"
-    gitmodules_file="${rest%%:*}"
-    relative_path="${rest#*:}"
+print_info "将勾选的嵌套子模块切换到对应分支..."
+for ((i = 0; i < CATALOG_N; i++)); do
+    if [ "${CATALOG_KIND[$i]}" != "nested" ] || [ "${CATALOG_SEL[$i]}" != "1" ]; then
+        continue
+    fi
+    parent_dir="${CATALOG_PARENT[$i]}"
+    relative_path="${CATALOG_PATH[$i]}"
+    gitmodules_file="${parent_dir}/.gitmodules"
     full_path="$REPO_DIR/$parent_dir/$relative_path"
     if [ ! -d "$full_path" ]; then continue; fi
     if ! (cd "$full_path" && git rev-parse --git-dir >/dev/null 2>&1); then continue; fi
