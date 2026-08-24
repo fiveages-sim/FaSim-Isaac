@@ -7,7 +7,7 @@ description: >-
   composite parents (Galaxea_R1, FiveAges W2, Cobot Magic V1). Use when adding or
   fixing mujoco physics, Newton, Gripper/EE mounts, Side joint renaming / mount
   orientation, parent↔child Sensor/Physics policy, nested chassis ROS, or
-  converting robots to match Galaxea_A1X / Marvin_M6_CCS / FiveAges_W2 / Tracer_V1
+  converting robots to match Galaxea_A1X / M6_CCS / FiveAges_W2 / Tracer_V1
   patterns.
 ---
 
@@ -21,7 +21,7 @@ prim path, MuJoCo actuators only for existing joints.
 - `robots/manipulators/Galaxea/Galaxea_A1X/` — arm Physics/Side/actuators (same flange all Sides)
 - `robots/manipulators/Galaxea/Galaxea_A1Y/` — same APIs; different joint limits/axes
 - `robots/manipulators/Galaxea/Galaxea_A1/` — same APIs; **left/right Gripper mounts use different flange orient**
-- `robots/manipulators/Tianji/Marvin_M6_CCS/` — **recommended EE hierarchy** (prim under `link7/tcp`) + EE variant
+- `robots/manipulators/Tianji/M6_CCS/` — **recommended EE hierarchy** (prim under `link7/tcp`) + EE variant
 - `robots/grippers/Jodell/RG75/`, `robots/grippers/ChangingTek/AG2F120S/` — gripper mujoco + Side
 - `robots/humanoid/Galaxea_R1/` — torso + SteerChassis mujoco; dual A1 arms
 - `robots/humanoid/FiveAges/Gen2/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
@@ -112,7 +112,7 @@ Rules:
 - Do not over non-existent finger/gripper prims on the arm base.
 - Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso may be 60000/6000; wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
 - **Do not** copy PhysX wheel `damping=1e5` into MuJoCo actuators (that number is PhysX velocity-drive damping, not MJC `gainPrm`).
-- Reference strip pattern: `Marvin_M6_CCS/payloads/Physics/mujoco.usda`.
+- Reference strip pattern: `M6_CCS/payloads/Physics/mujoco.usda`.
 
 ### Newton gravity compensation
 
@@ -149,13 +149,13 @@ Isaac `omni.physics.isaacsimready` **VariantSwitcher** flips every prim with a `
 
 ## 4. Seamless EE mounts — tip/tcp nesting (**recommended**)
 
-**Recommended (Marvin M6 CCS):** nest the EE prim under the design tip frame so Stage hierarchy matches the flange and **scene tweaks of gripper install angle stay convenient**:
+**Recommended (M6 CCS):** nest the EE prim under the design tip frame so Stage hierarchy matches the flange and **scene tweaks of gripper install angle stay convenient**:
 
 ```
 /RobotRoot/linkN/tcp/<EEName>     # tip may be a non-rigid IsaacSite — that is OK
 ```
 
-Reference: `robots/manipulators/Tianji/Marvin_M6_CCS/payloads/EE/` and `payloads/Side/payloads/EE/`.
+Reference: `robots/manipulators/Tianji/M6_CCS/payloads/EE/` and `payloads/Side/payloads/EE/`.
 
 Rules for this pattern:
 1. Same EE prim name for all Sides (seamless) — never `EE_Left` / `EE_Right` as different prim names.
@@ -214,7 +214,7 @@ Standalone grippers (RG75, AG2F120S, …): own `Physics=mujoco`, Side rename, mi
 
 ## 7. Composite parents (dual / embedded arms)
 
-Examples: `Galaxea_R1`; `FiveAges/Gen2/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `Marvin_M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5).
+Examples: `Galaxea_R1`; `FiveAges/Gen2/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5).
 
 | Topic | Rule |
 |-------|------|
