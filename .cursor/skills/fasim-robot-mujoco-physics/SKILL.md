@@ -18,17 +18,17 @@ Convert a FaSim-Isaac manipulator, gripper, or composite humanoid to the shared
 prim path, MuJoCo actuators only for existing joints.
 
 **Reference assets (read before copying numbers):**
-- `robots/manipulators/Galaxea/Galaxea_A1X/` — arm Physics/Side/actuators (same flange all Sides)
-- `robots/manipulators/Galaxea/Galaxea_A1Y/` — same APIs; different joint limits/axes
-- `robots/manipulators/Galaxea/Galaxea_A1/` — same APIs; **left/right Gripper mounts use different flange orient**
+- `robots/manipulators/Galaxea/A1X/` — arm Physics/Side/actuators (same flange all Sides)
+- `robots/manipulators/Galaxea/A1Y/` — same APIs; different joint limits/axes
+- `robots/manipulators/Galaxea/A1/` — same APIs; **left/right Gripper mounts use different flange orient**
 - `robots/manipulators/Tianji/M6_CCS/` — **recommended EE hierarchy** (prim under `link7/tcp`) + EE variant
 - `robots/grippers/Jodell/RG75/`, `robots/grippers/ChangingTek/AG2F120S/` — gripper mujoco + Side
-- `robots/humanoid/Galaxea_R1/` — torso + SteerChassis mujoco; dual A1 arms
+- `robots/humanoid/Galaxea/R1/` — torso + SteerChassis mujoco; dual A1 arms
 - `robots/humanoid/FiveAges/Gen2/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
 - `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual ARX X5/R5
 - `../../../robots/mobile_base/Linkhou/S2_V1/` — four-steer / four-wheel mujoco
 - `robots/mobile_base/Agilex/Tracer_V1/` — differential wheels; PhysX velocity drive ≠ MuJoCo actuator
-- `robots/manipulators/ARX 6.0/X5/` — Side → EE mount shape (`payloads/EE/`, shared EE prim)
+- `robots/manipulators/ARX/X5/` — Side → EE mount shape (`payloads/EE/`, shared EE prim)
 
 **Do not** blind-copy A1X joint axes / `localPos` / limits / **EE flange quats**. Port
 **structure & APIs**; keep target kinematics and Side-specific mount xforms from the

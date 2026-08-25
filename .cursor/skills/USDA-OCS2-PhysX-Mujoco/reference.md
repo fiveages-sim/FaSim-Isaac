@@ -25,7 +25,7 @@ When the user says “fix PhysX / do not touch mujoco”, edit **only** `physx.u
 
 ### Authoritative PhysX reference (ARX)
 
-`FaSim-Isaac/robots/manipulators/ARX/ARX5_Gripper_2025/configuration/left_physic.usd` (used by old `ARX_Lift2S`):
+`FaSim-Isaac/robots/manipulators/ARX/Gripper_2025/payloads/Physics/physx.usda`（旧 crate `ARX5_Gripper_2025/.../left_physic.usd` 已移除；下列数值仍为 PhysX/OCS2 参考基线）:
 
 | Property | Value |
 |----------|-------|
@@ -132,7 +132,7 @@ After renaming variant **options**, update env selections or components never lo
 
 ## Nested chassis ROS (Cobot Magic / Galaxea_R1)
 
-Child chassis graphs (`cmd_vel`, `/odom`) stay on the child asset. After merge they must be **retargeted** from the parent (mount adapter or root `over "ChassisPrim"` like `Galaxea_R1.usda`):
+Child chassis graphs (`cmd_vel`, `/odom`) stay on the child asset. After merge they must be **retargeted** from the parent (mount adapter or root `over "ChassisPrim"` like `humanoid/Galaxea/R1/R1.usda`):
 
 ```usda
 over "ArticulationController"

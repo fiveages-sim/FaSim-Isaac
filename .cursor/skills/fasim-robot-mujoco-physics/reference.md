@@ -17,10 +17,10 @@ RobotName/
 
 X5 uses `EE` + `payloads/EE/{2023,2025,left_*,right_*}.usda` with the same “one prim path” idea.
 
-Galaxea_R1 (composite) layout extras:
+Galaxea R1 (composite) layout extras (`robots/humanoid/Galaxea/R1/`):
 
 ```
-Galaxea_R1/
+R1/
   payloads/Physics/mujoco.usda          # torso actuators
   payloads/Chassis/steer_chassis.usda   # SteerChassis mount (variant Chassis=SteerChassis)
   payloads/Robot/r1.usda
@@ -68,7 +68,7 @@ Map from PhysX joint:
 def Xform "RobotRoot"
 {
     def "Galaxea_G1" (
-        prepend payload = @../../../../../Galaxea_G1/Galaxea_G1.usda@
+        prepend payload = @../../../../../G1/G1.usda@
         variants = {
             string Sensor = "d405"
             string Side = "left"   # default | left | right
@@ -181,7 +181,7 @@ over "Galaxea_G1" (
 
 ```usda
 def "Galaxea_A1_Left" (
-    prepend payload = @.../Galaxea_A1/Galaxea_A1.usda@
+    prepend payload = @.../A1/A1.usda@
     variants = {
         string Gripper = "galaxea_g1"
         string Side = "left"
