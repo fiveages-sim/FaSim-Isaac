@@ -161,13 +161,21 @@ quatf physics:localRot1 = (1, 0, 0, 0)
 
 右手若还带根/挂载负 scale：即使 FixedJoint 对齐，Play 仍可能跳 —— 见上文「根负 scale 不可上臂」，先做 Y 安全烘焙。
 
-## J. 接触参数（摘要，以 o7 为准）
+## J. 接触参数（冻结基线，o6/o7 共用）
 
-| | 四指 | 拇指基线 | Mimic | 碰撞 | Solver |
-|--|------|----------|-------|------|--------|
-| | D=1 K=5 F=20 | D=1 K=10 F=30 | NF=0 DR=0 | mesh `convexHull` | 64 / 1 |
+| Drive | maxJointVelocity | Mimic | 自碰 | 摩擦 | Solver |
+|-------|------------------|-------|------|------|--------|
+| D=0.0005 K=0.005 F=1.68 force | **500000** | NF=0 DR=0 | **On** + FilteredPairs（保留捏合） | μs1.5 μd1.2 rest0 | 64 / 1 |
 
-拇指挂臂抗重力可再加大（例 K=50 F=80 D=5）。详见 SKILL.md §0.1。
+**优先级：** `maxJointVelocity=500000` 消炸 → 自碰过滤 → 摩擦 → 用 K/D/F 慢慢调手感（见 SKILL §0.1）。
+
+### Inspire 对照（`module_5_end-checkpoint_3`）
+
+| 项 | Inspire 官方 | 我们 o6/o7 |
+|----|--------------|------------|
+| maxJointVelocity | 70–260（教程真机包络） | **500000**（Isaac 6 接触稳定） |
+| 自碰 | On + 大量 FilteredPairs（含独立 rubber/pad 体） | On + 按拓扑移植（无独立 rubber 体则滤跨 hop / 邻指） |
+| 摩擦 PhysicsMaterial | **无**（仅视觉 Rubber_Smooth） | **有**（写在 collider 上） |
 
 ## K. PhysX-safe Y-mirror bake（原 `_mirror_right.py`，勿放进资产目录）
 
@@ -215,17 +223,20 @@ def bake_yflip_mesh(mesh: UsdGeom.Mesh) -> None:
 
 **必须删（勿提交进资产树）：** `*_left/`、`*_right/` 源树、`_build_*.py`、`_mirror_*.py`、`__pycache__/`、`transform_report.json`、临时 `env/test.usda`
 
-## M. o6 对齐 o7 接触（断点续作记录）
+## M. 完善差距与下一刀（关节已冻结）
 
-验收标准（用户）：轻压桌不飞、无手指吸附、可抓桌上魔方；大力戳指抽搐/拽倒可接受。
+验收：握拳/指垫互碰不飞；可抓桌上物体（物体侧也要摩擦）。
 
-| 项 | 曾踩坑 | 应对齐 |
-|----|--------|--------|
-| 碰撞 | 胶囊/方盒简化；`convexDecomposition` | **mesh + convexHull**（同 o7） |
-| Mimic | NF=20 / DR=1 | **0 / 0** |
-| Drive | 过软或过硬乱拧 | 四指 5/1/20，拇指 10/1/30 |
-| Articulation | solver 96/4；per-link maxVel 夹死 | **64/1**；不要靠限速当主手段 |
-| 质量 | 指节抬到几十克 | 保持源克级质量 |
+| 项 | 状态 | 下一步 |
+|----|------|--------|
+| maxJointVelocity=500000 | ✅ 冻结 | 勿回调到真机 260「为了稳」 |
+| D/K/F | ✅ **0.0005 / 0.005 / 1.68** | 手感后调：先 F 再 K；抖则加 D |
+| 自碰 + FilteredPairs | ✅ | 挂载：physx self-col + `body_self_collision_mute` + EE `dexhand_self_collision` excludes |
+| 碰撞摩擦 | ✅ o6/o7 collider | 场景物体对齐摩擦 |
+| 指尖几何 / contactOffset | 仍全 convexHull | 可选；非关节优先 |
+| 运控软抓取 | 资产外 | 接触后勿硬拧 target |
+
+历史踩坑：胶囊碰撞、NF=20、用低 maxJointVelocity「防尖峰」——均已否定。
 
 ## I. 参考链接
 
