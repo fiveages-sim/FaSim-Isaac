@@ -23,6 +23,21 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# 与 fa_w2_ws/release.sh download_file 一致：curl 默认进度条；wget 强制 bar
+download_file() {
+    local url="$1"
+    local dest="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 3 --connect-timeout 15 -o "${dest}" "${url}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --progress=bar:force --tries=3 -O "${dest}" "${url}"
+    else
+        print_error "需要 curl 或 wget"
+        return 1
+    fi
+}
+
 # 获取脚本所在目录的绝对路径
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$SCRIPT_DIR"
@@ -640,7 +655,8 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         print_info "  rm -rf \"$ROS_WS_DIR\""
     else
         print_info "开始下载: $ROS_WS_ZIP_URL"
-        if wget -q --show-progress -O "$ROS_WS_ZIP_FILE" "$ROS_WS_ZIP_URL"; then
+        if download_file "$ROS_WS_ZIP_URL" "$ROS_WS_ZIP_FILE.part"; then
+            mv "$ROS_WS_ZIP_FILE.part" "$ROS_WS_ZIP_FILE"
             print_info "✓ 下载完成，正在解压..."
             if unzip "$ROS_WS_ZIP_FILE" -d "$REPO_DIR"; then
                 if [ -d "$ROS_WS_EXTRACTED_DIR" ]; then
@@ -663,8 +679,8 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
         else
             print_warn "下载失败。请检查网络连接，或确认版本标签是否存在："
             print_warn "  https://github.com/isaac-sim/IsaacSim-ros_workspaces/releases"
-            print_warn "  wget -O \"$ROS_WS_ZIP_FILE\" \"$ROS_WS_ZIP_URL\""
-            rm -f "$ROS_WS_ZIP_FILE"
+            print_warn "  curl -fL -o \"$ROS_WS_ZIP_FILE\" \"$ROS_WS_ZIP_URL\""
+            rm -f "$ROS_WS_ZIP_FILE.part" "$ROS_WS_ZIP_FILE"
         fi
     fi
 
