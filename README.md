@@ -33,7 +33,7 @@ cd FaSim-Isaac
 
 #### 操作 2：配置环境
 
-- **Isaac ROS2 Jazzy Workspace**：可选 Isaac Sim 版本（默认与版本列表见 `config/fa_sim.conf`），下载对应 ROS workspaces，提取 `jazzy_ws` 到 `isaac_jazzy_ws/`，安装 rosdep / colcon 依赖，构建工作空间并写入 `~/.bashrc`。也可通过环境变量指定：`ISAAC_SIM_VERSION=6.0.1 ./init.sh`
+- **Isaac ROS2 Jazzy Workspace**：可选 Isaac Sim 版本（菜单会查询 GitHub 最新 3 个稳定 tag，失败则回退 `config/fa_sim.conf`），下载对应 ROS workspaces，提取 `jazzy_ws` 到 `isaac_jazzy_ws/`，安装 rosdep / colcon 依赖，构建工作空间并写入 `~/.bashrc`。也可通过环境变量指定：`ISAAC_SIM_VERSION=6.0.1 ./init.sh`
 
 ### 3. 启动 Isaac Sim
 
