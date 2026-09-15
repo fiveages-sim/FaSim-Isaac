@@ -337,11 +337,50 @@ case "$choice" in
         ;;
 esac
 
+# 查询 GitHub 最新稳定 tag（IsaacSim-X.Y.Z，排除 -dev / -full 等）
+fetch_latest_isaac_sim_versions() {
+    local count="${1:-3}"
+    local prefix="${ISAAC_ROS_WS_TAG_PREFIX:-IsaacSim-}"
+    local url="${ISAAC_ROS_WS_GIT_URL:-https://github.com/isaac-sim/IsaacSim-ros_workspaces.git}"
+    local timeout_sec="${ISAAC_ROS_WS_GIT_TIMEOUT:-30}"
+    local raw
+    if command -v timeout >/dev/null 2>&1; then
+        raw="$(GIT_TERMINAL_PROMPT=0 timeout "$timeout_sec" git ls-remote --tags --refs "$url" 2>/dev/null)" || return 1
+    else
+        raw="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs "$url" 2>/dev/null)" || return 1
+    fi
+    [ -n "$raw" ] || return 1
+    echo "$raw" \
+        | awk '{print $2}' \
+        | sed 's|refs/tags/||' \
+        | grep -E "^${prefix}[0-9]+\.[0-9]+\.[0-9]+$" \
+        | sed "s/^${prefix}//" \
+        | sort -Vr \
+        | head -n "$count"
+}
+
+resolve_isaac_sim_versions() {
+    local count="${ISAAC_SIM_VERSION_MENU_COUNT:-3}"
+    local fetched v
+    print_info "正在查询 IsaacSim-ros_workspaces 最新 ${count} 个稳定版本..."
+    if fetched="$(fetch_latest_isaac_sim_versions "$count")" && [ -n "$fetched" ]; then
+        ISAAC_SIM_VERSIONS=()
+        while IFS= read -r v; do
+            [ -n "$v" ] && ISAAC_SIM_VERSIONS+=("$v")
+        done <<< "$fetched"
+        print_info "已获取最新 ${#ISAAC_SIM_VERSIONS[@]} 个版本: ${ISAAC_SIM_VERSIONS[*]}"
+    else
+        print_warn "无法查询远程版本，使用配置中的备用列表: ${ISAAC_SIM_VERSIONS[*]}"
+    fi
+    ISAAC_SIM_DEFAULT_VERSION="${ISAAC_SIM_DEFAULT_VERSION:-${ISAAC_SIM_VERSIONS[0]}}"
+}
+
 # Isaac Sim ROS Workspace 版本选择（仅环境配置模式）
 # 优先：环境变量 ISAAC_SIM_VERSION > 菜单 > ISAAC_SIM_DEFAULT_VERSION
 ISAAC_SIM_VERSION="${ISAAC_SIM_VERSION:-}"
 if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     if [ -z "$ISAAC_SIM_VERSION" ]; then
+        resolve_isaac_sim_versions
         echo ""
         echo "请选择 Isaac Sim ROS Workspace 版本"
         echo
