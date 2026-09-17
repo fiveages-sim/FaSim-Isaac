@@ -217,11 +217,45 @@ def bake_yflip_mesh(mesh: UsdGeom.Mesh) -> None:
     # normals Y-flip + renormalize; reverse each face winding; update extent
 ```
 
+## K2. Xhand1 Y 镜像与去重（2026-09）
+
+与 §K 全手 `*_yflip` + 视觉 `Sy=-1` 不同：Xhand1 有**现成右手掌**，四指 mesh 与左手相同。
+
+### 右手掌（Y-up 源 → Z-up）
+
+源 `hand_link.usd`：`upAxis=Y`，`/World` orient ≈ `Rx(90°)`，mesh `/World/right_hand_link`。
+
+```python
+M = UsdGeom.Xformable(world).ComputeLocalToWorldTransform(0)
+R = M.ExtractRotationMatrix()
+pts = [Gf.Vec3f(*M.Transform(Gf.Vec3d(*p))) for p in src_pts]
+# faceVarying normals: n' = normalize(R * n)
+# winding 保持（Rx det>0）；拷 GeomSubset black/pad
+```
+
+写入 `Hand/right/geometries.usd` 的 `/Geometries/mesh/mesh`（子 Mesh 名保持 `mesh`，instances 的 `over "mesh"` 才对得上）。**不要**再给该视觉加 `Sy=-1`。烤完删除源 usd/glb。
+
+### 四指只镜像位姿
+
+`index/mid/ring/pinky` 根 translate 的 Y 取反；远端局部 `(0,0,z)` 不变。关节 `localPos0` 同步 Y 镜像；`index_joint1` 为 X 轴 → `localRot × Ry(180°)`。四指 collision/visual 继续用左手 `mesh_2`–`mesh_7`。
+
+### 去重
+
+| 层 | 右手只留 | 共用 |
+|----|----------|------|
+| geometries | `mesh`, `mesh_1`, `mesh_8`–`12` | 四指 `@../left/geometries.usd@` |
+| instances | 薄 over 掌/拇指 geom | `@../left/instances.usda@` |
+| materials / robot | — | `Hand/materials.usda`、`Hand/robot.usda` |
+
+`robotJoints` 覆盖必须写在**入口** Side variant 体内，不能只写在 Side payload。
+
+切 Side 丢 Physics、`CreateJoint no bodies`、`physx.usda` 漏前缀关节 → 见 SKILL §4 / §4.1。
+
 ## L. 资产目录纪律
 
 **可保留：** `{Name}.usda`、`Textures/`、`payloads/**`
 
-**必须删（勿提交进资产树）：** `*_left/`、`*_right/` 源树、`_build_*.py`、`_mirror_*.py`、`__pycache__/`、`transform_report.json`、临时 `env/test.usda`
+**必须删（勿提交进资产树）：** `*_left/`、`*_right/` 源树、`_build_*.py`、`_mirror_*.py`、`__pycache__/`、`transform_report.json`、临时 `env/test.usda`、已烘焙源 mesh（`hand_link.usd` / `.glb`）、小写重复导入树（如 `xhand1/`、`XHAND1_xhand1/`）、`source_assets/`
 
 ## M. 完善差距与下一刀（关节已冻结）
 

@@ -2,15 +2,17 @@
 name: fasim-dexhand-asset
 description: >-
   Build FaSim-Isaac unified dexterous-hand USD assets (LinkerHand o6/o7,
-  BrainCo Revo1/Revo2, etc.) from separate left/right USDA imports: confirm
-  mirror axis (X like o6 vs Y like o7) before conversion; PhysX-safe mirror
-  bake (root scale always (1,1,1)); Hand/left|right morphology; Side variants
-  with left_hand_/right_hand_ rename; Physics variants; validated sim baseline
-  (maxJointVelocity=500000 frozen; G1 hold D=0.06 K=0.1 F=30 / thumb
-  D=0.08 K=0.12 F=50 + jointFriction=0.5; μs=2.0 contactOffset=0.002;
-  distal CCD; self-collision + FilteredPairs). Warn AssemblerFixedJoint must
-  match mount TF; never ship build scripts or raw *_left/*_right trees.
-  Does NOT write arm EE mounts.
+  BrainCo Revo1/Revo2, RobotEra Xhand1, etc.) from separate left/right USDA
+  imports: confirm mirror axis (X like o6 vs Y like o7/Xhand1) before
+  conversion; PhysX-safe mirror bake (root scale always (1,1,1)); Hand/left|right
+  morphology; Side variants with left_hand_/right_hand_ rename; Physics variants;
+  validated sim baseline (maxJointVelocity=500000 frozen; G1 hold D=0.06 K=0.1
+  F=30 / thumb D=0.08 K=0.12 F=50 + jointFriction=0.5; μs=2.0 contactOffset=0.002;
+  distal CCD; self-collision + FilteredPairs). LED glow uses Head_V1 glTF
+  emission (emissive_factor × strength; inverted LED normals look like
+  white metal with no glow). Warn AssemblerFixedJoint must match mount TF;
+  never ship build scripts or raw *_left/*_right trees. Does NOT write
+  arm EE mounts.
 ---
 
 # FaSim Dexterous Hand Asset
@@ -22,17 +24,20 @@ description: >-
 
 | 型号 | 结构 Side L/R | 关节基线 | 自碰+Filter | 碰撞摩擦 | 备注 |
 |------|---------------|----------|-------------|---------|------|
-| **o6** | ✅ | **G1 hold 已同步 o7** | ✅ | ✅ μ2.0+contactOffset | W2:`dexhand_o6_new`；单手:`o6/env/test` |
+| **o6** | ✅ | **G1 hold 已同步 o7** | ✅ | ✅ μ2.0+contactOffset | W2:`dexhand_o6_new`；`Flange=default` = AG2F90 金属 + 黑打印件 |
 | **o7** | ✅ | **G1 完全通过** | ✅ 保留捏合 | ✅ | W2:`dexhand_o7_new` 抓瓶不穿不粘可抬 |
+| **Xhand1** | ✅ Y 镜像 | 对齐 §0.1；12 DOF 无 mimic | ✅ | ✅ | `RobotEra/Xhand1`；右手掌单独烘焙；§4.1 |
+| **L6** | ✅ Y 镜像 | 对齐 §0.1；mimic 0/0 保留 gearing | ✅ | ✅ | `LinkerHands/L6`；四指不翻 mesh；M6 EE=`LinkerHand_L6`；Look；Flange |
 
 **黄金参考：**
 
 - **结构 / Side / 挂载**：`LinkerHands/o6/`、夹爪 `grippers/Jodell/RG75/`
 - **官方自碰写法**：`dexhands/Inspire/module_5_end-checkpoint_3/`（开自碰 + `PhysicsFilteredPairsAPI`）
 - **关节 PhysX（o6/o7 已跑通）**：§0.1（含 K/D/F 调参说明）
+- **指示灯发光**：`FiveAges/Gen2/components/Head_V1/payloads/materials.usda` 的 `Material "light"`（§8.1）
 
 **资产目录只保留交付物**（入口 USDA + `payloads/` + `Textures/`）。  
-禁止放入：`o7_left/`、`o7_right/`、`_*.py` 构建脚本、`__pycache__/`、`transform_report.json`。算法写在 [reference.md](reference.md)。
+禁止放入：`o7_left/`、`o7_right/`、`_*.py` 构建脚本、`__pycache__/`、`transform_report.json`、已烘焙的源 mesh（如 `hand_link.usd` / `.glb`）、小写重复树（如 `xhand1/`）。算法写在 [reference.md](reference.md)。
 
 **待处理批次：**
 
@@ -40,8 +45,10 @@ description: >-
 |--------------------|----------------|
 | `LinkerHand_o6_*` | `LinkerHands/o6`（✅） |
 | `LinkerHand_o7_*` | `LinkerHands/o7`（✅） |
-| `BrainCo_Revo1_*` | `BrainCo/Revo1` |
-| `BrainCo_Revo2_*` | `BrainCo/Revo2` |
+| `BrainCo_Revo1_*` | `BrainCo/Revo1`（LED glTF 已按 Head_V1 跑通；灯面法线已翻朝外） |
+| `BrainCo_Revo2_*` | `BrainCo/Revo2`（LED `green_light` 同套；右手四指近端 ×Rz(180°)） |
+| `RobotEra/xhand1`（小写导入） | `RobotEra/Xhand1`（✅ Y 镜像；右手掌单独烘焙；§4.1） |
+| `LinkerHands/L6`（单手导入） | `LinkerHands/L6`（✅ prim `L6`；Y 镜像；四指不翻 mesh；M6 EE=`LinkerHand_L6`；Look；Flange） |
 
 ---
 
@@ -55,7 +62,7 @@ description: >-
 4. default Side 用哪只手形态？通常 = 左手
 5. 【必确认】右手镜像轴 / 做法？未确认前禁止套用另一轴
    - [ ] X 镜像（o6）：link 位姿 X 翻 + 视觉 Sx=-1 + 碰撞 *_xflip；根 (1,1,1)
-   - [ ] Y 镜像（o7）：PhysX 安全烘焙（§2B / reference §Y）；根 (1,1,1)；Side/right 关节 Y 镜像 + X/Z 轴 ×Ry(180°)
+   - [ ] Y 镜像（o7 / Xhand1）：PhysX 安全烘焙（§2B / reference §Y / §K2）；根 (1,1,1)；Side/right 关节 Y 镜像 + X/Z 轴 ×Ry(180°)
    - [ ] 其它
    禁止：仅靠根负 scale 交付（Play 挂臂会跳）。
 6. 驱动 / mimic：对齐 §0.1（先 maxJointVelocity=500000，再抄 o6/o7 D/K/F）
@@ -214,11 +221,17 @@ Y 细节与脚本级步骤 → [reference.md](reference.md)「PhysX-safe Y-mirro
   Textures/                 # 可选
   payloads/
     base.usda               # → Hand/left
-    Hand/left|right/        # base, instances, geometries, materials, robot
+    Hand/
+      materials.usda        # 左右共用（Xhand1）
+      robot.usda            # 无前缀关节（default Side）
+      left/{base,instances,geometries}
+      right/{base,instances,geometries}   # 只留右手独有 mesh
     Side/default|left|right.usda
     Physics/physics|physx|mujoco|none.usda
     Robot/  Sensor/
 ```
+
+左右 `materials`/`robot` 相同则**提升到 `Hand/`**，不要各拷一份。右手 `instances` 可引用左手，只 over 掌/拇指独有几何。四指 mesh 与左手逐点相同时，右手 geometries **不要复制**，instance 指 `@../left/geometries.usd@`。
 
 ---
 
@@ -231,6 +244,47 @@ Y 细节与脚本级步骤 → [reference.md](reference.md)「PhysX-safe Y-mirro
 | right | 右 | `right_hand_*`；入口 `delete` 左 base → `Hand/right` |
 
 Y 镜像 right：关节/质量 localPos/Rot 同步 Y 镜像；`axis=X|Z` 再 ×Ry(180°)（拇指 joint2/3）。
+
+**`robotJoints`：** 共享 `Hand/robot.usda` 列的是无前缀名。`Side/left|right` payload 里 `rel=` / `delete rel` **盖不掉** base subLayer 的 `prepend rel`。必须在**入口** `variantSet "Side"` 的 left/right **花括号内**写显式 `rel isaac:physics:robotJoints = [ left_hand_* | right_hand_* ]`。
+
+**切 Side 丢 Physics：** 根上不要 authored `Physics=physx`（挡 VariantSwitcher）。Isaac 改 Side 会按入口 `variants` 字典重写，session 里的 physx 被清掉，Switcher 写过一次就不再补 → Play 出现 `CreateJoint - no bodies` + jointFriction 警告。做法：每个 `Side/{default,left,right}.usda` 的根 prim **弱**写 `variants = { string Physics = "physx" }`（payload 层）；session `mujoco` 仍能盖过。
+
+**`physx.usda`：** 必须同时 over 无前缀 **和** `left_hand_*` / `right_hand_*`。只写无前缀时，Side=right 的活动关节吃不到 PhysxJointAPI。
+
+**Side/right 四指刚体：** 不要只 over COM。Physics 变体空着时 COM-only 没有 `RigidBodyAPI` → `middle/pinky/ring_joint2` 报 `CreateJoint - no bodies`。四指 overs 必须与拇指一样带齐 RB + Mass + FilteredPairs（COM 用 Y 镜像值）。
+
+### 4.1 Xhand1 要点（2026-09 · Y 镜像）
+
+入口：`robots/dexhands/RobotEra/Xhand1/Xhand1.usda`，prim `Xhand1`。12 独立 DOF，无 mimic。
+
+| 项 | 做法 |
+|----|------|
+| 镜像轴 | **Y**（食指 −Y、小指 +Y）。先确认轴，禁止套 X。 |
+| 根 / 碰撞 | 根 `(1,1,1)`；碰撞 det>0。有现成右手掌 mesh 则视觉/碰撞**共用**该 mesh，不要再 `Sy=-1` 或留一份 `*_yflip`。 |
+| 四指 | **位姿** Y 镜像（`t'=(x,-y,z)`，`R'=Sy R Sy`）；**mesh 不翻**，引用左手 `mesh_2`–`mesh_7`。只翻掌+拇指、四指留在左手 Y 上 → 拇指会跑到小指侧。 |
+| 拇指 / 手背 | 无现成右手 mesh 时：视觉可 `Sy=-1`，碰撞烘焙 Y-flip 后局部 `(1,1,1)`。Xhand1 已把 yflip 折回规范名，视觉碰撞共用。 |
+| 右手掌源 | 用户给的 `hand_link.usd` 常是 **Y-up** + 根 `Rx(90°)`。用 World `ComputeLocalToWorldTransform` 把点/法线烤进 Z-up `/Geometries/mesh`，保留 `black`/`pad` GeomSubset。烤完**删除**源 `hand_link.usd` / `.glb`。 |
+| 几何去重 | 右手 `geometries.usd` 只留独有：`mesh`（掌）、`mesh_1`（手背）、`mesh_8`–`12`（拇指）。禁止 `mesh` 与 `mesh_yflip` 各存一份相同点。 |
+| instances | 右手薄文件：`references = @../left/instances.usda@`，只 over 掌/手背/拇指 geom。材质 `@../materials.usda@`。 |
+| 材质 | 共用 `Hand/materials.usda`。Xhand1 `black`：`metallic_factor=0.8`（白/垫/灯不动）。MDL 相对 `Hand/` 为 `@../../Textures/pbr.mdl@`。 |
+| `delete references` | Side=right 的 `delete` 左 base **经常删不干净**（与 Wuji 相同）。靠右手更强意见盖住；验收时看 composed npts / Y 范围，不要只看文件。 |
+
+### 4.2 L6 要点（2026-09 · Y 镜像 + Look + Flange）
+
+入口：`robots/dexhands/LinkerHands/L6/L6.usda`，prim `L6`。四指独立 DIP mimic（gearing 保留，`dampingRatio=0` `naturalFrequency=0`）。
+
+o6 转接板已从 Hand 烘焙 mesh 拆成 **`Flange` 变体**（仿 AG2F90）：`payloads/Flange/default.usda` 在已有 `flange` link 上挂 AG2F120S 金属法兰 + `payloads/Flange/flange.usd` 黑打印件。默认 `Flange=default`。M6 o6 焊点仍是 `T z=0.0045, Rz=+90`。
+
+| 项 | 做法 |
+|----|------|
+| 镜像轴 | **Y**（与 Xhand1 同）。根 `(1,1,1)`。 |
+| 四指 | **位姿** Y 镜像；**mesh 不翻**，右手引用左手四指 geom。掌 + 拇指单独烤 Y-flip。 |
+| 质量 | 整手 **607 g**；按 o6 连杆比分摊（勿均匀 9 g / 勿抄 0.989 kg/link）。 |
+| Flange | 默认 `none`。`default` 复用 o6 的金属/打印件 usd；因掌在 flange 原点，整栈相对 o6 再沿 Z 移 **-0.024383**。 |
+| 挂载 | `flange` 为 RB/`root_joint` 父；M6 EE 选项 **`LinkerHand_L6`**，prim 仍 `L6`。焊点 **`T z=0.028883, Rz=+180`**（0.0045+0.024383；不要抄 o6 的 Rz+90）；EE 选 `Flange=default`。FixedJoint 与 xform 同 TF。 |
+| Look | `default` = 原白 `shell`/`finger`；`dark_gray` = 缎面电镀银 `(0.58,0.59,0.62)` metallic=0.88 roughness=0.32。橡胶/LED/`black_metal` 不动。 |
+
+**Look 如何穿过 instanceable 材质：** `VisualMaterials/shell|finger` 在 instance 原型里 `references` `materials.usda`。`specializes` **盖不过** 这份 reference（合成栈里白色仍更强）。正确做法：`payloads/Look/dark_gray.usda` 把视觉 instance xform **和** 嵌套 Material 都设 `instanceable=false`，再本地写 `base_color_factor` / `metallic_factor` / `roughness_factor`（local > reference）。`default` payload 为空，保持原白。切 Look 后必须 **Reload Stage**。右手 `instances` 引用左手，同一套 overs 生效。
 
 ---
 
@@ -247,10 +301,55 @@ Side L/R/default 形态与关节前缀正确
 碰撞 mesh convexHull；det>0；collider 有摩擦
 mimic 0/0；drive + maxJointVelocity=500000 对齐 §0.1
 enabledSelfCollisions=1；静位假接触已 FilteredPairs
-资产目录无 *_left/*_right、无 _*.py、无 __pycache__
+资产目录无 *_left/*_right、无 _*.py、无 __pycache__、无已烘焙源 mesh（hand_link.usd 等）
+切 Side=right 后 Physics 仍为 physx（或 session mujoco）；Play 无 CreateJoint no bodies
 挂臂：FixedJoint = 挂载 TF；Play 不跳
 接触：握拳/指垫互碰不飞；可抓桌上物体（物体侧也要摩擦）
+LED：GeomSubset 有面；emissive_factor≠0；灯面法线朝外；Reload Stage 后发光
+L6 Look：default 仍白；dark_gray 只改 shell/finger，切变体后 Reload
+L6 Flange：单独打开为 none；M6 `EE=LinkerHand_L6` 为 default（AG2F90 银法兰 + 黑打印件），掌在板外侧、Rz=+180；Play 不跳
 ```
+
+---
+
+## 8.1 LED 发光（glTF · Head_V1 / Revo 已跑通 · 2026-09）
+
+Isaac RTX 认的是本地 `Textures/pbr.mdl` 的 **gltf_material**，不是 OmniPBR。
+
+```
+emission = emissive_factor * max(0, emissive_strength)
+emissive_factor 默认 (0,0,0)  →  只写 strength 完全不亮
+```
+
+**黄金抄本：** `robots/humanoid/FiveAges/Gen2/components/Head_V1/payloads/materials.usda` → `Material "light"`。  
+仓内对齐：`BrainCo/Revo2` `green_light`、`BrainCo/Revo1` `light`、`Astribot/S1` `light`（青色因子）。
+
+```usda
+asset info:mdl:sourceAsset = @../../Textures/pbr.mdl@
+token info:mdl:sourceAsset:subIdentifier = "gltf_material"
+int inputs:alpha_mode = 2                    # blend
+color3f inputs:base_color_factor = (1, 1, 1) # 白底，颜色走 emission
+color3f inputs:emissive_factor = (0, 1, 0.002)  # LED 色；Revo 绿 / Head 青 (0, 0.968, 1)
+float inputs:emissive_strength = 4950
+float inputs:metallic_factor = 1
+float inputs:roughness_factor = 0
+float inputs:ior = 1.9
+float inputs:transmission_factor = 0.23622048
+```
+
+`pbr.mdl` 相对 `payloads/Hand/materials.usda`（或机身 `payloads/materials.usda`）解析。改完必须 **Reload Stage**（Stop/Play 不够）。
+
+| 现象 | 原因 | 做法 |
+|------|------|------|
+| 仍是原色塑料、不发光 | 只有 `emissive_strength`，因子仍是 0 | 写非零 `emissive_factor` |
+| 亮面白色金属、不发光 | 白底+金属 1 已绑上；**灯面法线朝内**，RTX 只正面发光 | 翻 GeomSubset 绕序 **且** 翻转 faceVarying normals（反转 corner 顺序并取反） |
+| 改 OmniPBR `enable_emission` 仍不亮 | 本仓 LED 不走 OmniPBR | 改回 glTF，抄 Head_V1 |
+
+法线朝向：灯面法线 · (面心 − mesh bbox 中心) **应 > 0**（朝外）。Revo2 `green_light` 100% 朝外；Revo1 `light` 曾 100% 朝内，翻面后发光。右手视觉 `Sx=-1` 会再翻世界法线，若仅右手不亮再单独处理。
+
+GeomSubset：`familyName=materialBind`，`indices` 非空；绑定 `VisualMaterials/<mat>`，不要另起 OmniPBR 材质名。
+
+**禁止：** 把 OmniPBR 当 FaSim 指示灯默认方案；只改 strength 不写 factor；只翻 winding 不改 faceVarying normals（Hydra 仍用旧朝内法线）。
 
 ---
 
