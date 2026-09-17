@@ -23,7 +23,7 @@ End-to-end workflow for ROS robots in **Isaac Sim 6**: import, assemble, variant
 |-------|------|
 | Galaxea_R1 | `robots/humanoid/Galaxea/R1/` — Chassis + nested ROS retarget |
 | Cobot Magic V1 | `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual X5/R5 |
-| Tracer V1 | `robots/mobile_base/Agilex/Tracer_V1/` |
+| Tracer V1 | `robots/mobile_base/Agilex/Tracer V1/` |
 | ARX Lift2S 6.0 | `FaSim-Isaac/robots/mobile_manipulator/ARX/Lift 2S/` |
 | ARX Gripper PhysX | `FaSim-Isaac/robots/manipulators/ARX/Gripper_2025/payloads/Physics/physx.usda` (旧 crate `ARX5_Gripper_2025` 已移除) |
 | Notes | `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md` |

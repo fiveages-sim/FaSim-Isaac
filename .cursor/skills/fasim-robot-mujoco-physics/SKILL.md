@@ -27,7 +27,7 @@ prim path, MuJoCo actuators only for existing joints.
 - `robots/humanoid/FiveAges/Gen2/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
 - `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual ARX X5/R5
 - `../../../robots/mobile_base/Linkhou/S2_V1/` — four-steer / four-wheel mujoco
-- `robots/mobile_base/Agilex/Tracer_V1/` — differential wheels; PhysX velocity drive ≠ MuJoCo actuator
+- `robots/mobile_base/Agilex/Tracer V1/` — differential wheels; PhysX velocity drive ≠ MuJoCo actuator
 - `robots/manipulators/ARX/X5/` — Side → EE mount shape (`payloads/EE/`, shared EE prim)
 
 **Do not** blind-copy A1X joint axes / `localPos` / limits / **EE flange quats**. Port
