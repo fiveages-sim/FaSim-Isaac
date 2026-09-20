@@ -34,3 +34,7 @@ IsaacSim-ros_workspaces-IsaacSim-*.zip
 IsaacSim-ros_workspaces/
 IsaacSim-ros_workspaces-*/
 isaac_jazzy_ws/
+
+# 本机覆盖配置（参考 fa_w2_ws 的 robot.local.yaml）
+config/fa_sim.local.conf
+
