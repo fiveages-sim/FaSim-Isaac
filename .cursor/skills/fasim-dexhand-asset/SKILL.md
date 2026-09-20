@@ -9,10 +9,10 @@ description: >-
   validated sim baseline (maxJointVelocity=500000 frozen; G1 hold D=0.06 K=0.1
   F=30 / thumb D=0.08 K=0.12 F=50 + jointFriction=0.5; μs=2.0 contactOffset=0.002;
   distal CCD; self-collision + FilteredPairs). LED glow uses Head_V1 glTF
-  emission (emissive_factor × strength; inverted LED normals look like
-  white metal with no glow). Warn AssemblerFixedJoint must match mount TF;
-  never ship build scripts or raw *_left/*_right trees. Does NOT write
-  arm EE mounts.
+  emission. Piper/Split Aloha Revo EE: palm inward Rz/Rx; parent NonDexHand +
+  excludes. Warn AssemblerFixedJoint must match mount TF; never ship build
+  scripts or raw *_left/*_right trees. Does NOT write arm EE mounts except the
+  Revo/Piper TF constraints above.
 ---
 
 # FaSim Dexterous Hand Asset
@@ -86,12 +86,18 @@ description: >-
    | 机身物理 | `W2/payloads/Physics/physx.usda` | `base_link` self-col=**1**；subLayer 静音层 |
    | 机身静音 | `W2/payloads/Physics/body_self_collision_mute.usda` | 躯干+底盘+左右臂 `NonDexHand` + dexhand excludes（**与臂选型无关**） |
    | 灵巧手 EE | `.../EE/dexhand_self_collision.usda` | 通用规范：给臂 `NonDexHand` 加手 excludes（不绑厂商名） |
+   | Piper | `Piper/payloads/Physics/physx.usda` + `arm_self_collision_mute.usda` | `root_joint` self-col=1；EE 已 subLayer `dexhand_self_collision`（Revo1/Revo2） |
+   | Split Aloha | `payloads/Physics/body_self_collision_mute.usda` | 箱体+Ranger+左右 Piper；excludes `…/Piper/link6/tcp/Revo1\|Revo2`；与嵌套 Piper `NonDexHand` **互滤** |
+
+   **Piper tcp 朝向（Revo，FixedJoint = xform）**  
+   Revo2 掌心 native **+Z**；Revo1 native **+Y**。要掌心朝内（非朝下）：Revo2 `Rz(−90)`；Revo1 `Rx(+90)`（= native 对齐 ∘ 同一 `Rz(−90)`）；**Revo1 右手再 `Rz(+180)`**。法兰视觉做 tcp **兄弟**，不要跟手一起转。细节：`USDA-OCS2-PhysX-Mujoco` reference § Piper Revo EE。
 
    **新 dexhand EE 接入清单**  
    1. 挂载：`root_joint` inactive + FixedJoint（与父同树）  
    2. EE usda `subLayers` → `@./dexhand_self_collision.usda@`，并把 `/…/tcp/<HandPrim>` 写入该文件 excludes  
-   3. 同步左右腕路径到 `body_self_collision_mute.usda` excludes  
+   3. 同步左右腕路径到父机 `body_self_collision_mute.usda` excludes（W2 / Luna / **Split Aloha**）  
    4. 夹爪不要写入 excludes（留在 NonDexHand 自滤即可）  
+   5. 整机 Newton：`append references` `body_*_mute_newton.usda`（**不要**把臂路径写进父 newton mute）  
 
    - **模块化**：静音在 W2 `Physics`，任意 `Arm_Left`/`Arm_Right` 组合（含单侧 M6、混装 ART7）都有机体静音，不绑死左臂挂载文件。  
    - **坑**：`includes` `link7` 会展开到 EE；不 `excludes` → 手指穿模。手保持**未分组**。  

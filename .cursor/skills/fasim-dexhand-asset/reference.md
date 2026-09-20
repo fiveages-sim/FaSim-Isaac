@@ -265,7 +265,7 @@ pts = [Gf.Vec3f(*M.Transform(Gf.Vec3d(*p))) for p in src_pts]
 |----|------|--------|
 | maxJointVelocity=500000 | ✅ 冻结 | 勿回调到真机 260「为了稳」 |
 | D/K/F | ✅ **0.0005 / 0.005 / 1.68** | 手感后调：先 F 再 K；抖则加 D |
-| 自碰 + FilteredPairs | ✅ | 挂载：physx self-col + `body_self_collision_mute` + EE `dexhand_self_collision` excludes |
+| 自碰 + FilteredPairs | ✅ | 挂载：physx self-col + `body_self_collision_mute` + EE `dexhand_self_collision` excludes（Piper Revo / Split Aloha 同套；Revo1 右手 `Rz(+180)`） |
 | 碰撞摩擦 | ✅ o6/o7 collider | 场景物体对齐摩擦 |
 | 指尖几何 / contactOffset | 仍全 convexHull | 可选；非关节优先 |
 | 运控软抓取 | 资产外 | 接触后勿硬拧 target |

@@ -7,8 +7,8 @@ description: >-
   composite parents (Galaxea_R1, FiveAges W2, Cobot Magic V1). Use when adding or
   fixing mujoco physics, Newton, Gripper/EE mounts, Side joint renaming / mount
   orientation, parent↔child Sensor/Physics policy, nested chassis ROS, or
-  converting robots to match Galaxea_A1X / M6_CCS / FiveAges_W2 / Tracer_V1
-  patterns.
+  converting robots to match Galaxea_A1X / M6_CCS / FiveAges_W2 / Tracer_V1 /
+  Split Aloha / Ranger Mini patterns.
 ---
 
 # FaSim Robot MuJoCo / Physics Port
@@ -26,6 +26,8 @@ prim path, MuJoCo actuators only for existing joints.
 - `robots/humanoid/Galaxea/R1/` — torso + SteerChassis mujoco; dual A1 arms
 - `robots/humanoid/FiveAges/Gen2/W2/` — torso + Head + Linkhou chassis + dual M6; wheel/steer PD split
 - `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual ARX X5/R5
+- `robots/mobile_manipulator/Agilex/Split Aloha/` — Ranger Mini 4WS + dual Piper + lift; nested ROS + dexhand self-col
+- `robots/mobile_base/Agilex/Ranger Mini/` — 4WS mujoco steer PD maps PhysX K/D/F (`D≈0.2 K`)
 - `../../../robots/mobile_base/Linkhou/S2_V1/` — four-steer / four-wheel mujoco
 - `robots/mobile_base/Agilex/Tracer V1/` — differential wheels; PhysX velocity drive ≠ MuJoCo actuator
 - `robots/manipulators/ARX/X5/` — Side → EE mount shape (`payloads/EE/`, shared EE prim)
@@ -110,8 +112,8 @@ Rules:
 - Prismatic grippers: use `PhysicsDriveAPI:linear` / `drive:linear:physics:* = None` analogously.
 - Only define actuators for **default** Side joints (`joint1`…); Side actuators stay in `Side/left|right.usda`.
 - Do not over non-existent finger/gripper prims on the arm base.
-- Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso may be 60000/6000; wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
-- **Do not** copy PhysX wheel `damping=1e5` into MuJoCo actuators (that number is PhysX velocity-drive damping, not MJC `gainPrm`).
+- Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso may be 60000/6000; **steer** `force` PD → `gainPrm=[K]`, `biasPrm=[0,-K,-D]`, `forceRange=±F` (Ranger Mini 1500/300/±120). Wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
+- **Do not** copy PhysX wheel `damping=1e5` into MuJoCo actuators (that number is PhysX **acceleration** velocity-drive damping, not MJC `gainPrm`). PhysX wheels: `type=acceleration`, not `force`.
 - Reference strip pattern: `M6_CCS/payloads/Physics/mujoco.usda`.
 
 ### Newton gravity compensation
@@ -214,7 +216,7 @@ Standalone grippers (RG75, AG2F120S, …): own `Physics=mujoco`, Side rename, mi
 
 ## 7. Composite parents (dual / embedded arms)
 
-Examples: `Galaxea_R1`; `FiveAges/Gen2/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5).
+Examples: `Galaxea_R1`; `FiveAges/Gen2/W2` (torso + `Head_V1` + `LinkHou/S2_V1` + dual `M6_CCS`); `Cobot Magic V1` (Tracer + dual X5/R5); `Split Aloha` (Ranger Mini + dual Piper + lift).
 
 | Topic | Rule |
 |-------|------|
@@ -226,6 +228,8 @@ Examples: `Galaxea_R1`; `FiveAges/Gen2/W2` (torso + `Head_V1` + `LinkHou/S2_V1` 
 | Arm `root_joint` | `active = false` only — do not delete ArticulationRoot APIs |
 | Chassis | Drop child ArticulationRoot on the prim that has it + FixedJoint; steer position-PD vs wheel damping-bias |
 | Nested ROS | Retarget `targetPrim` → parent root, `chassisPrim` → parent base; author `token[] jointNames` (no ConstructArray v1) |
+| Newton body mute | `append references` `body_self_collision_mute_newton.usda` on root `Physics=mujoco` (**not** mujoco subLayer). **Never** put child arm paths in the parent newton mute (races Arm payloads). Wheels stay enabled. |
+| 4WS steer/wheels | PhysX steer `force` PD (`D≈0.2 K`) vs wheel `acceleration`; MuJoCo maps K/D/F — do not copy `damping=1e5`. `vy`+yaw: align-gate in `cmd_vel` script (USDA-OCS2 reference § 4WS) |
 | Order | Parent `prepend variantSets` starts with `Physics` |
 | Validation | `Sdf.Layer.FindOrOpen` adapters; compose full stack; assert child Physics + remapped actuators |
 

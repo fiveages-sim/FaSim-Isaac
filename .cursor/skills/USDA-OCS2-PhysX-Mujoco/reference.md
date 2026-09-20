@@ -47,6 +47,8 @@ When the user says “fix PhysX / do not touch mujoco”, edit **only** `physx.u
 
 Do **not** blindly set PhysX `gearing=+1` to “match URDF” — that can freeze link8 or break stroke unless limits/NF are retuned carefully.
 
+**AgileX Piper gripper** (prismatic `axis=Z`, both fingers often share world axis `(0,-1,0)`): `gearing=-1` + `localRot1` Rz180 makes **both pads travel the same way**. Validated: PhysX `physxMimicJoint:rotZ:gearing = 1`, Newton `newton:mimicCoef1 = -1`. Check world axes before copying ARX `gearing=-1`.
+
 ### Side left/right
 
 - Deactivates default `gripper_joint` / `joint8`.
@@ -170,6 +172,79 @@ Parser error (`matching … KeywordConnect … Assignment … ConnectValue at ''
 
 PhysX wheel `damping=1e5` is **not** a MuJoCo actuator gain. Wheels: `stiffness=0` → damping-bias `MjcActuator`; do not copy PhysX damping into `mujoco.usda`.
 
+### PhysX wheel Drive `type`
+
+Steer and wheel **do not share** Drive type. Authoritative chassis: `robots/mobile_base/Linkhou/S2_V2/` (Ranger Mini matches after port).
+
+```usda
+over "fl_steer_joint" {
+    float drive:angular:physics:stiffness = 60000
+    float drive:angular:physics:damping = 6000
+    uniform token drive:angular:physics:type = "force"          /* position */
+}
+over "fl_wheel_joint" {
+    float drive:angular:physics:stiffness = 0
+    float drive:angular:physics:damping = 100000
+    float drive:angular:physics:targetPosition = 0
+    uniform token drive:angular:physics:type = "acceleration"   /* velocity */
+}
+```
+
+| Joint | `type` | Why |
+|-------|--------|-----|
+| Steer | `force` + `targetPosition` | PD on module yaw |
+| Wheel | **`acceleration`** + `targetVelocity` | `damping` is a velocity tracking gain |
+
+`force` + `damping=1e5` on wheels → `τ = D·(ω*−ω)` (huge torque) → four wheels fight → chassis jitters / surges. `cmd_vel` script: `linearGain ≈ 1/r` (Linkhou S2 `r=0.07` → **14.28**; Ranger Mini `r=0.09` → **11.262**), plus `(θ,v) ≡ (θ+π,−v)` continuity. Parent `joint_command` ArticulationController must **not** connect velocity/effort (would overwrite `cmd_vel` wheel targets).
+
+### 4WS cmd_vel (Ranger Mini / Split Aloha)
+
+IK: `vx_i = vx − ω y_i`, `vy_i = vy + ω x_i`, `θ = atan2(vy_i, vx_i)`, `v = ‖(vx_i, vy_i)‖`. Wheel order must match authored `jointNames` (Ranger Mini: fl, rl, rr, fr).
+
+**`vy` + `ω` at once:** the four target angles jump 60°–120° apart while wheel `acceleration` drive applies immediately → scrub, left-right rock, “卡住”. Gate **all four** wheel speeds by the **worst** steer error (not per-wheel): ≥40° → 0, ≤12° → 1. Keep a rate-limited steer estimate at `maxJointVelocity` (script `_STEER_SLEW` **must match** PhysX `physxJoint:maxJointVelocity`). Pick `(θ, v)` vs `(θ+π, −v)` against the **estimate**, not last command (command history is 1-frame). Sign-flip scale (~0.35) still applies.
+
+Do **not** add `IsaacReadJointState` on the nested Ranger graph without retargeting to the **merged** articulation root (`Split_Aloha/base`); the lag model is portable standalone + nested.
+
+### Steer PD (do not copy Linkhou onto Ranger Mini)
+
+| | Linkhou S2 (stiff) | Ranger Mini (validated 2026-09) |
+|--|--------------------|----------------------------------|
+| type | `force` | `force` |
+| K / D | 60000 / 6000 | **1500 / 300** (`D ≈ 0.2 K`) |
+| maxForce | large | **120** Nm (40 Nm saturates on tire scrub) |
+| maxJointVelocity | — | **180** °/s (90 °/s too slow → stuck; 360 too snappy) |
+| MuJoCo | map K/D/F | `gainPrm=[K]`, `biasPrm=[0,-K,-D]`, `forceRange=±F` |
+
+Symptoms: small-angle overshoot → lower K (not only raise D). Steer late / chassis rocks on crab+yaw → raise `maxForce`/`maxJointVelocity` and keep the align-gate; do not return to K=60000.
+
+### Pitch nod vs roll (tall 4WS + upper box)
+
+Narrow track + high COM → drive pitch (about Y / `Iyy`). Lower **upper-box COM z** and add **low chassis ballast**; raising box `Iyy` stores energy and often still nods. Left-right rock after soft steer is usually **4WS scrub**, not missing `Ixx`. Lift prismatic-Z is not a pitch DOF.
+
+### Nested dexhand self-col (Split Aloha / Piper Revo)
+
+Same as W2/Luna: parent art-root self-col **ON**; `NonDexHand` mutes body/chassis/arm; EE `dexhand_self_collision.usda` excludes hand roots; grippers stay in the group.
+
+Split Aloha: `payloads/Physics/body_self_collision_mute.usda` (physx subLayer) includes `base` / `lifting_link` / `Ranger_Mini` / both `…/Piper`; excludes `…/Piper/link6/tcp/Revo1|Revo2`; **cross-filter** parent ↔ nested `Piper/CollisionGroups/NonDexHand` (else arm hull vs box chatter). Newton: `newton:selfCollisionEnabled=1` + **append references** `body_self_collision_mute_newton.usda` on root `Physics=mujoco` (not mujoco subLayer; **no Piper paths** — races Arm payloads). Arms: Piper `arm_self_collision_mute_newton`. Hands ungrouped.
+
+### Optical USD Camera (no ROS until asked)
+
+USD Camera looks **−Z**; ROS/optical `camera_link` looks **+Z** → child Camera `orient = (0, 1, 0, 0)` (Rx180). Sibling of the visual mesh — **not** under dabai’s compensation xform (`orient` + `rotateX:unitsResolve`).
+
+Aperture from FOV (`f` = Isaac default 18.147562): `aperture = 2 f tan(fov/2)`. Split Aloha lift dabai RGB **16:9 H86° V55° D93.5°±3°** → `horizontalAperture=33.84575` `verticalAperture=18.89405`. **4:3 H64° V55°** is a horizontal crop of the same lens — do not author a second Camera.
+
+### Piper Revo1 / Revo2 EE (tcp)
+
+`AssemblerFixedJoint` `localPos0/localRot0` **=** mount `translate/orient`. Native: Revo2 palm **+Z**, Revo1 palm **+Y**.
+
+| EE / Side | Mount (T z=0.0105) | Notes |
+|-----------|--------------------|--------|
+| Revo2 L/R/default | `Rz(−90)` `(0.707, 0, 0, −0.707)` | Palm inward (tcp −Y left / +Y right after X-mirror), **not** palm-down |
+| Revo1 L/default | `Rx(+90)` `(0.707, 0.707, 0, 0)` | Native-to-Revo2 align ∘ `Rz(−90)` |
+| Revo1 right | `Rx(+90)` then `Rz(+180)` `(0, 0, 0.707, 0.707)` | Extra spin after X-mirror |
+
+Do not copy Revo2 identity onto Revo1 (stays palm-down). Flange visual is a **tcp sibling** so it does not inherit hand rotation.
+
 ---
 
 ## Troubleshooting matrix
@@ -187,6 +262,14 @@ PhysX wheel `damping=1e5` is **not** a MuJoCo actuator gain. Wheels: `stiffness=
 | Arm joints vanish after mount | Deleted ArticulationRoot APIs on arm `root_joint` | `active = false` only |
 | `Invalid DOF name ()` | ConstructArray `jointNames` empty when nested | Author `token[] inputs:jointNames` on the controller |
 | Mounted chassis empty / “ruined” | Adapter USDA parse error (often illegal `delete …connect`) | `Sdf.Layer.FindOrOpen` the adapter; remove illegal delete |
+| Chassis jitters / wheels fight | Wheel Drive `type=force` + `damping=1e5` | Set wheels to `acceleration` (steer stays `force`); `linearGain≈1/r` |
+| 4WS crab+yaw rocks / stuck | Wheel vel before steers arrive; `maxForce`/`maxVel` too low | Align-gate (min of 4); match slew to `maxJointVelocity`; F≈120, ωmax≈180°/s |
+| Steer small-angle overshoot | Copied Linkhou K=60000 | Ranger Mini K=1500 D=300 (`D≈0.2 K`) |
+| Pitch nod on accel | High upper COM, short wheelbase | Lower box COM z + chassis ballast; do not just raise `Iyy` |
+| Nested Revo fingers penetrate | Parent self-col off or no EE excludes | Parent self-col ON + NonDexHand + `dexhand_self_collision` Revo excludes |
+| Camera looks backward / through housing | Camera under dabai xform, or no Rx180 | Sibling of mesh on optical link; `orient=(0,1,0,0)` |
+| Revo1 still palm-down | Identity / old Rx90·Rz90 only | Revo1 `Rx(+90)`; right + `Rz(+180)` |
+| Piper gripper both pads same side | Copied ARX `gearing=-1` on co-axial fingers | PhysX `gearing=+1`, Newton `mimicCoef1=-1` |
 
 ---
 

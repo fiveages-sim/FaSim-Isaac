@@ -7,8 +7,8 @@ description: >-
   Transformer, Robot Assembler, variantSets, VariantSwitcher, Physics=physx|
   mujoco, gripper mimic/drive, AdaptiveGripperController, Newton vs PhysX,
   nested Chassis/arm ROS graphs, ArticulationController jointNames, USDA parse
-  errors on adapter payloads, Cobot Magic / Tracer / ARX Lift2S / LunarBot
-  mobile manipulators.
+  errors on adapter payloads, 4WS cmd_vel / steer PD, optical USD Camera,
+  Cobot Magic / Tracer / ARX Lift2S / LunarBot / Split Aloha / Ranger Mini.
 ---
 
 # Isaac URDF → USDA → Variants → OCS2 Physics
@@ -22,6 +22,9 @@ End-to-end workflow for ROS robots in **Isaac Sim 6**: import, assemble, variant
 | Robot | Path |
 |-------|------|
 | Galaxea_R1 | `robots/humanoid/Galaxea/R1/` — Chassis + nested ROS retarget |
+| Split Aloha | `robots/mobile_manipulator/Agilex/Split Aloha/` — Ranger Mini + dual Piper + lift camera |
+| Ranger Mini | `robots/mobile_base/Agilex/Ranger Mini/` — 4WS cmd_vel + steer/wheel Drive split |
+| Piper Revo EE | `robots/manipulators/AgileX/Piper/payloads/EE/` — Revo1/Revo2 tcp mounts |
 | Cobot Magic V1 | `robots/mobile_manipulator/Agilex/Cobot Magic V1/` — Tracer chassis + dual X5/R5 |
 | Tracer V1 | `robots/mobile_base/Agilex/Tracer V1/` |
 | ARX Lift2S 6.0 | `FaSim-Isaac/robots/mobile_manipulator/ARX/Lift 2S/` |
@@ -66,11 +69,13 @@ Prefer file import over ROS2 URDF node (Fast DDS vs Zenoh mismatches).
 
 ### 1.3 Physics after transform
 
-| Joint role | Drive | Stiffness | Damping |
-|------------|-------|-----------|---------|
-| Position (arms, lift, steer) | force + targetPosition | tuned | tuned |
-| Continuous wheel | force + targetVelocity | **0** | high (e.g. 1e5–1e6) |
-| Mecanum | same as wheel + `isaacmecanumwheel:radius/angle` | | |
+| Joint role | Drive `type` | Target | Stiffness | Damping |
+|------------|--------------|--------|-----------|---------|
+| Position (arms, lift, **steer**) | **`force`** | `targetPosition` | tuned (e.g. 60000) | tuned (e.g. 6000) |
+| Continuous **wheel** | **`acceleration`** | `targetVelocity` | **0** | high (e.g. `1e5`) |
+| Mecanum | same as wheel + `isaacmecanumwheel:radius/angle` | | | |
+
+Wheels must **not** use `force` + `damping=1e5`: that is a huge torque (`τ = D·(ω*−ω)`), four modules fight, chassis jitters. Linkhou S2 / Ranger Mini: `acceleration`, `stiffness=0`, `damping=1e5`; `cmd_vel` script `linearGain ≈ 1/r` (S2 `r=0.07` → 14.28; Ranger Mini `r=0.09` → **11.262**). Steer stays `force`. **Do not** copy Linkhou steer `K=60000 D=6000` onto Ranger Mini (small-angle overshoot). Ranger Mini steer: `D ≈ 0.2·K` (e.g. 1500/300), `maxForce` high enough to beat tire scrub, `maxJointVelocity` matched in the 4WS script slew. `vy`+`ω` must **gate wheel speed until all four steers align** — see [reference.md](reference.md) § 4WS. Do **not** copy `1e5` into MuJoCo actuators.
 
 ---
 
@@ -184,8 +189,9 @@ variantSet "Physics" = {
 
 ### 4.1 PhysX (OCS2 / ArticulationController)
 
-- Position joints: `drive:*:physics:type = "force"`, stiffness/damping/maxForce tuned.
-- Continuous wheels: `stiffness=0`, high PhysX damping (e.g. `1e5`); **do not** copy that damping into MuJoCo actuators.
+- Position joints (arms, lift, **steer**): `drive:*:physics:type = "force"`, stiffness/damping/maxForce tuned.
+- Continuous **wheels**: `type = "acceleration"`, `stiffness=0`, `targetVelocity`, PhysX `damping` ~ `1e5`. **Not** `force` — that + `1e5` makes the chassis jitter (Linkhou S2 / Ranger Mini). `cmd_vel` `linearGain ≈ 1/r`. **Do not** copy `1e5` into MuJoCo actuators.
+- **Steer** (4WS): `force` position PD; start `D ≈ 0.2·K`. Soft K without `maxForce`/`maxJointVelocity` → late steer + lateral rock. Stiff Linkhou gains on Ranger Mini → overshoot. PhysX + MuJoCo `gainPrm`/`biasPrm`/`forceRange` must match. Details: [reference.md](reference.md) § 4WS / steer.
 - Single parent articulation root; chassis child ArticulationRoot deleted on the prim that has it; arm/EE `root_joint` is `active=false` only.
 - Grippers: see [reference.md](reference.md) § Gripper PhysX + OCS2.
 - Side left/right: `robotJoints` must list **active** renamed joints (`left_gripper_joint`), not deactivated `gripper_joint`.
@@ -228,11 +234,14 @@ Play checklist:
 - [ ] Newton: same with `Physics=mujoco`; no PhysX Drive left on actuated joints
 - [ ] VariantSwitcher: Newton↔PhysX flips root + nested components
 - [ ] Env variant selections match renamed options
+- [ ] 4WS: steer tracks before wheels push; `vy`+yaw does not scrub
+- [ ] Optical `Camera` under camera_link looks along +Z (Rx180); no ROS until asked
+- [ ] Nested dexhand: parent self-col ON + NonDexHand + EE excludes (Piper Revo / Split Aloha)
 
 ---
 
 ## Additional resources
 
-- [reference.md](reference.md) — gripper PhysX/OCS2, nested chassis ROS, USDA `delete …connect` parse trap, VariantSwitcher
+- [reference.md](reference.md) — gripper PhysX/OCS2, 4WS cmd_vel, steer PD, nested chassis ROS, optical Camera, Piper Revo EE, USDA `delete …connect` parse trap, VariantSwitcher
 - Project notes: `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md`
 - NVIDIA: [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/latest/robot_setup/asset_structure.html)

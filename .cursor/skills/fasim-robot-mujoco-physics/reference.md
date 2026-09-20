@@ -221,4 +221,5 @@ Match Galaxea_R1: Chassis adapter payloads the shared base, welds `AssemblerFixe
 - Parent Physics payloads must `over` Tracer / X5 / R5 / nested grippers with matching `Physics=` (X5/R5 have no default).
 - Nested `ArticulationController`: author `token[] inputs:jointNames`; ConstructArray v1 output does not resolve under payload → `Invalid DOF name ()`.
 - **Illegal USDA:** `delete token[] inputs:jointNames.connect` (no `= </…>`) fails the **entire** adapter parse; mounted child is empty. Always `Sdf.Layer.FindOrOpen` the adapter.
-- PhysX wheel velocity drive (`stiffness=0`, `damping=1e5`) stays in `physx.usda`. MuJoCo wheels: damping-bias actuators only — do not copy `1e5`.
+- PhysX wheel velocity drive stays in `physics.usda` / `physx.usda`: **`type=acceleration`**, `stiffness=0`, `damping=1e5` (not `force` — that jitters the chassis). Steer stays `force` (`D≈0.2 K` on Ranger Mini; do not copy Linkhou 60000/6000). MuJoCo wheels: damping-bias actuators only — do not copy `1e5`. Steer MJC: `gainPrm=[K]`, `biasPrm=[0,-K,-D]`, `forceRange=±F`. See USDA-OCS2-PhysX-Mujoco reference § 4WS / steer.
+- Split Aloha: nested Ranger `targetPrim`/`chassisPrim` → `Split_Aloha/base`; `jointNames` authored. Dexhand Newton mute is **append-ref** on Split Aloha `Physics=mujoco`, no Piper paths in that file.
