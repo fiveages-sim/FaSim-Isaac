@@ -8,14 +8,17 @@ description: >-
   mujoco, gripper mimic/drive, AdaptiveGripperController, Newton vs PhysX,
   nested Chassis/arm ROS graphs, ArticulationController jointNames, USDA parse
   errors on adapter payloads, 4WS cmd_vel / steer PD, optical USD Camera,
-  Cobot Magic / Tracer / ARX Lift2S / LunarBot / Split Aloha / Ranger Mini.
+  Cobot Magic / Tracer / ARX Lift2S / LunarBot / Split Aloha / Ranger Mini,
+  DifferentialController cmd_vel / caster Drive strip / maxWheelSpeed traps.
+  Humanoid xacro import (Zerith H1 and similar) uses the official URDFImporter
+  path in fasim-urdf-isaac-import; do not part-split.
 ---
 
 # Isaac URDF → USDA → Variants → OCS2 Physics
 
 End-to-end workflow for ROS robots in **Isaac Sim 6**: import, assemble, variantize, and stabilize **PhysX** + **Newton/MuJoCo** for **OCS2** / topic-based `ros2_control`.
 
-**Companion skills:** For deep MuJoCo-only porting patterns see project skill `fasim-robot-mujoco-physics` if present. For gripper/PhysX close pitfalls see [reference.md](reference.md).
+**Companion skills:** For deep MuJoCo-only porting patterns see project skill `fasim-robot-mujoco-physics` if present. For gripper/PhysX close pitfalls see [reference.md](reference.md). For **humanoid xacro → official `urdf_import.py`** (one tree, `visuals/`+`collisions/`, materials) see `fasim-urdf-isaac-import`. **Zerith H1** is one articulation from Isaac Sim `URDFImporter` + Asset Transformer (`~/isaacsim/skills/urdf-mjcf-to-usd-conversion`); do not part-split it. `base_link` collisions use convexDecomposition with two hulls, not a solid column.
 
 **Reference assets**
 
@@ -29,12 +32,14 @@ End-to-end workflow for ROS robots in **Isaac Sim 6**: import, assemble, variant
 | Tracer V1 | `robots/mobile_base/Agilex/Tracer V1/` |
 | ARX Lift2S 6.0 | `FaSim-Isaac/robots/mobile_manipulator/ARX/Lift 2S/` |
 | ARX Gripper PhysX | `FaSim-Isaac/robots/manipulators/ARX/Gripper_2025/payloads/Physics/physx.usda` (旧 crate `ARX5_Gripper_2025` 已移除) |
+| Zerith H1 | `robots/humanoid/Zerith/H1/` — one-tree `urdf_import.py`, then USDA supplements (`fasim-urdf-isaac-import`) |
 | Notes | `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md` |
 
 ## Checklist
 
 ```
 - [ ] 1. Split URDF parts; expand xacro; record mount poses
+- [ ] 1b. Humanoid xacro (Zerith H1): `fasim-urdf-isaac-import` official `urdf_import.py` + `visuals/`/`collisions/`. Do not part-split.
 - [ ] 2. Isaac 5: URDF → USD; Isaac 6: Asset Transformer → USDA
 - [ ] 3. Robot Assembler: child→parent; merge articulation (delete child roots)
 - [ ] 4. Root variantSets + local adapter payloads (not direct category refs)
@@ -190,7 +195,7 @@ variantSet "Physics" = {
 ### 4.1 PhysX (OCS2 / ArticulationController)
 
 - Position joints (arms, lift, **steer**): `drive:*:physics:type = "force"`, stiffness/damping/maxForce tuned.
-- Continuous **wheels**: `type = "acceleration"`, `stiffness=0`, `targetVelocity`, PhysX `damping` ~ `1e5`. **Not** `force` — that + `1e5` makes the chassis jitter (Linkhou S2 / Ranger Mini). `cmd_vel` `linearGain ≈ 1/r`. **Do not** copy `1e5` into MuJoCo actuators.
+- Continuous **wheels**: `type = "acceleration"`, `stiffness=0`, `targetVelocity`, PhysX `damping` ~ `1e5` (light chassis) or `1e6` (heavy wheeled humanoid / Zerith). **Not** `force` + high D on multi-wheel fight cases (Linkhou S2 / Ranger Mini). DiffDrive: official `DifferentialController` Graph (Tracer V2 / Woosh Ai2 / Zerith); `maxWheelSpeed=0`; passive casters **no DriveAPI**. Details: [reference.md](reference.md) § DiffDrive. **Do not** copy PhysX wheel damping into MuJoCo actuators.
 - **Steer** (4WS): `force` position PD; start `D ≈ 0.2·K`. Soft K without `maxForce`/`maxJointVelocity` → late steer + lateral rock. Stiff Linkhou gains on Ranger Mini → overshoot. PhysX + MuJoCo `gainPrm`/`biasPrm`/`forceRange` must match. Details: [reference.md](reference.md) § 4WS / steer.
 - Single parent articulation root; chassis child ArticulationRoot deleted on the prim that has it; arm/EE `root_joint` is `active=false` only.
 - Grippers: see [reference.md](reference.md) § Gripper PhysX + OCS2.
@@ -211,7 +216,7 @@ Typical stack:
 - Isaac OmniGraph: `ROS2SubscribeJointState` → `IsaacArticulationController` on the **merged** articulation prim (parent root / chassis `base_link`).
 - Publish `joint_states` via `IsaacReadJointState`.
 - Host: `topic_based_ros2_control` + `ocs2_arm_controller` + `adaptive_gripper_controller`.
-- Nested chassis `cmd_vel` graphs: retarget + author `jointNames` — see [reference.md](reference.md) § Nested chassis ROS.
+- Nested chassis `cmd_vel` graphs: retarget + author `jointNames` — see [reference.md](reference.md) § Nested chassis ROS / DiffDrive.
 
 Gripper AdaptiveGripperController:
 
@@ -242,6 +247,7 @@ Play checklist:
 
 ## Additional resources
 
-- [reference.md](reference.md) — gripper PhysX/OCS2, 4WS cmd_vel, steer PD, nested chassis ROS, optical Camera, Piper Revo EE, USDA `delete …connect` parse trap, VariantSwitcher
+- [reference.md](reference.md) — gripper PhysX/OCS2, DiffDrive, 4WS cmd_vel, steer PD, nested chassis ROS, optical Camera, Piper Revo EE, USDA `delete …connect` parse trap, VariantSwitcher
+- Project skill `fasim-urdf-isaac-import` — official `urdf_import.py` playbook (`visuals/`+`collisions/`, materials, Zerith DiffDrive/casters)
 - Project notes: `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md`
 - NVIDIA: [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/latest/robot_setup/asset_structure.html)

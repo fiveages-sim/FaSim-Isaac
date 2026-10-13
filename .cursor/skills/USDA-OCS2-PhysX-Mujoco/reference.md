@@ -134,6 +134,21 @@ After renaming variant **options**, update env selections or components never lo
 
 ## Nested chassis ROS (Cobot Magic / Galaxea_R1)
 
+### DiffDrive (Tracer V2 / Woosh Ai2 / Zerith H1)
+
+Official OmniGraph (not ScriptNode):
+
+`OnPlaybackTick` → `ROS2SubscribeTwist(cmd_vel)` → `ScaleToFromStageUnit(linear)` → `BreakVector3` → `DifferentialController` (`lin.x`, `ang.z`, `dt`) → `ArticulationController` (`jointNames=[left,right]`).
+
+| Rule | Detail |
+|------|--------|
+| Math | \(\omega_L=(2v-\omega L_{tw})/(2r)\), \(\omega_R=(2v+\omega L_{tw})/(2r)\); output `[left, right]` |
+| Signs | Both drive joints identity +Y → **same-sign** cmds; negating right swaps forward↔spin |
+| Caps | `max*=0` unset. **Never** tight `maxWheelSpeed` — Isaac clips L/R independently → Δω→0 at high `v`. Prefer `maxLinearSpeed` / `maxAngularSpeed` |
+| Drive | PhysX `acceleration`, `K=0`, high `D` (`1e5`–`1e6`), high `maxForce` / `maxJointVelocity`. Prefer this over Woosh `force`+small `maxForce` for heavy robots |
+| Casters | Strip `PhysicsDriveAPI` (JointState only). Tracer’s caster `Drive+K=100` centers forks — OK for light AGV, bad for heavy arc-turn |
+| Refs | Tracer V2 `payloads/ROS/ros2.usda`; Woosh Ai2 `payloads/Graph/enable.usda`; Zerith `payloads/ROS/enable.usda` + `fasim-urdf-isaac-import` §D |
+
 Child chassis graphs (`cmd_vel`, `/odom`) stay on the child asset. After merge they must be **retargeted** from the parent (mount adapter or root `over "ChassisPrim"` like `humanoid/Galaxea/R1/R1.usda`):
 
 ```usda
