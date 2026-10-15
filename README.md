@@ -31,9 +31,16 @@ cd FaSim-Isaac
 
 脚本会自动完成子模块初始化、分支切换并更新到最新提交。
 
-#### 操作 2：配置环境
+#### 操作 2：加载 ArtVIP 场景
+
+用 Isaac 自带的 Python 运行 `tools/artvip_kitchen.py`。还没有原版数据时先下载再转换，已有则只转换。结果写到 `environment/ArtVIP-fasim/kitchen`，不拉子模块。`convert` 会删掉已有转换结果再重建。
+
+#### 操作 3：配置环境
 
 - **Isaac ROS2 Jazzy Workspace**：可选 Isaac Sim 版本（菜单会查询 GitHub 最新 3 个稳定 tag，失败则回退 `config/fa_sim.conf`），下载对应 ROS workspaces，提取 `jazzy_ws` 到 `isaac_jazzy_ws/`，安装 rosdep / colcon 依赖，构建工作空间并写入 `~/.bashrc`。也可通过环境变量指定：`ISAAC_SIM_VERSION=6.0.1 ./init.sh`
+- **安装舵轮控制节点并启用脚本静默**（选项 4）：只改本机 Isaac 安装目录（默认 `${HOME}/isaacsim`，可用 `ISAACSIM_DIR` 覆盖），不拉子模块、不构建 ROS 工作空间。重装 Isaac 后需要再选一次。正在运行的 Isaac 要重启后才生效。
+  - **舵轮控制节点**：把 `exts/fasim.steering.nodes` 链到 `extsUser/`，并在 `isaacsim.exp.full.kit` 与 Newton kit 中启用。Linkhou S2_V1 和 Taku 底盘的舵轮控制因此走普通 OmniGraph 节点 `fasim.steering.nodes.SwerveController`，打开场景时不会因为 ScriptNode 把全部 Action Graph 关掉。
+  - **脚本静默**：写入 `opt_in = true` 与 `ignoreWarningDialog = true`。前者默认授权仍留在资产里的 ScriptNode，后者跳过 ArtVIP 行为脚本的安全弹窗。
 
 ### 3. 启动 Isaac Sim
 
@@ -67,8 +74,10 @@ cp config/fa_sim.local.template.conf config/fa_sim.local.conf
 
 ```
 FaSim-Isaac/
-├── init.sh                       # 一键初始化脚本
+├── init.sh                       # 一键初始化；选项 2 加载 ArtVIP，选项 4 安装舵轮控制节点
 ├── run.sh                        # Isaac Sim 启动脚本
+├── exts/fasim.steering.nodes/    # 舵轮控制 OmniGraph 节点
+├── tools/artvip_kitchen.py       # ArtVIP 厨房下载与转换
 ├── config/
 │   ├── fa_sim.conf               # 共用配置（init / run）
 │   └── fa_sim.local.template.conf
@@ -76,10 +85,25 @@ FaSim-Isaac/
 ├── robots/                       # 机器人 USD 资产（Git 子模块）
 ├── environment/
 │   ├── fiveages_env/             # 场景 USD 资产（Git 子模块）
-│   └── fa-project-usd/           # Fa Project USD 资产（Git 子模块，private）
+│   ├── fa-project-usd/           # Fa Project USD 资产（Git 子模块，private）
+│   ├── ArtVIP/                   # 原版下载（gitignore）
+│   └── ArtVIP-fasim/             # 转换后的厨房组件（gitignore）
 └── isaac_jazzy_ws/               # ROS2 Jazzy 工作空间（由 init.sh 操作 2 生成）
 ```
 
 `robots` 内按类型分子目录：人形（humanoid）、机械臂（manipulators）、夹爪（grippers）、灵巧手（dexhands）、传感器（sensors）、支架（stands）等；`environment` 下为场景与项目相关 USD。具体机型与文件名可直接在对应目录中查看。
+
+---
+
+## ArtVIP 厨房
+
+原版数据不入库。转换结果给机器人场景当 payload 用，同样不入库。`./init.sh` 选 **2** 会做同样的事。也可以直接运行：
+
+```bash
+python tools/artvip_kitchen.py download   # environment/ArtVIP/
+python tools/artvip_kitchen.py convert    # environment/ArtVIP-fasim/kitchen
+```
+
+未设置 `HF_ENDPOINT` 或 `--endpoint` 时，下载走 `https://hf-mirror.com`。`convert` 会删掉已有输出再重建，包含碰撞、叠放间距和 Isaac Sim 6.2 行为脚本垫片。机器人场景（如 W2、Taku 的 `env/artvip/ktichen.usda`）不是这个脚本生成的，厨房平移、物理变体和 GPU 配对缓冲写在那些场景文件里。
 
 ---

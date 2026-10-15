@@ -1,0 +1,91 @@
+{
+    "fasim.steering.nodes.SwerveController": {
+        "version": 1,
+        "description": ["Four-wheel steer command from a planar twist. Linkhou S2 snaps steer to zero on stop. Taku holds steer, limits slew, and drops a stale cmd_vel."],
+        "language": "python",
+        "metadata": {
+            "uiName": "舵轮控制节点"
+        },
+        "inputs": {
+            "execIn": {
+                "type": "execution",
+                "description": ["Playback tick."]
+            },
+            "profile": {
+                "type": "token",
+                "description": ["Which chassis kinematics and stop behavior to use."],
+                "default": "linkhou_s2_v1",
+                "metadata": {
+                    "allowedTokens": ["linkhou_s2_v1", "taku"]
+                }
+            },
+            "Desired_Linear_Velocity_X": {
+                "type": "double",
+                "description": ["Body-frame forward speed, meters per second."],
+                "default": 0.0
+            },
+            "Desired_Linear_Velocity_Y": {
+                "type": "double",
+                "description": ["Body-frame lateral speed, meters per second."],
+                "default": 0.0
+            },
+            "Desired_Angular_Velocity": {
+                "type": "double",
+                "description": ["Yaw rate, radians per second."],
+                "default": 0.0
+            },
+            "linearGain": {
+                "type": "double",
+                "description": ["Scale applied to wheel speed after the inverse kinematics."],
+                "default": 50.0
+            },
+            "angularGain": {
+                "type": "double",
+                "description": ["Scale applied to yaw rate before the inverse kinematics."],
+                "default": 1.0
+            },
+            "flipVelocityScale": {
+                "type": "double",
+                "description": ["Wheel-speed scale for one frame when the equivalent steer solution flips sign."],
+                "default": 0.35
+            },
+            "deltaSeconds": {
+                "type": "double",
+                "description": ["Playback frame dt. Taku uses it for steer slew and command timeout."],
+                "default": 0.0
+            },
+            "msgCount": {
+                "type": "int",
+                "description": ["Increments when a new Twist arrives. Taku times out the last command if this stops changing."],
+                "default": 0
+            },
+            "simTime": {
+                "type": "double",
+                "description": ["Unused. Kept so existing Taku graph connections still resolve."],
+                "default": 0.0
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": ["Fires after the command is written."]
+            },
+            "Steer_Position_Command": {
+                "type": "double[]",
+                "description": ["Steer angles, fl rl rr fr."]
+            },
+            "Steer_Joints": {
+                "type": "token[]",
+                "description": ["Steer joint names, fl rl rr fr."]
+            },
+            "Wheel_Velocity_Command": {
+                "type": "double[]",
+                "description": ["Wheel velocity commands, fl rl rr fr."]
+            },
+            "Wheel_Joints": {
+                "type": "token[]",
+                "description": ["Wheel joint names, fl rl rr fr."]
+            }
+        }
+    }
+}

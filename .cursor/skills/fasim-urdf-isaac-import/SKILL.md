@@ -2,7 +2,7 @@
 name: fasim-urdf-isaac-import
 description: >-
   Practical playbook for importing humanoid/mobile-manipulator xacro into
-  FaSim-Isaac Isaac Sim 6.1 USD via the shipped URDFImporter + Asset
+  FaSim-Isaac Isaac Sim 6.2 USD via the shipped URDFImporter + Asset
   Transformer. Do not part-split (no Chassis/Body/Head/Arm trees, no
   build_final). After import, fold *_1 collision siblings into visuals/
   collisions, flatten links to root siblings + `joints` (Inex/Luna),
@@ -35,7 +35,7 @@ Official path only: offline xacro → OBJ if needed → Isaac Sim `urdf_import.p
 
 | Role | Location |
 |------|----------|
-| Isaac Sim 6.1 | `~/isaacsim` (`~/isaacsim/python.sh`) |
+| Isaac Sim 6.2 | `~/isaacsim` (`~/isaacsim/python.sh`) |
 | Official URDF import | `~/isaacsim/standalone_examples/api/isaacsim.asset.importer.urdf/urdf_import.py` |
 | Official skill | `~/isaacsim/skills/urdf-mjcf-to-usd-conversion/SKILL.md` |
 | Mesh format only | `glb_to_obj.py` converts `.glb` → `.obj` (converter does not read GLB). Not a robot builder. |
@@ -88,7 +88,7 @@ Use **isaac-urdf-usda-ocs2** instead when assembling **shared category** arms/wh
 
 ## 2. Official import
 
-Isaac Sim 6.1 converter (`urdf_usd_converter` 0.3.2) reads STL/OBJ/DAE only. `.glb` is dropped with empty meshes.
+Isaac Sim 6.2 converter (`urdf_usd_converter` 0.3.2) reads STL/OBJ/DAE only. `.glb` is dropped with empty meshes.
 
 ```bash
 # 1) expand xacro offline (URDFImporter does not parse xacro)
@@ -114,7 +114,7 @@ Importer tree is `Geometry/<link>` nested, joints under `Physics`. FaSim robots 
 
 CLI `urdf_import.py` writes same-stem visual/collision as **sibling** Xforms (`base_link` visual, `base_link_1` collision, `purpose=guide`). That `_1` is USD name uniquification (`name_cache.getPrimNames`), **not** a second rigid and **not** the Isaac Sim recommended sim structure.
 
-Isaac Sim 6.1 [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/6.1.0/robot_setup/asset_structure.html) nests links under `Geometry/`. FaSim ships the flattened Inex / Luna form instead:
+Isaac Sim 6.2 [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/robot_setup/asset_structure.html) nests links under `Geometry/`. FaSim ships the flattened Inex / Luna form instead:
 
 ```text
 /<Robot>/
@@ -205,4 +205,4 @@ Numbers: [reference.md](reference.md) §F. If one side of a two-sided LED is dar
 
 - [reference.md](reference.md) — materials table, EE quats, ROS/mimic pitfalls
 - Skills: `USDA-OCS2-PhysX-Mujoco`, `fasim-robot-mujoco-physics`, `fasim-usd-bake-scale`
-- NVIDIA: [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/6.1.0/robot_setup/asset_structure.html)
+- NVIDIA: [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/6.2.0/robot_setup/asset_structure.html)

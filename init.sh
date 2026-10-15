@@ -330,18 +330,22 @@ echo "请选择要执行的操作"
 echo
 echo "  [仓库初始化]"
 echo "    1) 初始化仓库（勾选要拉取的子模块，public 默认勾选）"
+echo "    2) 加载 ArtVIP 场景"
 echo
 echo "  [环境配置]"
-echo "    2) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
+echo "    3) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
+echo "    4) 安装舵轮控制节点并启用脚本静默"
 echo
 echo "  [其他]"
 echo "    q) 退出"
 echo
-read -rp "输入选项 [1-2/q]: " choice
+read -rp "输入选项 [1-4/q]: " choice
 
 case "$choice" in
     1|"") INIT_MODE="repo" ;;
-    2) INIT_MODE="ros2_jazzy" ;;
+    2) INIT_MODE="artvip" ;;
+    3) INIT_MODE="ros2_jazzy" ;;
+    4) INIT_MODE="isaac_local" ;;
     q|Q)
         echo "已退出。"
         exit 0
@@ -410,7 +414,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
             ver_idx=$((ver_idx + 1))
         done
         custom_idx=$ver_idx
-        echo "    ${custom_idx}) 自定义版本号（如 6.1.0）"
+        echo "    ${custom_idx}) 自定义版本号（如 6.2.0）"
         echo
         echo "  [其他]"
         echo "    q) 退出"
@@ -426,7 +430,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
                 ;;
             *)
                 if [ "$ver_choice" = "$custom_idx" ]; then
-                    read -rp "输入版本号（例如 6.1.0 或 IsaacSim-6.1.0）: " custom_ver
+                    read -rp "输入版本号（例如 6.2.0 或 IsaacSim-6.2.0）: " custom_ver
                     custom_ver="${custom_ver#IsaacSim-}"
                     custom_ver="${custom_ver#v}"
                     if [ -z "$custom_ver" ]; then
@@ -456,7 +460,7 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 fi
 echo ""
 
-if [ "$INIT_MODE" != "ros2_jazzy" ]; then
+if [ "$INIT_MODE" = "repo" ]; then
 
 VISIBILITY_CONF="$REPO_DIR/submodules_visibility.conf"
 if [ ! -f "$VISIBILITY_CONF" ]; then
@@ -612,7 +616,7 @@ echo ""
 print_info "如需更新子模块到最新提交，可以运行："
 print_info "  git submodule update --remote"
 
-fi  # end of [ "$INIT_MODE" != "ros2_jazzy" ]
+fi  # end of [ "$INIT_MODE" = "repo" ]
 
 if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
@@ -825,6 +829,148 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
 fi
 
+# 把仓库里的舵轮控制节点挂进本机 Isaac，使 Linkhou / Taku 底盘图不再使用 ScriptNode。
+install_fasim_steering_nodes() {
+    local ext_name="fasim.steering.nodes"
+    local src="${REPO_DIR}/exts/${ext_name}"
+    local isaac_dir="${ISAACSIM_DIR:-${HOME}/isaacsim}"
+    local exts_user="${isaac_dir}/extsUser"
+    local link="${exts_user}/${ext_name}"
+    local kit dep_line tmp
+
+    if [ ! -f "${src}/config/extension.toml" ]; then
+        print_warn "找不到舵轮控制节点扩展: ${src}"
+        return 0
+    fi
+    if [ ! -d "$isaac_dir" ]; then
+        print_warn "未找到 Isaac Sim（${isaac_dir}），跳过舵轮控制节点安装"
+        return 0
+    fi
+
+    mkdir -p "$exts_user"
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        print_warn "舵轮控制节点路径已存在且不是链接，跳过: ${link}"
+    else
+        ln -sfn "$src" "$link"
+        print_info "舵轮控制节点已安装: ${link}"
+    fi
+
+    dep_line="\"${ext_name}\" = {}"
+    for kit in \
+        "${isaac_dir}/apps/isaacsim.exp.full.kit" \
+        "${isaac_dir}/apps/isaacsim.exp.full.newton.kit"
+    do
+        [ -f "$kit" ] || continue
+        if grep -qF "$dep_line" "$kit"; then
+            print_info "舵轮控制节点已启用: $(basename "$kit")"
+            continue
+        fi
+        if ! grep -q '^\[dependencies\]$' "$kit"; then
+            print_warn "找不到 [dependencies]，跳过: ${kit}"
+            continue
+        fi
+        tmp="$(mktemp)"
+        awk -v dep="$dep_line" '
+            $0 == "[dependencies]" && !inserted {
+                print
+                print dep
+                inserted = 1
+                next
+            }
+            { print }
+        ' "$kit" > "$tmp"
+        mv "$tmp" "$kit"
+        print_info "已启用舵轮控制节点: $(basename "$kit")"
+    done
+}
+
+# 本机启动时默认允许 ScriptNode，并跳过 ArtVIP 行为脚本弹窗。
+install_isaac_script_silence() {
+    local isaac_dir="${ISAACSIM_DIR:-${HOME}/isaacsim}"
+    local kit tmp
+    if [ ! -d "$isaac_dir" ]; then
+        print_warn "未找到 Isaac Sim（${isaac_dir}），跳过脚本静默配置"
+        return 0
+    fi
+    for kit in \
+        "${isaac_dir}/apps/isaacsim.exp.full.kit" \
+        "${isaac_dir}/apps/isaacsim.exp.full.newton.kit"
+    do
+        [ -f "$kit" ] || continue
+        if ! grep -q '^\[settings.app\]$' "$kit"; then
+            print_warn "找不到 [settings.app]，跳过: ${kit}"
+            continue
+        fi
+        if ! grep -qF 'opt_in = true' "$kit"; then
+            tmp="$(mktemp)"
+            awk '
+                $0 == "[settings.app]" && !inserted {
+                    print "[settings.app.\"omni.graph.scriptnode\"]"
+                    print "opt_in = true"
+                    print ""
+                    inserted = 1
+                }
+                { print }
+            ' "$kit" > "$tmp"
+            mv "$tmp" "$kit"
+            print_info "已默认授权 ScriptNode: $(basename "$kit")"
+        fi
+        if ! grep -qF 'ignoreWarningDialog = true' "$kit"; then
+            tmp="$(mktemp)"
+            awk '
+                $0 == "[settings.app]" && !inserted {
+                    print "[settings.app.scripting]"
+                    print "ignoreWarningDialog = true"
+                    print ""
+                    inserted = 1
+                }
+                { print }
+            ' "$kit" > "$tmp"
+            mv "$tmp" "$kit"
+            print_info "已跳过行为脚本弹窗: $(basename "$kit")"
+        fi
+        if grep -qF 'opt_in = true' "$kit" && grep -qF 'ignoreWarningDialog = true' "$kit"; then
+            print_info "脚本静默已启用: $(basename "$kit")"
+        fi
+    done
+}
+
+# 下载（若还没有原版）并转换 ArtVIP 厨房，供机器人场景 payload 引用。
+load_artvip_scene() {
+    local isaac_dir="${ISAACSIM_DIR:-${HOME}/isaacsim}"
+    local py="${isaac_dir}/kit/python/bin/python3"
+    local script="${REPO_DIR}/tools/artvip_kitchen.py"
+    local official="${REPO_DIR}/environment/ArtVIP/Interactive_scene/kitchen/Interactive_kitchen.usd"
+    local cmd="convert"
+
+    if [ ! -f "$script" ]; then
+        print_error "找不到转换脚本: ${script}"
+        return 1
+    fi
+    if [ ! -x "$py" ]; then
+        print_error "未找到 Isaac Python: ${py}"
+        return 1
+    fi
+    if [ ! -f "$official" ]; then
+        print_info "未找到原版厨房，先下载 ArtVIP 再转换..."
+        cmd="all"
+    else
+        print_info "已有原版厨房，开始转换（会重建 environment/ArtVIP-fasim/kitchen）..."
+    fi
+    if ! "$py" "$script" "$cmd"; then
+        print_error "ArtVIP 场景加载失败"
+        return 1
+    fi
+    print_info "ArtVIP 厨房已就绪: ${REPO_DIR}/environment/ArtVIP-fasim/kitchen"
+}
+
+if [ "$INIT_MODE" = "isaac_local" ]; then
+    install_fasim_steering_nodes
+    install_isaac_script_silence
+elif [ "$INIT_MODE" = "artvip" ]; then
+    load_artvip_scene
+fi
+
 echo ""
 print_info "=========================================="
 print_info "全部步骤已完成！"
@@ -834,6 +980,12 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     print_info "Isaac ROS2 Workspace 已按 ${ISAAC_SIM_TAG} 配置完成"
     print_info "现在可以通过以下指令启动 Isaac Sim："
     echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
+elif [ "$INIT_MODE" = "isaac_local" ]; then
+    print_info "舵轮控制节点与脚本静默已写入本机 Isaac Sim。"
+    print_info "正在运行的 Isaac 需要重启后才生效。"
+elif [ "$INIT_MODE" = "artvip" ]; then
+    print_info "ArtVIP 厨房组件位于 environment/ArtVIP-fasim/kitchen。"
+    print_info "在 Isaac 中打开机器人的 env/artvip/ktichen.usda 即可使用。"
 else
     print_info "仓库初始化完成，如需更新子模块到最新提交，可以运行："
     echo -e "  ${GREEN}git submodule update --remote${NC}"

@@ -1,0 +1,24 @@
+[package]
+version = "0.1.0"
+category = "Simulation"
+title = "舵轮控制节点"
+description = "OmniGraph swerve controller used by Linkhou S2 and Taku chassis graphs. Replaces omni.graph.scriptnode.ScriptNode so opening a stage does not disable every graph."
+authors = ["FiveAges"]
+keywords = ["isaac", "omnigraph", "steering"]
+
+[dependencies]
+"omni.graph" = {}
+"omni.graph.core" = {}
+"omni.graph.tools" = {}
+"omni.timeline" = {}
+
+[[python.module]]
+name = "fasim.steering.nodes"
+
+[fswatcher.patterns]
+include = ["*.ogn", "*.py"]
+exclude = ["Ogn*Database.py"]
+
+[python.pipapi]
+requirements = ["numpy"]
+use_online_index = true
