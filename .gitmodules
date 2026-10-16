@@ -7,3 +7,6 @@
 [submodule "environment/fa-project-usd"]
 	path = environment/fa-project-usd
 	url = git@github.com:fiveages-sim/fa-project-usd.git
+[submodule "environment/artvip-usd"]
+	path = environment/artvip-usd
+	url = git@github.com:fiveages-sim/artvip-usd.git
