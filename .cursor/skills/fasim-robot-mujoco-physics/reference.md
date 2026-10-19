@@ -53,9 +53,27 @@ def MjcActuator "joint1"
 ```
 
 Map from PhysX joint:
-- `forceRange` ↔ `drive:*:physics:maxForce`
+- `forceRange` ↔ `drive:*:physics:maxForce` (may **tier down** on distal joints for Newton — see below)
 - `ctrlRange` ↔ `physics:lowerLimit` / `upperLimit`
 - Gripper prismatic: often `gainPrm=100`, `biasPrm=[0,-100,-10,...]`, ctrl in meters
+
+**Do not** map PhysX implicit `force` Drive stiffness/damping 1:1 into `gainPrm`/`biasPrm` when those numbers are PhysX-solver-scale (e.g. CR5 / M6 PhysX `6e4–6e5`). Newton `MjcActuator` is explicit; use the M6 Newton PD recipe instead.
+
+## Newton arm PD stability (CR5 + AG2F90 case)
+
+**Symptom:** fruits / table scene under Newton — arm shakes violently, or distal joints sag and “won’t hold.”
+
+| Check | Wrong | Working approach |
+|-------|--------|------------------|
+| Arm `gainPrm` | `60000` copied from PhysX Drive | M6-style **`800/50`**, `mjc:damping=1.0` |
+| Distal `forceRange` | Uniform `±100` with high `kp` on tiny wrist `I` | Tier like M6: proximal large, wrist **`±18…20`** |
+| `mjc:armature` | `0.01` while chasing huge `kp` | Raise armature **`0.05–0.1`** first (CR5 used `0.1` proximal / `0.05` wrist) |
+| EE gravity | Only arm `Link*` have `mjc:gravcomp` | Also `gravcomp` on welded **`gripper_base`**; fingers stay off |
+| Gripper strip | Delete `PhysicsDriveAPI` only (AG2F90 left `drive:stiffness=10`) | Block `drive:* = None` like AG2F120S — residual Drive fights the whole articulation |
+
+**Tuning order:** (1) strip all residual PhysX drives on arm **and** gripper → (2) M6 PD + damping 1.0 → (3) tier distal forceRange → (4) EE-base gravcomp → (5) raise armature if still soft → (6) only then nudge `kp`. Blindly raising `kp` with large wrist `forceRange` reintroduces bang-bang.
+
+References: `robots/manipulators/Tianji/M6_CCS/payloads/Physics/mujoco.usda`, `robots/manipulators/Dobot/CR5/payloads/Physics/mujoco.usda`, `robots/grippers/ChangingTek/AG2F90/payloads/Physics/mujoco.usda`.
 
 ## Gripper mount skeleton
 

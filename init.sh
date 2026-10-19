@@ -330,7 +330,7 @@ echo "请选择要执行的操作"
 echo
 echo "  [仓库初始化]"
 echo "    1) 初始化仓库（勾选要拉取的子模块，public 默认勾选）"
-echo "    2) 加载 ArtVIP 场景"
+echo "    2) 下载官方 ArtVIP（environment/ArtVIP，不转换场景）"
 echo
 echo "  [环境配置]"
 echo "    3) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
@@ -935,33 +935,27 @@ install_isaac_script_silence() {
     done
 }
 
-# 下载（若还没有原版）并转换 ArtVIP 厨房，供机器人场景 payload 引用。
+# 只下载官方 ArtVIP。场景组件在 environment/artvip-usd，不再转换到 ArtVIP-fasim。
 load_artvip_scene() {
     local isaac_dir="${ISAACSIM_DIR:-${HOME}/isaacsim}"
-    local py="${isaac_dir}/kit/python/bin/python3"
+    local py="${isaac_dir}/python.sh"
     local script="${REPO_DIR}/tools/artvip_kitchen.py"
-    local official="${REPO_DIR}/environment/ArtVIP/Interactive_scene/kitchen/Interactive_kitchen.usd"
-    local cmd="convert"
+    local official="${REPO_DIR}/environment/ArtVIP"
 
     if [ ! -f "$script" ]; then
-        print_error "找不到转换脚本: ${script}"
+        print_error "找不到下载脚本: ${script}"
         return 1
     fi
     if [ ! -x "$py" ]; then
         print_error "未找到 Isaac Python: ${py}"
         return 1
     fi
-    if [ ! -f "$official" ]; then
-        print_info "未找到原版厨房，先下载 ArtVIP 再转换..."
-        cmd="all"
-    else
-        print_info "已有原版厨房，开始转换（会重建 environment/ArtVIP-fasim/kitchen）..."
-    fi
-    if ! "$py" "$script" "$cmd"; then
-        print_error "ArtVIP 场景加载失败"
+    print_info "下载官方 ArtVIP 到 ${official} ..."
+    if ! "$py" "$script" download; then
+        print_error "ArtVIP 下载失败"
         return 1
     fi
-    print_info "ArtVIP 厨房已就绪: ${REPO_DIR}/environment/ArtVIP-fasim/kitchen"
+    print_info "官方数据位于 ${official}。场景组件在 environment/artvip-usd。"
 }
 
 if [ "$INIT_MODE" = "isaac_local" ]; then
@@ -984,8 +978,8 @@ elif [ "$INIT_MODE" = "isaac_local" ]; then
     print_info "舵轮控制节点与脚本静默已写入本机 Isaac Sim。"
     print_info "正在运行的 Isaac 需要重启后才生效。"
 elif [ "$INIT_MODE" = "artvip" ]; then
-    print_info "ArtVIP 厨房组件位于 environment/ArtVIP-fasim/kitchen。"
-    print_info "在 Isaac 中打开机器人的 env/artvip/ktichen.usda 即可使用。"
+    print_info "官方 ArtVIP 位于 environment/ArtVIP。"
+    print_info "场景组件在 environment/artvip-usd，机器人 env/artvip 直接 payload 这些场景。"
 else
     print_info "仓库初始化完成，如需更新子模块到最新提交，可以运行："
     echo -e "  ${GREEN}git submodule update --remote${NC}"

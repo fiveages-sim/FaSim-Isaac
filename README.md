@@ -33,7 +33,7 @@ cd FaSim-Isaac
 
 #### 操作 2：加载 ArtVIP 场景
 
-用 Isaac 自带的 Python 运行 `tools/artvip_kitchen.py`。还没有原版数据时先下载再转换，已有则只转换。结果写到 `environment/ArtVIP-fasim/kitchen`，不拉子模块。`convert` 会删掉已有转换结果再重建。
+用 Isaac 自带的 Python 运行 `tools/artvip_kitchen.py download`，把官方数据下到 `environment/ArtVIP/`。场景组件在 `environment/artvip-usd`，不再转换出 `ArtVIP-fasim`。
 
 #### 操作 3：配置环境
 
@@ -74,10 +74,10 @@ cp config/fa_sim.local.template.conf config/fa_sim.local.conf
 
 ```
 FaSim-Isaac/
-├── init.sh                       # 一键初始化；选项 2 加载 ArtVIP，选项 4 安装舵轮控制节点
+├── init.sh                       # 一键初始化；选项 2 下载官方 ArtVIP，选项 4 安装舵轮控制节点
 ├── run.sh                        # Isaac Sim 启动脚本
 ├── exts/fasim.steering.nodes/    # 舵轮控制 OmniGraph 节点
-├── tools/artvip_kitchen.py       # ArtVIP 厨房下载与转换
+├── tools/artvip_kitchen.py       # 下载官方 ArtVIP
 ├── config/
 │   ├── fa_sim.conf               # 共用配置（init / run）
 │   └── fa_sim.local.template.conf
@@ -87,7 +87,7 @@ FaSim-Isaac/
 │   ├── fiveages_env/             # 场景 USD 资产（Git 子模块）
 │   ├── fa-project-usd/           # Fa Project USD 资产（Git 子模块，private）
 │   ├── ArtVIP/                   # 原版下载（gitignore）
-│   └── ArtVIP-fasim/             # 转换后的厨房组件（gitignore）
+│   └── artvip-usd/               # 场景组件（payload 官方 ArtVIP）
 └── isaac_jazzy_ws/               # ROS2 Jazzy 工作空间（由 init.sh 操作 2 生成）
 ```
 
@@ -95,15 +95,14 @@ FaSim-Isaac/
 
 ---
 
-## ArtVIP 厨房
+## ArtVIP 场景
 
-原版数据不入库。转换结果给机器人场景当 payload 用，同样不入库。`./init.sh` 选 **2** 会做同样的事。也可以直接运行：
+原版数据不入库。`./init.sh` 选 **2** 只下载官方数据。场景组件在 `environment/artvip-usd`，机器人 `env/artvip` 直接 payload `scenes/*.usda`。
 
 ```bash
-python tools/artvip_kitchen.py download   # environment/ArtVIP/
-python tools/artvip_kitchen.py convert    # environment/ArtVIP-fasim/kitchen
+python tools/artvip_kitchen.py download              # environment/ArtVIP/
 ```
 
-未设置 `HF_ENDPOINT` 或 `--endpoint` 时，下载走 `https://hf-mirror.com`。`convert` 会删掉已有输出再重建，包含碰撞、叠放间距和 Isaac Sim 6.2 行为脚本垫片。机器人场景（如 W2、Taku 的 `env/artvip/ktichen.usda`）不是这个脚本生成的，厨房平移、物理变体和 GPU 配对缓冲写在那些场景文件里。
+未设置 `HF_ENDPOINT` 或 `--endpoint` 时，下载走 `https://hf-mirror.com`。厨房里的开关门、灯光和物理调整写在 artvip-usd 的 object USDA 里，见 `environment/artvip-usd/README.md`。机器人场景文件只保留摆放、物理变体和 GPU 配对缓冲。
 
 ---

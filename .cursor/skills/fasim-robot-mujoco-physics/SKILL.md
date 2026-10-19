@@ -112,18 +112,21 @@ Rules:
 - Prismatic grippers: use `PhysicsDriveAPI:linear` / `drive:linear:physics:* = None` analogously.
 - Only define actuators for **default** Side joints (`joint1`…); Side actuators stay in `Side/left|right.usda`.
 - Do not over non-existent finger/gripper prims on the arm base.
-- Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`). Galaxea arms often kp=200/kd=10; W2 torso may be 60000/6000; **steer** `force` PD → `gainPrm=[K]`, `biasPrm=[0,-K,-D]`, `forceRange=±F` (Ranger Mini 1500/300/±120). Wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
+- Map MuJoCo PD from **this** robot’s PhysX (`stiffness`/`damping`/`maxForce`) **only when PhysX gains are already Newton-scale**. Galaxea arms often kp=200/kd=10; M6_CCS Newton uses **800/50** with `mjc:damping=1.0` (PhysX Drive on M6 stays 600000/60000 — do **not** copy that into `gainPrm`). W2 torso / CR5-style PhysX `60000/6000` is **implicit** joint-drive stiffness — copying into explicit `MjcActuator` causes violent bang-bang (see pitfalls). **steer** `force` PD → `gainPrm=[K]`, `biasPrm=[0,-K,-D]`, `forceRange=±F` (Ranger Mini 1500/300/±120). Wheels with `stiffness=0` → gain≈0 + damping bias, `ctrlLimited=false`.
 - **Do not** copy PhysX wheel `damping=1e5` into MuJoCo actuators (that number is PhysX **acceleration** velocity-drive damping, not MJC `gainPrm`). PhysX wheels: `type=acceleration`, not `force`.
-- Reference strip pattern: `M6_CCS/payloads/Physics/mujoco.usda`.
+- Arm Newton baseline: prefer **M6_CCS** (`800/50`, `mjc:damping=1.0`, armature≈0.01–0.1, distal `forceRange` tiered smaller). Raise `mjc:armature` before chasing huge `kp` when distal `JointEquivalentInertia` is tiny.
+- Reference strip + PD pattern: `M6_CCS/payloads/Physics/mujoco.usda`. Worked CR5+AG2F90: `Dobot/CR5/payloads/Physics/mujoco.usda`.
 
 ### Newton gravity compensation
 
 | Attribute | Where | Role |
 |-----------|--------|------|
-| `mjc:gravcomp = 1` | Rigid **bodies** (torso links, arm `link1…N`) | Actual gravity-compensation force |
+| `mjc:gravcomp = 1` | Rigid **bodies** (torso links, arm `link1…N`, welded EE **base**) | Actual gravity-compensation force |
 | `mjc:actuatorgravcomp = 1` | Actuated **joints** | Route that force through `qfrc_actuator` (with joint force limits) |
 
-Enable both on torso + arm. Default **off** for chassis steer/wheels and gripper fingers unless explicitly requested. Side joints must set `actuatorgravcomp` inside the same `def` as `MjcJointAPI`.
+Enable both on torso + arm. Default **off** for chassis steer/wheels and gripper **fingers** unless explicitly requested. Side joints must set `actuatorgravcomp` inside the same `def` as `MjcJointAPI`.
+
+**Per-body only:** arm `Link*` / `link*` `gravcomp` does **not** cover a welded EE. Without `mjc:gravcomp` on `gripper_base` (or equivalent), EE mass is held only by arm PD → distal joints look soft / sag. Put `gravcomp` on the EE base in the **gripper** `Physics/mujoco.usda`; leave fingers off unless needed.
 
 **`physics.usda` must not `subLayers` the robot root** — causes composition cycles when root `Physics=physx|mujoco` payloads it.
 
@@ -250,13 +253,17 @@ Note: without Isaac schema plugins loaded, `GetAppliedSchemas()` may omit `MjcJo
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Mujoco still shows stiffness/damping | Only deleted DriveAPI schema; attrs remain from `physics`/Side | In `mujoco.usda` set `drive:* = None` (+ Side joint overs) |
+| Arm explodes / bang-bang under Newton | Copied PhysX **implicit** Drive (`kp` 1e4–1e5) into explicit `MjcActuator`; or high `kp` + large distal `forceRange` on tiny `JointEquivalentInertia` | Use M6-scale PD (`~800/50`, `mjc:damping=1.0`); tier wrist `forceRange` smaller (M6 `±18`, CR5 `±20`); raise `mjc:armature` (0.05–0.1) before raising `kp` |
+| Distal joints soft / sag with EE | Arm link `gravcomp` only; welded gripper has no body `gravcomp` | `mjc:gravcomp=1` on EE `gripper_base` in gripper `mujoco.usda` (fingers stay off by default) |
+| Whole arm unstable with gripper | Gripper `mujoco` deleted DriveAPI but left residual `drive:*` (e.g. AG2F90 `stiffness=10`) fighting MjcActuator | Same strip as AG2F120S / arm: `drive:* = None` on actuated gripper joints |
+| Blind `kp` raise still unstable | Saturation oscillation: error × `kp` hits `forceRange` every step on low-I wrist | Cap distal `forceRange`; add armature; do not “fix soft with 60000” |
 | Side payload fails / EE missing | Duplicate `def`+`over` same name in one layer | Merge into single `def` |
 | Gripper UI option gone | Gripper only inside Side payload, not root | Register `Gripper`/`EE` on root |
 | Actuator unresolved target | All-Side actuators in shared `mujoco.usda` | Default-only in mujoco; side acts in Side; disable the other set |
 | Seamless Side break | Different EE prim names per Side | Unify path under tip/tcp; switch via EE Side |
 | Child Physics won’t flip | Parent sticky / authoring-layer Physics opinion | Remove overlay; let VariantSwitcher write session; push from parent Physics payload |
 | Gripper “not on tcp” | Root-sibling mount | Nest under tip/tcp; fix rels + relative xform |
-| G-comp no effect | Only `actuatorgravcomp` without body `gravcomp` | Set both |
+| G-comp no effect | Only `actuatorgravcomp` without body `gravcomp` | Set both on the **same** bodies/joints that should be compensated |
 | Composition cycle | `physics.usda` subLayers robot root | Remove that subLayer |
 | Left/right flange identical | Copied default flange into all mounts | Restore Side-specific orient/`localRot*` |
 | Nested `CreateJoint - no bodies` | Child Physics unset; mount correctly unsticky | Parent `Physics/*.usda` overs child Physics |
@@ -267,5 +274,5 @@ Note: without Isaac schema plugins loaded, `GetAppliedSchemas()` may omit `MjcJo
 
 ## Extra detail
 
-- Mount/actuator templates, A1 flange notes, R1/W2/Cobot Magic chassis: [reference.md](reference.md)
+- Mount/actuator templates, A1 flange notes, R1/W2/Cobot Magic chassis, **Newton arm PD / CR5+AG2F90 stability**: [reference.md](reference.md)
 - Nested chassis ROS / illegal USDA `delete …connect`: companion `USDA-OCS2-PhysX-Mujoco` [reference.md](../USDA-OCS2-PhysX-Mujoco/reference.md)

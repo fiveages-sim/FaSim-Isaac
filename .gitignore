@@ -38,7 +38,6 @@ isaac_jazzy_ws/
 # 本机覆盖配置（参考 fa_w2_ws 的 robot.local.yaml）
 config/fa_sim.local.conf
 
-# ArtVIP 原版下载与 Newton 转换结果（不入库）
+# ArtVIP 原版下载（不入库）。场景组件在 environment/artvip-usd。
 environment/ArtVIP/
-environment/ArtVIP-fasim/
 
