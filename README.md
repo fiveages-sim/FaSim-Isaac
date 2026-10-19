@@ -106,3 +106,7 @@ python tools/artvip_kitchen.py download              # environment/ArtVIP/
 未设置 `HF_ENDPOINT` 或 `--endpoint` 时，下载走 `https://hf-mirror.com`。厨房里的开关门、灯光和物理调整写在 artvip-usd 的 object USDA 里，见 `environment/artvip-usd/README.md`。机器人场景文件只保留摆放、物理变体和 GPU 配对缓冲。
 
 ---
+
+## License
+
+This package is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
