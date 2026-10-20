@@ -31,16 +31,33 @@ cd FaSim-Isaac
 
 脚本会自动完成子模块初始化、分支切换并更新到最新提交。
 
-#### 操作 2：加载 ArtVIP 场景
+#### 操作 2：更新子模块
+
+不进入勾选菜单。已检出的子模块（含以前勾过的 private）会更新；尚未初始化的 public 会补拉；尚未初始化的 private 跳过。嵌套 public 会带上其顶层父模块。
+
+默认保留当前分支，避免调试分支被切走。当前是 detached HEAD 时，改用 `.gitmodules` 的 `branch`（缺省 `main`）。本地改动会先暂存，落后远程时用 merge，冲突会列出文件。
+
+```bash
+./init.sh --update                      # 或 -u，保留当前分支
+./init.sh --update --default-branch     # 或再加 -d，切换到 .gitmodules 分支
+```
+
+交互菜单第 2 项会再问一次是否切换到默认分支。主仓库本身不会 `git pull`。
+
+#### 操作 3：加载 ArtVIP 场景
 
 用 Isaac 自带的 Python 运行 `tools/artvip_kitchen.py download`，把官方数据下到 `environment/ArtVIP/`。场景组件在 `environment/artvip-usd`，不再转换出 `ArtVIP-fasim`。
 
-#### 操作 3：配置环境
+#### 操作 4：配置 Isaac ROS2 Jazzy Workspace
 
-- **Isaac ROS2 Jazzy Workspace**：可选 Isaac Sim 版本（菜单会查询 GitHub 最新 3 个稳定 tag，失败则回退 `config/fa_sim.conf`），下载对应 ROS workspaces，提取 `jazzy_ws` 到 `isaac_jazzy_ws/`，安装 rosdep / colcon 依赖，构建工作空间并写入 `~/.bashrc`。也可通过环境变量指定：`ISAAC_SIM_VERSION=6.0.1 ./init.sh`
-- **安装舵轮控制节点并启用脚本静默**（选项 4）：只改本机 Isaac 安装目录（默认 `${HOME}/isaacsim`，可用 `ISAACSIM_DIR` 覆盖），不拉子模块、不构建 ROS 工作空间。重装 Isaac 后需要再选一次。正在运行的 Isaac 要重启后才生效。
-  - **舵轮控制节点**：把 `exts/fasim.steering.nodes` 链到 `extsUser/`，并在 `isaacsim.exp.full.kit` 与 Newton kit 中启用。Linkhou S2_V1 和 Taku 底盘的舵轮控制因此走普通 OmniGraph 节点 `fasim.steering.nodes.SwerveController`，打开场景时不会因为 ScriptNode 把全部 Action Graph 关掉。
-  - **脚本静默**：写入 `opt_in = true` 与 `ignoreWarningDialog = true`。前者默认授权仍留在资产里的 ScriptNode，后者跳过 ArtVIP 行为脚本的安全弹窗。
+可选 Isaac Sim 版本（菜单会查询 GitHub 最新 3 个稳定 tag，失败则回退 `config/fa_sim.conf`），下载对应 ROS workspaces，提取 `jazzy_ws` 到 `isaac_jazzy_ws/`，安装 rosdep / colcon 依赖，构建工作空间并写入 `~/.bashrc`。也可通过环境变量指定：`ISAAC_SIM_VERSION=6.0.1 ./init.sh`
+
+#### 操作 5：安装舵轮控制节点并启用脚本静默
+
+只改本机 Isaac 安装目录（默认 `${HOME}/isaacsim`，可用 `ISAACSIM_DIR` 覆盖），不拉子模块、不构建 ROS 工作空间。重装 Isaac 后需要再选一次。正在运行的 Isaac 要重启后才生效。
+
+- **舵轮控制节点**：把 `exts/fasim.steering.nodes` 链到 `extsUser/`，并在 `isaacsim.exp.full.kit` 与 Newton kit 中启用。Linkhou S2_V1 和 Taku 底盘的舵轮控制因此走普通 OmniGraph 节点 `fasim.steering.nodes.SwerveController`，打开场景时不会因为 ScriptNode 把全部 Action Graph 关掉。
+- **脚本静默**：写入 `opt_in = true` 与 `ignoreWarningDialog = true`。前者默认授权仍留在资产里的 ScriptNode，后者跳过 ArtVIP 行为脚本的安全弹窗。
 
 ### 3. 启动 Isaac Sim
 
@@ -74,7 +91,7 @@ cp config/fa_sim.local.template.conf config/fa_sim.local.conf
 
 ```
 FaSim-Isaac/
-├── init.sh                       # 一键初始化；选项 2 下载官方 ArtVIP，选项 4 安装舵轮控制节点
+├── init.sh                       # 一键初始化；选项 2 / --update 更新子模块，选项 3 下载官方 ArtVIP，选项 5 安装舵轮控制节点
 ├── run.sh                        # Isaac Sim 启动脚本
 ├── exts/fasim.steering.nodes/    # 舵轮控制 OmniGraph 节点
 ├── tools/artvip_kitchen.py       # 下载官方 ArtVIP
@@ -88,7 +105,7 @@ FaSim-Isaac/
 │   ├── fa-project-usd/           # Fa Project USD 资产（Git 子模块，private）
 │   ├── ArtVIP/                   # 原版下载（gitignore）
 │   └── artvip-usd/               # 场景组件（payload 官方 ArtVIP）
-└── isaac_jazzy_ws/               # ROS2 Jazzy 工作空间（由 init.sh 操作 2 生成）
+└── isaac_jazzy_ws/               # ROS2 Jazzy 工作空间（由 init.sh 操作 4 生成）
 ```
 
 `robots` 内按类型分子目录：人形（humanoid）、机械臂（manipulators）、夹爪（grippers）、灵巧手（dexhands）、传感器（sensors）、支架（stands）等；`environment` 下为场景与项目相关 USD。具体机型与文件名可直接在对应目录中查看。
@@ -97,7 +114,7 @@ FaSim-Isaac/
 
 ## ArtVIP 场景
 
-原版数据不入库。`./init.sh` 选 **2** 只下载官方数据。场景组件在 `environment/artvip-usd`，机器人 `env/artvip` 直接 payload `scenes/*.usda`。
+原版数据不入库。`./init.sh` 选 **3** 只下载官方数据。场景组件在 `environment/artvip-usd`，机器人 `env/artvip` 直接 payload `scenes/*.usda`。
 
 ```bash
 python tools/artvip_kitchen.py download              # environment/ArtVIP/

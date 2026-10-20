@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # FaSim-Isaac 快速部署仓库初始化脚本
-# 功能：自动初始化子模块并切换到 main 分支最新提交
+# 功能：初始化子模块，或一键更新已有子模块（默认保留当前分支）
 
 set -u  # 遇到未定义变量时退出
 
@@ -22,6 +22,51 @@ print_warn() {
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
+
+print_usage() {
+    echo "用法: $0 [选项]"
+    echo ""
+    echo "选项:"
+    echo "  --update, -u              更新已初始化子模块，并补上尚未拉取的 public 子模块"
+    echo "                            默认保留当前分支；detached HEAD 时使用 .gitmodules 分支"
+    echo "  --default-branch, -d      与 --update 合用：切换到 .gitmodules 指定分支后更新"
+    echo "  --help, -h                显示此帮助"
+    echo ""
+    echo "不带参数时进入交互菜单。菜单第 2 项为更新。"
+}
+
+UPDATE_MODE=false
+KEEP_BRANCH=true
+SKIP_MENU=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --update|-u)
+            UPDATE_MODE=true
+            SKIP_MENU=true
+            shift
+            ;;
+        --default-branch|-d)
+            KEEP_BRANCH=false
+            shift
+            ;;
+        --help|-h)
+            print_usage
+            exit 0
+            ;;
+        *)
+            print_error "未知参数: $1"
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$KEEP_BRANCH" = false ] && [ "$UPDATE_MODE" != true ]; then
+    print_error "--default-branch 需要与 --update 一起使用"
+    print_usage
+    exit 1
+fi
 
 # 与 fa_w2_ws/release.sh download_file 一致：curl 默认进度条；wget 强制 bar
 download_file() {
@@ -324,28 +369,373 @@ pick_submodules() {
     done
 }
 
+
+is_git_worktree() {
+    local dir="$1"
+    local abs toplevel
+    [ -d "$dir" ] || return 1
+    abs=$(cd "$dir" && pwd -P) || return 1
+    toplevel=$(git -C "$abs" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [ "$abs" = "$toplevel" ]
+}
+
+gitmodules_branch() {
+    local gitmodules="$1"
+    local path="$2"
+    local branch config_key
+    branch=$(git config --file "$gitmodules" --get "submodule.$path.branch" 2>/dev/null || true)
+    if [ -z "$branch" ]; then
+        config_key=$(git config --file "$gitmodules" --get-regexp 'submodule\..*\.path' 2>/dev/null \
+            | awk -v p="$path" '$2==p {k=$1; gsub(/^submodule\.|\.path$/,"",k); print k; exit}')
+        if [ -n "${config_key:-}" ]; then
+            branch=$(git config --file "$gitmodules" --get "submodule.${config_key}.branch" 2>/dev/null || true)
+        fi
+    fi
+    echo "${branch:-main}"
+}
+
+disable_robots_sparse_checkout() {
+    if [ -d "$REPO_DIR/robots" ] &&
+       (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1) &&
+       (cd "$REPO_DIR/robots" && git config --bool core.sparseCheckout 2>/dev/null | grep -qx true); then
+        print_info "检测到 robots 仍启用稀疏检出（旧模式遗留），正在关闭..."
+        (cd "$REPO_DIR/robots" && git sparse-checkout disable)
+        print_info "✓ robots 已恢复为完整工作区"
+    fi
+}
+
+stash_local_changes() {
+    if git diff-index --quiet HEAD -- 2>/dev/null; then
+        return 0
+    fi
+    print_warn "  检测到本地修改，先暂存..."
+    if ! git stash push -m "Auto-stash before update"; then
+        print_warn "  暂存失败，尝试重置..."
+    fi
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        print_warn "  暂存失败，重置本地修改..."
+        git reset --hard HEAD || true
+    fi
+}
+
+choose_target_branch() {
+    local default_branch="$1"
+    local keep_current_branch="$2"
+    local current
+    current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+    TARGET_BRANCH="$default_branch"
+    if [ "$keep_current_branch" = true ] && [ "$current" != "HEAD" ] && [ -n "$current" ]; then
+        TARGET_BRANCH="$current"
+        if [ "$current" != "$default_branch" ]; then
+            print_info "  保留当前分支: $current (默认: $default_branch)"
+        else
+            print_info "  保留当前分支: $current"
+        fi
+    elif [ "$keep_current_branch" = true ]; then
+        print_info "  当前处于 detached HEAD，使用默认分支: $default_branch"
+    else
+        print_info "  使用默认分支: $default_branch"
+    fi
+}
+
+checkout_target_branch() {
+    local branch_name="$1"
+    local current final_branch
+    current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+    if [ "$current" = "$branch_name" ]; then
+        print_info "  已在 $branch_name 分支"
+        return 0
+    fi
+    print_info "  从 $current 切换到 $branch_name 分支..."
+    if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+        git checkout "$branch_name" 2>/dev/null || git checkout -f "$branch_name" || return 1
+    else
+        git checkout -b "$branch_name" "origin/$branch_name" 2>/dev/null || git checkout "$branch_name" || return 1
+    fi
+    final_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+    [ "$final_branch" = "$branch_name" ]
+}
+
+update_checked_out_repo() {
+    local label="$1"
+    local default_branch="$2"
+    local keep_current_branch="$3"
+    local local_commit remote_commit conflicted file
+
+    print_info "处理子模块: $label"
+    stash_local_changes
+
+    print_info "  获取远程更新..."
+    git fetch origin || print_warn "  获取远程更新失败，继续..."
+
+    choose_target_branch "$default_branch" "$keep_current_branch"
+
+    if ! git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
+        print_warn "  远程分支 $TARGET_BRANCH 不存在，跳过 $label"
+        return 1
+    fi
+
+    if ! checkout_target_branch "$TARGET_BRANCH"; then
+        print_error "  无法切换到 $TARGET_BRANCH 分支"
+        return 1
+    fi
+
+    print_info "  更新到最新提交（使用 merge 方式）..."
+    git fetch origin "$TARGET_BRANCH" || print_warn "  获取远程更新失败"
+
+    local_commit=$(git rev-parse HEAD 2>/dev/null || true)
+    remote_commit=$(git rev-parse "origin/$TARGET_BRANCH" 2>/dev/null || true)
+    if [ -z "$remote_commit" ]; then
+        print_warn "  无法解析 origin/$TARGET_BRANCH"
+        return 1
+    fi
+    if [ "$local_commit" = "$remote_commit" ]; then
+        print_info "  已是最新提交，无需更新"
+        print_info "✓ $label 已在 $TARGET_BRANCH 分支"
+        return 0
+    fi
+
+    if git merge "origin/$TARGET_BRANCH" --no-edit; then
+        print_info "  ✓ 成功合并远程更新"
+    else
+        conflicted=$(git ls-files -u | awk '{print $4}' | sort -u)
+        if [ -n "$conflicted" ]; then
+            print_warn "  检测到合并冲突，需要手动解决"
+            print_warn "  冲突文件："
+            while IFS= read -r file; do
+                [ -n "$file" ] && print_warn "    - $file"
+            done <<< "$conflicted"
+            print_warn "  请进入 $label 目录手动解决冲突后运行："
+            print_warn "    git add <解决冲突的文件>"
+            print_warn "    git commit"
+        else
+            print_warn "  合并失败，但未检测到冲突"
+        fi
+        return 1
+    fi
+    print_info "✓ $label 已在 $TARGET_BRANCH 分支"
+    return 0
+}
+
+update_top_submodule() {
+    local submodule_path="$1"
+    local keep_current_branch="$2"
+    local default_branch rc
+
+    if ! is_git_worktree "$REPO_DIR/$submodule_path"; then
+        print_info "初始化子模块: $submodule_path"
+        git -C "$REPO_DIR" submodule sync -- "$submodule_path" || true
+        if ! git -C "$REPO_DIR" submodule update --init -- "$submodule_path"; then
+            print_error "初始化失败: $submodule_path"
+            return 1
+        fi
+    fi
+    if ! is_git_worktree "$REPO_DIR/$submodule_path"; then
+        print_error "子模块初始化后仍未检出: $submodule_path"
+        return 1
+    fi
+
+    default_branch=$(gitmodules_branch "$REPO_DIR/.gitmodules" "$submodule_path")
+    cd "$REPO_DIR/$submodule_path" || return 1
+    update_checked_out_repo "$submodule_path" "$default_branch" "$keep_current_branch"
+    rc=$?
+    cd "$REPO_DIR" || exit 1
+    return "$rc"
+}
+
+update_nested_submodule() {
+    local parent_dir="$1"
+    local relative_path="$2"
+    local keep_current_branch="$3"
+    local full_path="$REPO_DIR/$parent_dir/$relative_path"
+    local gitmodules="$REPO_DIR/$parent_dir/.gitmodules"
+    local default_branch label rc
+
+    if ! is_git_worktree "$REPO_DIR/$parent_dir"; then
+        print_warn "父模块未检出，跳过 $parent_dir/$relative_path"
+        return 1
+    fi
+    if [ ! -f "$gitmodules" ]; then
+        print_warn "未找到 $gitmodules，跳过 $parent_dir/$relative_path"
+        return 1
+    fi
+    if ! is_git_worktree "$full_path"; then
+        print_info "初始化嵌套子模块: $parent_dir/$relative_path"
+        if ! (
+            cd "$REPO_DIR/$parent_dir" &&
+            git submodule sync -- "$relative_path" &&
+            git submodule update --init -- "$relative_path"
+        ); then
+            print_error "初始化失败: $parent_dir/$relative_path"
+            return 1
+        fi
+    fi
+    if ! is_git_worktree "$full_path"; then
+        print_error "嵌套子模块初始化后仍未检出: $parent_dir/$relative_path"
+        return 1
+    fi
+
+    default_branch=$(gitmodules_branch "$gitmodules" "$relative_path")
+    label="$parent_dir/$relative_path"
+    cd "$full_path" || return 1
+    update_checked_out_repo "$label" "$default_branch" "$keep_current_branch"
+    rc=$?
+    cd "$REPO_DIR" || exit 1
+    return "$rc"
+}
+
+select_for_update() {
+    local i full
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_KIND[$i]}" = "top" ]; then
+            full="$REPO_DIR/${CATALOG_PATH[$i]}"
+        else
+            full="$REPO_DIR/${CATALOG_PARENT[$i]}/${CATALOG_PATH[$i]}"
+        fi
+        if is_git_worktree "$full" || [ "${CATALOG_VIS[$i]}" = "public" ]; then
+            CATALOG_SEL[$i]=1
+        else
+            CATALOG_SEL[$i]=0
+        fi
+    done
+    ensure_parents_selected
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            continue
+        fi
+        if [ "${CATALOG_KIND[$i]}" = "top" ]; then
+            full="$REPO_DIR/${CATALOG_PATH[$i]}"
+        else
+            full="$REPO_DIR/${CATALOG_PARENT[$i]}/${CATALOG_PATH[$i]}"
+        fi
+        if [ "${CATALOG_VIS[$i]}" = "private" ] && ! is_git_worktree "$full"; then
+            print_info "跳过未初始化的 private: $(catalog_label "$i")"
+        fi
+    done
+}
+
+prompt_keep_branch() {
+    local keep_choice
+    echo ""
+    echo "是否切换到默认分支？"
+    echo "  1) 否，保留当前分支只进行更新（默认）"
+    echo "  2) 是，切换到 .gitmodules 指定分支并更新"
+    echo ""
+    read -rp "输入选项 [1-2]（默认: 1）: " keep_choice
+    case ${keep_choice:-1} in
+        1) KEEP_BRANCH=true ;;
+        2) KEEP_BRANCH=false ;;
+        *)
+            print_warn "无效选项，使用默认行为（保留当前分支）"
+            KEEP_BRANCH=true
+            ;;
+    esac
+}
+
+run_submodule_update() {
+    local keep_current_branch="$1"
+    local i selected=0 processing_failed=false
+
+    if [ "$keep_current_branch" = true ]; then
+        print_info "更新模式：保留当前分支"
+    else
+        print_info "更新模式：切换到 .gitmodules 指定分支"
+    fi
+
+    VISIBILITY_CONF="$REPO_DIR/submodules_visibility.conf"
+    if [ ! -f "$VISIBILITY_CONF" ]; then
+        print_error "未找到配置文件: $VISIBILITY_CONF"
+        return 1
+    fi
+
+    load_visibility_conf
+    print_info "已从 $VISIBILITY_CONF 加载嵌套子模块配置（public: ${#NESTED_PUBLIC_SPECS[@]} 项, private: ${#NESTED_PRIVATE_SPECS[@]} 项）"
+    build_submodule_catalog
+    if [ "$CATALOG_N" -eq 0 ]; then
+        print_error "未找到任何子模块"
+        return 1
+    fi
+    select_for_update
+
+    print_info "将更新以下子模块："
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            print_info "  - [$(catalog_label "$i")] (${CATALOG_VIS[$i]})"
+            selected=$((selected + 1))
+        fi
+    done
+    if [ "$selected" -eq 0 ]; then
+        print_warn "没有需要更新的子模块"
+        return 0
+    fi
+
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_KIND[$i]}" = "top" ] && [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            if ! update_top_submodule "${CATALOG_PATH[$i]}" "$keep_current_branch"; then
+                processing_failed=true
+            fi
+        fi
+    done
+
+    disable_robots_sparse_checkout
+
+    for ((i = 0; i < CATALOG_N; i++)); do
+        if [ "${CATALOG_KIND[$i]}" = "nested" ] && [ "${CATALOG_SEL[$i]}" = "1" ]; then
+            if ! update_nested_submodule "${CATALOG_PARENT[$i]}" "${CATALOG_PATH[$i]}" "$keep_current_branch"; then
+                processing_failed=true
+            fi
+        fi
+    done
+
+    echo ""
+    print_info "当前子模块状态："
+    git -C "$REPO_DIR" submodule status || true
+    echo ""
+
+    if [ "$processing_failed" = true ]; then
+        print_error "部分子模块更新失败，请检查上方日志"
+        return 1
+    fi
+
+    print_info "=========================================="
+    print_info "子模块更新完成！"
+    print_info "=========================================="
+    if [ "$keep_current_branch" = true ]; then
+        print_info "子模块已在当前分支上更新到最新提交"
+    else
+        print_info "子模块已切换到默认分支并更新到最新提交"
+    fi
+    return 0
+}
+
 # 选择操作类型
+if [ "$SKIP_MENU" = false ]; then
 echo ""
 echo "请选择要执行的操作"
 echo
-echo "  [仓库初始化]"
+echo "  [仓库]"
 echo "    1) 初始化仓库（勾选要拉取的子模块，public 默认勾选）"
-echo "    2) 下载官方 ArtVIP（environment/ArtVIP，不转换场景）"
+echo "    2) 更新子模块到最新提交（默认保留当前分支）"
 echo
 echo "  [环境配置]"
-echo "    3) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
-echo "    4) 安装舵轮控制节点并启用脚本静默"
+echo "    3) 下载官方 ArtVIP（environment/ArtVIP，不转换场景）"
+echo "    4) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
+echo "    5) 安装舵轮控制节点并启用脚本静默"
 echo
 echo "  [其他]"
 echo "    q) 退出"
 echo
-read -rp "输入选项 [1-4/q]: " choice
+read -rp "输入选项 [1-5/q]: " choice
 
 case "$choice" in
     1|"") INIT_MODE="repo" ;;
-    2) INIT_MODE="artvip" ;;
-    3) INIT_MODE="ros2_jazzy" ;;
-    4) INIT_MODE="isaac_local" ;;
+    2)
+        INIT_MODE="update"
+        prompt_keep_branch
+        ;;
+    3) INIT_MODE="artvip" ;;
+    4) INIT_MODE="ros2_jazzy" ;;
+    5) INIT_MODE="isaac_local" ;;
     q|Q)
         echo "已退出。"
         exit 0
@@ -355,6 +745,9 @@ case "$choice" in
         exit 1
         ;;
 esac
+else
+    INIT_MODE="update"
+fi
 
 # 查询 GitHub 最新稳定 tag（IsaacSim-X.Y.Z，排除 -dev / -full 等）
 fetch_latest_isaac_sim_versions() {
@@ -493,13 +886,7 @@ else
 fi
 
 # 旧版 W2 稀疏检出可能仍开着，会挡住完整 robots 工作区（例如 Gen3）
-if [ -d "$REPO_DIR/robots" ] &&
-   (cd "$REPO_DIR/robots" && git rev-parse --git-dir >/dev/null 2>&1) &&
-   (cd "$REPO_DIR/robots" && git config --bool core.sparseCheckout 2>/dev/null | grep -qx true); then
-    print_info "检测到 robots 仍启用稀疏检出（旧模式遗留），正在关闭..."
-    (cd "$REPO_DIR/robots" && git sparse-checkout disable)
-    print_info "✓ robots 已恢复为完整工作区"
-fi
+disable_robots_sparse_checkout
 
 print_info "初始化选中的嵌套子模块（追加，不卸载已有项）..."
 for ((i = 0; i < CATALOG_N; i++)); do
@@ -614,9 +1001,16 @@ print_info "当前子模块状态："
 git submodule status
 echo ""
 print_info "如需更新子模块到最新提交，可以运行："
-print_info "  git submodule update --remote"
+print_info "  ./init.sh --update"
+print_info "  ./init.sh --update --default-branch"
 
 fi  # end of [ "$INIT_MODE" = "repo" ]
+
+if [ "$INIT_MODE" = "update" ]; then
+    if ! run_submodule_update "$KEEP_BRANCH"; then
+        exit 1
+    fi
+fi
 
 if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
@@ -980,8 +1374,13 @@ elif [ "$INIT_MODE" = "isaac_local" ]; then
 elif [ "$INIT_MODE" = "artvip" ]; then
     print_info "官方 ArtVIP 位于 environment/ArtVIP。"
     print_info "场景组件在 environment/artvip-usd，机器人 env/artvip 直接 payload 这些场景。"
+elif [ "$INIT_MODE" = "update" ]; then
+    print_info "也可以直接运行："
+    echo -e "  ${GREEN}./init.sh --update${NC}"
+    echo -e "  ${GREEN}./init.sh --update --default-branch${NC}"
 else
     print_info "仓库初始化完成，如需更新子模块到最新提交，可以运行："
-    echo -e "  ${GREEN}git submodule update --remote${NC}"
+    echo -e "  ${GREEN}./init.sh --update${NC}"
+    echo -e "  ${GREEN}./init.sh --update --default-branch${NC}"
 fi
 echo ""
