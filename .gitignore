@@ -38,6 +38,8 @@ isaac_jazzy_ws/
 # 本机覆盖配置（参考 fa_w2_ws 的 robot.local.yaml）
 config/fa_sim.local.conf
 
-# ArtVIP 原版下载（不入库）。场景组件在 environment/artvip-usd。
+# ArtVIP / LabUtopia 原版下载（不入库）。参照组件在各自 *-usd 目录。
 environment/ArtVIP/
+environment/artvip-usd/ArtVIP/
+environment/labutopia-usd/LabUtopia/
 

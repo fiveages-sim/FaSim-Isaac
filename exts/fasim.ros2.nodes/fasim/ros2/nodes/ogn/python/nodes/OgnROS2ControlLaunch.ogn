@@ -1,0 +1,85 @@
+{
+    "fasim.ros2.nodes.ROS2ControlLaunch": {
+        "version": 1,
+        "language": "python",
+        "scheduling": ["compute-on-request"],
+        "description": "Merges quick-start ros2_control YAML, starts Isaac's in-process ControllerManager, and activates the controllers for the selected mode.",
+        "uiName": "FaSim ROS2 Control Launch",
+        "inputs": {
+            "execIn": {
+                "type": "execution",
+                "description": "Playback tick. Setup runs once after Play."
+            },
+            "targetPrim": {
+                "type": "target",
+                "description": "A single ArticulationRootAPI prim, or a parent containing exactly one."
+            },
+            "robot": {
+                "type": "string",
+                "default": "",
+                "description": "Robot name without _description (e.g. cr5, zerith_h1)."
+            },
+            "type": {
+                "type": "string",
+                "default": "",
+                "description": "robot_common_launch type key. Empty: use Isaac EE / EE_Left / EE_Right variant names as-is (must match ROS keys: AG2F90-C, AG2F120S, gripper, revo1, …; none→no EE)."
+            },
+            "mode": {
+                "type": "token",
+                "default": "demo",
+                "description": "Which controllers to activate.",
+                "metadata": {
+                    "allowedTokens": ["demo", "split_body", "full_body"]
+                }
+            },
+            "profile": {
+                "type": "string",
+                "default": "",
+                "description": "Optional robot profile YAML path."
+            },
+            "namespace": {
+                "type": "string",
+                "default": "",
+                "description": "ROS 2 namespace for the ControllerManager. Empty = global /controller_manager (typical for a single robot). Set e.g. cr5 when multiple robots or a host CM already owns /controller_manager."
+            },
+            "enableGripper": {
+                "type": "bool",
+                "default": true,
+                "description": "Same as robot_common_launch enable_gripper. Used when type is set explicitly; if type is empty, any non-none EE / EE_Left / EE_Right enables hand/gripper detect."
+            },
+            "rosSetup": {
+                "type": "string",
+                "default": "",
+                "description": "Path to ros2_ws install/setup.bash. If empty, derived from AMENT_PREFIX_PATH (first non-/opt/ros install). Always sourced so Kit's PYTHONPATH cannot hide robot_common_launch."
+            },
+            "publishRobotDescription": {
+                "type": "bool",
+                "default": true,
+                "description": "Latch robot_common_launch xacro robot_description on /robot_description (or /<namespace>/robot_description). Same URDF source as the ROS quick-start stack; Isaac USD synth publish stays off."
+            },
+            "useSimTime": {
+                "type": "bool",
+                "default": true,
+                "description": "Set use_sim_time on the ControllerManager. Requires /clock from ROS2PublishClock."
+            },
+            "enableArmsTargetManager": {
+                "type": "bool",
+                "default": true,
+                "description": "After controllers activate, spawn arms_target_manager as a host OS process on wall clock (not Kit/sim thread; use_sim_time=false, nice=10). Stop tears it down with the CM. Same role as robot_common_launch enable_arms_target_manager."
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": "Fires once after ControllerManager setup and controller activation succeed."
+            }
+        },
+        "state": {
+            "configured": {
+                "type": "bool",
+                "default": false,
+                "description": "True after successful setup; Stop schedules setup again on the next compute."
+            }
+        }
+    }
+}

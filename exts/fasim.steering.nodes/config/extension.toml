@@ -19,6 +19,4 @@ name = "fasim.steering.nodes"
 include = ["*.ogn", "*.py"]
 exclude = ["Ogn*Database.py"]
 
-[python.pipapi]
-requirements = ["numpy"]
-use_online_index = true
+# Do NOT use [python.pipapi] numpy — online install can break Kit / pink pinocchio.

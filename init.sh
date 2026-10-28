@@ -720,7 +720,7 @@ echo
 echo "  [环境配置]"
 echo "    3) 下载官方 ArtVIP（environment/ArtVIP，不转换场景）"
 echo "    4) 配置 Isaac ROS2 Jazzy Workspace（下载 ROS workspaces、安装依赖并构建）"
-echo "    5) 安装舵轮控制节点并启用脚本静默"
+echo "    5) 安装 FaSim 扩展（舵轮 + ROS2 Control）并启用脚本静默"
 echo
 echo "  [其他]"
 echo "    q) 退出"
@@ -1223,9 +1223,12 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
 
 fi
 
-# 把仓库里的舵轮控制节点挂进本机 Isaac，使 Linkhou / Taku 底盘图不再使用 ScriptNode。
-install_fasim_steering_nodes() {
-    local ext_name="fasim.steering.nodes"
+# 把仓库 exts/<name> 链到本机 Isaac extsUser，并写入常用 kit 的 [dependencies]。
+# $1 = extension 目录名（如 fasim.steering.nodes）
+# $2 = 给人看的短名（日志用）
+install_fasim_kit_extension() {
+    local ext_name="$1"
+    local label="${2:-$1}"
     local src="${REPO_DIR}/exts/${ext_name}"
     local isaac_dir="${ISAACSIM_DIR:-${HOME}/isaacsim}"
     local exts_user="${isaac_dir}/extsUser"
@@ -1233,30 +1236,32 @@ install_fasim_steering_nodes() {
     local kit dep_line tmp
 
     if [ ! -f "${src}/config/extension.toml" ]; then
-        print_warn "找不到舵轮控制节点扩展: ${src}"
+        print_warn "找不到 ${label} 扩展: ${src}"
         return 0
     fi
     if [ ! -d "$isaac_dir" ]; then
-        print_warn "未找到 Isaac Sim（${isaac_dir}），跳过舵轮控制节点安装"
+        print_warn "未找到 Isaac Sim（${isaac_dir}），跳过 ${label} 安装"
         return 0
     fi
 
     mkdir -p "$exts_user"
     if [ -e "$link" ] && [ ! -L "$link" ]; then
-        print_warn "舵轮控制节点路径已存在且不是链接，跳过: ${link}"
+        print_warn "${label} 路径已存在且不是链接，跳过: ${link}"
     else
         ln -sfn "$src" "$link"
-        print_info "舵轮控制节点已安装: ${link}"
+        print_info "${label} 已安装: ${link}"
     fi
 
     dep_line="\"${ext_name}\" = {}"
     for kit in \
         "${isaac_dir}/apps/isaacsim.exp.full.kit" \
-        "${isaac_dir}/apps/isaacsim.exp.full.newton.kit"
+        "${isaac_dir}/apps/isaacsim.exp.full.newton.kit" \
+        "${isaac_dir}/apps/isaacsim.exp.full.streaming.kit" \
+        "${isaac_dir}/apps/isaacsim.exp.full.newton.streaming.kit"
     do
         [ -f "$kit" ] || continue
         if grep -qF "$dep_line" "$kit"; then
-            print_info "舵轮控制节点已启用: $(basename "$kit")"
+            print_info "${label} 已启用: $(basename "$kit")"
             continue
         fi
         if ! grep -q '^\[dependencies\]$' "$kit"; then
@@ -1274,8 +1279,76 @@ install_fasim_steering_nodes() {
             { print }
         ' "$kit" > "$tmp"
         mv "$tmp" "$kit"
-        print_info "已启用舵轮控制节点: $(basename "$kit")"
+        print_info "已启用 ${label}: $(basename "$kit")"
     done
+}
+
+# Linkhou / Taku 底盘舵轮 OmniGraph（替代 ScriptNode）。
+install_fasim_steering_nodes() {
+    install_fasim_kit_extension "fasim.steering.nodes" "舵轮控制节点"
+}
+
+# in-process ros2_control：ROS2ControlLaunch / emit_control（G1D / G1 / W2 …）。
+install_fasim_ros2_nodes() {
+    install_fasim_kit_extension "fasim.ros2.nodes" "ROS2 Control 节点"
+}
+
+# 让原版 ~/isaacsim/isaac-sim.sh 也能启动：默认剥掉 bashrc 的 /opt/ros
+#（否则 apt pinocchio/eigenpy 崩 pink）。./run.sh 另设 FASIM_FULL_HOST_ROS=1 保留完整 ROS。
+install_isaac_env_guard() {
+    local isaac_dir="${ISAACSIM_DIR:-${HOME}/isaacsim}"
+    local guard_src="${REPO_DIR}/tools/isaac_env_guard.sh"
+    local guard_dst="${isaac_dir}/fasim_isaac_env_guard.sh"
+    local setup="${isaac_dir}/setup_ros_env.sh"
+    local setup_template="${REPO_DIR}/tools/isaac_setup_ros_env.sh"
+    local bak
+
+    if [ ! -f "$guard_src" ]; then
+        print_warn "找不到环境隔离脚本: ${guard_src}"
+        return 0
+    fi
+    if [ ! -d "$isaac_dir" ]; then
+        print_warn "未找到 Isaac Sim（${isaac_dir}），跳过环境隔离安装"
+        return 0
+    fi
+
+    ln -sfn "$guard_src" "$guard_dst"
+    print_info "环境隔离脚本已链接: ${guard_dst}"
+
+    if [ ! -f "$setup" ]; then
+        print_warn "找不到 setup_ros_env.sh，跳过"
+        return 0
+    fi
+
+    # Prefer shipping a known-good setup_ros_env (always prepend Isaac ROS lib +
+    # source guard). Backup stock file once.
+    if [ -f "$setup_template" ]; then
+        if ! grep -qF 'fasim_isaac_env_guard.sh' "$setup"; then
+            bak="${setup}.bak.fasim"
+            if [ ! -f "$bak" ]; then
+                cp -a "$setup" "$bak"
+                print_info "已备份原版 setup_ros_env.sh → $(basename "$bak")"
+            fi
+            cp -a "$setup_template" "$setup"
+            print_info "已安装 FaSim setup_ros_env.sh（隔离 /opt/ros + Isaac ROS lib）"
+        else
+            # Refresh from template if already patched (keep bak)
+            cp -a "$setup_template" "$setup"
+            print_info "已更新 setup_ros_env.sh"
+        fi
+    elif ! grep -qF 'fasim_isaac_env_guard.sh' "$setup"; then
+        {
+            echo ""
+            echo "# FaSim: strip host /opt/ros (see fasim_isaac_env_guard.sh)"
+            echo "if [ -f \"\${SCRIPT_DIR}/fasim_isaac_env_guard.sh\" ]; then"
+            echo "    # shellcheck disable=SC1091"
+            echo "    source \"\${SCRIPT_DIR}/fasim_isaac_env_guard.sh\""
+            echo "fi"
+        } >>"$setup"
+        print_info "已在 setup_ros_env.sh 末尾注入环境隔离"
+    else
+        print_info "setup_ros_env.sh 已含环境隔离"
+    fi
 }
 
 # 本机启动时默认允许 ScriptNode，并跳过 ArtVIP 行为脚本弹窗。
@@ -1354,6 +1427,8 @@ load_artvip_scene() {
 
 if [ "$INIT_MODE" = "isaac_local" ]; then
     install_fasim_steering_nodes
+    install_fasim_ros2_nodes
+    install_isaac_env_guard
     install_isaac_script_silence
 elif [ "$INIT_MODE" = "artvip" ]; then
     load_artvip_scene
@@ -1369,8 +1444,8 @@ if [ "$INIT_MODE" = "ros2_jazzy" ]; then
     print_info "现在可以通过以下指令启动 Isaac Sim："
     echo -e "  ${GREEN}ros2 launch isaacsim run_isaacsim.launch.py${NC}"
 elif [ "$INIT_MODE" = "isaac_local" ]; then
-    print_info "舵轮控制节点与脚本静默已写入本机 Isaac Sim。"
-    print_info "正在运行的 Isaac 需要重启后才生效。"
+    print_info "FaSim 扩展（舵轮 + ROS2 Control）、/opt/ros 环境隔离与脚本静默已写入本机 Isaac。"
+    print_info "现在可直接用 ~/isaacsim/isaac-sim.sh；正在运行的实例需重启。"
 elif [ "$INIT_MODE" = "artvip" ]; then
     print_info "官方 ArtVIP 位于 environment/ArtVIP。"
     print_info "场景组件在 environment/artvip-usd，机器人 env/artvip 直接 payload 这些场景。"

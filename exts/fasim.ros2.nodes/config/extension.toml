@@ -1,0 +1,22 @@
+[package]
+version = "0.1.0"
+category = "Simulation"
+title = "FaSim ROS 2 Control Launch"
+description = "OmniGraph node that merges quick-start ros2_control YAML and brings up Isaac's in-process ControllerManager."
+authors = ["FiveAges"]
+keywords = ["isaac", "omnigraph", "ros2", "ros2_control"]
+
+[dependencies]
+"omni.graph" = {}
+"omni.graph.core" = {}
+"omni.graph.tools" = {}
+"omni.timeline" = {}
+"isaacsim.ros2.core" = {}
+"isaacsim.ros2.control" = {}
+
+[[python.module]]
+name = "fasim.ros2.nodes"
+
+[fswatcher.patterns]
+include = ["*.ogn", "*.py"]
+exclude = ["Ogn*Database.py"]
