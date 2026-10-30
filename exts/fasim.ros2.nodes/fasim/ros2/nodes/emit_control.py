@@ -69,6 +69,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("true", "false", "1", "0", "yes", "no"),
         help="Emit merged params YAML for arms_target_manager_node (VR / marker teleop).",
     )
+    parser.add_argument(
+        "--arms",
+        default="",
+        help="robot_common_launch arms xacro key (e.g. piper, h, l, x). Empty: xacro default.",
+    )
     return parser.parse_args(argv)
 
 
@@ -309,6 +314,7 @@ def emit(args: argparse.Namespace) -> dict:
     enable_body = _as_bool(args.enable_body)
     hardware = "isaac"
 
+    arms = (getattr(args, "arms", None) or "").strip()
     launch_configurations: dict[str, str] = {
         "robot": robot_name,
         "type": robot_type,
@@ -318,6 +324,8 @@ def emit(args: argparse.Namespace) -> dict:
         launch_configurations["left_type"] = left_type
     if right_type:
         launch_configurations["right_type"] = right_type
+    if arms:
+        launch_configurations["arms"] = arms
     if profile_path:
         launch_configurations["robot_profile"] = profile_path
 

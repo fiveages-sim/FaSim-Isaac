@@ -1,4 +1,4 @@
-#!/usr/bin/scene python3
+#!/usr/bin/env python3
 """Bake non-unit xformOp:scale into mesh points / child translates; set scale to 1."""
 
 from __future__ import annotations

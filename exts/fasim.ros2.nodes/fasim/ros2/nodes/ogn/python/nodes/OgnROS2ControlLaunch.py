@@ -47,11 +47,84 @@ def _read_variant_selection(prim_path: str, variant_set: str) -> str:
         return ""
 
 
+# 运控 keys that are not lowercase (CR5 ChangingTek / robotiq). Prefer authoring
+# these exact strings as USD EE variant names; do not fold them.
+_EE_TYPE_CASE_PRESERVE = frozenset(
+    {"AG2F90-C", "AG2F90-C-Soft", "AG2F120S", "robotiq85"}
+)
+
+
 def _ee_type_key(selection: str) -> str:
-    """Isaac EE variant name is the ROS type key; ``none``/empty → no EE."""
+    """Map Isaac EE variant selection → robot_common_launch ``type`` key.
+
+    Prefer writing the 运控 key in the USD variant (``xhand1``, ``revo2``,
+    ``AG2F90-C``). Until titles are renamed, fold other names to lowercase
+    (``Xhand1``→``xhand1``, ``LinkerHand_o7``→``linkerhand_o7``). CR5 keys in
+    ``_EE_TYPE_CASE_PRESERVE`` stay as authored. ``none``/empty → no EE.
+    """
     name = (selection or "").strip()
     if not name or name.lower() == "none":
         return ""
+    if name in _EE_TYPE_CASE_PRESERVE:
+        return name
+    return name.lower()
+
+
+def _variant_search_roots(prim_path: str) -> list[str]:
+    """ArtRoot path plus ancestors (W2: ``…/base_link`` → ``…/FiveAges_W2``)."""
+    path = (prim_path or "").rstrip("/")
+    roots: list[str] = []
+    seen: set[str] = set()
+    while path and path not in seen:
+        seen.add(path)
+        roots.append(path)
+        parent = path.rsplit("/", 1)[0]
+        if not parent or parent == path:
+            break
+        path = parent
+    return roots
+
+
+def _resolve_robot_name(prim_path: str, robot_input: str) -> str:
+    """Resolve emit ``--robot`` from the input or USD ``Robot`` variant.
+
+    Non-empty ``inputs:robot`` wins (G1D / CR5 hardcode). When empty, walk
+    ``prim_path`` and ancestors for a ``Robot`` variant whose name is the
+    description package stem (e.g. ``fiveages_w2`` → ``fiveages_w2_description``).
+    Legacy W2 selection ``robot`` maps to ``fiveages_w2``.
+    """
+    robot_input = (robot_input or "").strip()
+    if robot_input:
+        return robot_input
+
+    path = (prim_path or "").rstrip("/")
+    selection = ""
+    seen: set[str] = set()
+    while path and path not in seen:
+        seen.add(path)
+        selection = _read_variant_selection(path, "Robot")
+        if selection and selection.strip().lower() != "none":
+            break
+        parent = path.rsplit("/", 1)[0]
+        if not parent or parent == path:
+            break
+        path = parent
+
+    name = (selection or "").strip()
+    if not name or name.lower() == "none":
+        raise RuntimeError(
+            "ROS2ControlLaunch: inputs:robot is empty and USD Robot variant is "
+            f"missing/none under {prim_path!r} (and ancestors). Set inputs:robot "
+            "or Robot=fiveages_w2|fiveages_w2r|…"
+        )
+    # Legacy FiveAges_W2 IsaacRobotAPI-only selection.
+    if name == "robot":
+        name = "fiveages_w2"
+        carb.log_info(
+            "ROS2ControlLaunch: Robot=robot → fiveages_w2 (legacy alias)"
+        )
+    else:
+        carb.log_info(f"ROS2ControlLaunch: inputs:robot empty → Robot={name!r}")
     return name
 
 
@@ -60,20 +133,50 @@ def _resolve_ee_launch_types(
 ) -> tuple[str, str, str, bool]:
     """Read USD EE variants as robot_common_launch type / left_type / right_type.
 
-    Isaac variant names must match ROS keys (CR5: AG2F90-C / AG2F120S;
-    Zerith: gripper / revo1 / revo2). No remap table.
+    Sources (first hit wins per side), then ``_ee_type_key``:
+    - ``EE`` / ``EE_Left`` / ``EE_Right`` on ArtRoot and ancestors (G1 / CR5)
+    - ``EE`` on ``Left_Arm`` / ``Right_Arm`` (W2 / dual-arm composites)
 
     Returns (type, left_type, right_type, enable_gripper).
     """
     type_input = (type_input or "").strip()
-    ee = _ee_type_key(_read_variant_selection(prim_path, "EE"))
-    left = _ee_type_key(_read_variant_selection(prim_path, "EE_Left"))
-    right = _ee_type_key(_read_variant_selection(prim_path, "EE_Right"))
+    roots = _variant_search_roots(prim_path)
+
+    ee = ""
+    left = ""
+    right = ""
+    for root in roots:
+        if not ee:
+            ee = _ee_type_key(_read_variant_selection(root, "EE"))
+        if not left:
+            left = _ee_type_key(_read_variant_selection(root, "EE_Left"))
+        if not right:
+            right = _ee_type_key(_read_variant_selection(root, "EE_Right"))
+
+    # W2: EE lives on each arm payload, not EE_Left on the humanoid root.
+    _left_arm_names = ("Left_Arm", "left_arm", "Arm_Left")
+    _right_arm_names = ("Right_Arm", "right_arm", "Arm_Right")
+    if not left:
+        for root in roots:
+            for arm in _left_arm_names:
+                left = _ee_type_key(_read_variant_selection(f"{root}/{arm}", "EE"))
+                if left:
+                    break
+            if left:
+                break
+    if not right:
+        for root in roots:
+            for arm in _right_arm_names:
+                right = _ee_type_key(_read_variant_selection(f"{root}/{arm}", "EE"))
+                if right:
+                    break
+            if right:
+                break
 
     if type_input:
         carb.log_info(
             f"ROS2ControlLaunch: type={type_input!r} enableGripper={bool(enable_gripper_input)} "
-            f"(EE={ee!r}, EE_Left={left!r}, EE_Right={right!r})"
+            f"(EE={ee!r}, left={left!r}, right={right!r})"
         )
         return type_input, "", "", bool(enable_gripper_input)
 
@@ -82,19 +185,61 @@ def _resolve_ee_launch_types(
         carb.log_info(f"ROS2ControlLaunch: EE={ee!r} → type={ee!r} enableGripper=True")
         return ee, "", "", True
 
-    # Dual ``EE_Left`` / ``EE_Right`` → left_type / right_type (and type when symmetric).
+    # Dual sides → left_type / right_type (and type when symmetric).
+    # An empty side is an explicit none so xacro does not fall back to type
+    # (G1D's type default is dex3; W2's type default is empty).
     if left or right:
         enable = True
-        # Symmetric sides: also set type= so xacros that only declare ``type`` work.
+        if left and not right:
+            right = "none"
+        elif right and not left:
+            left = "none"
         robot_type = left if left and left == right else ""
         carb.log_info(
-            f"ROS2ControlLaunch: EE_Left={left!r} EE_Right={right!r} "
-            f"→ type={robot_type!r} left_type={left!r} right_type={right!r} "
-            f"enableGripper={enable}"
+            f"ROS2ControlLaunch: left_type={left!r} right_type={right!r} "
+            f"type={robot_type!r} enableGripper={enable}"
         )
         return robot_type, left, right, enable
 
     return "", "", "", False
+
+
+def _synth_joint_scope_path(stage, prim_path: str) -> str:
+    """USD export/HW joint scope for synth when ArtRoot ≠ joint parent (W2).
+
+    Isaac ``build_full_urdf`` walks ``Usd.PrimRange(targetPrim)`` for HW joints and
+    exports kinematics from that path. W2 keeps ``PhysicsArticulationRootAPI`` on
+    ``…/base_link`` (so ``createArticulationView`` / ``IsaacSimSystem`` stay there)
+    while ``body_joint*`` / arm / EE DOFs live as siblings under ``…/FiveAges_W2``.
+    Scoping synth at ``base_link`` alone yields an empty ``<ros2_control>`` block →
+    JSB ``No state interfaces found to publish``.
+
+    Never expand into a parent that already hosts another ArticulationRoot (dual G1D
+    under ``/World``: sibling joints on the other robot must not pull scope to World).
+    """
+    from pxr import Usd, UsdPhysics
+
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return prim_path
+    if not prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        return prim_path
+    parent = prim.GetParent()
+    if not parent or not parent.IsValid():
+        return prim_path
+    # Dual-robot stages: parent=/World contains G1D + G1D_01 ArtRoots.
+    for sibling in Usd.PrimRange(parent):
+        if sibling == prim:
+            continue
+        if sibling.HasAPI(UsdPhysics.ArticulationRootAPI):
+            return prim_path
+    art_prefix = str(prim.GetPath()).rstrip("/") + "/"
+    for jp in Usd.PrimRange(parent):
+        if not (jp.IsA(UsdPhysics.RevoluteJoint) or jp.IsA(UsdPhysics.PrismaticJoint)):
+            continue
+        if not str(jp.GetPath()).startswith(art_prefix):
+            return str(parent.GetPath())
+    return prim_path
 
 
 def _find_usd_joint_prim(stage, target_path: str, joint_name: str):
@@ -120,21 +265,48 @@ def _is_ee_joint_name(name: str) -> bool:
         or "finger" in name_l
         or name_l.endswith("_hand_joint")
         or name_l == "hand_joint"
-        # Revo / dexhand: left_hand_index_joint, right_hand_thumb_joint1, …
+        # Revo / Xhand / o7: left_hand_index_joint, right_hand_thumb_joint1, …
         or "_hand_" in name_l
+        # Dex3 unprefixed (legacy) or Side-prefixed: hand_index_0_joint /
+        # left_hand_index_0_joint
+        or name_l.startswith("hand_")
+        or name_l.startswith("left_hand_")
+        or name_l.startswith("right_hand_")
+    )
+
+
+def _usd_path_looks_like_ee_mount(path_s: str) -> bool:
+    """True for structural EE mount paths (not product/model name lists).
+
+    Arm DOFs live under ``…/joints/``; hand/gripper DOFs sit under
+    ``…/tcp/…`` / ``…/flange/…`` / ``…/EE/…`` after the Assembler weld.
+    """
+    path_l = (path_s or "").lower()
+    return any(
+        token in path_l
+        for token in (
+            "/tcp/",
+            "/flange/",
+            "/ee/",
+            "/ee_",
+            "/hand/",
+            "/gripper/",
+            "/dexhand/",
+        )
     )
 
 
 def _iter_usd_ee_joint_prims(stage, target_path: str):
     """Yield Revolute/Prismatic joint prims that look like EE gripper/hand DOFs.
 
-    Matches robot_common_launch hand/gripper detection: joints under an EE/Hand
-    mount, or named like ``*gripper*`` / ``*_hand_*``.
+    No per-product path whitelist. Uses:
+    - joint-name heuristics (``*_hand_*``, ``*gripper*``)
+    - structural mount paths (``/tcp/``, ``/flange/``, ``/ee/``, …)
+    - ``isaac:physics:robotJoints`` mount Xforms that pass the same structural test
 
-    Note: IsaacRobotAPI ``isaac:physics:robotJoints`` on wheeled humanoids lists
-    *every* articulation joint (wheels, body, arms). Only non-joint *mount*
-    targets from that rel (Revo2 / Gripper Xforms prepended by EE variants) are
-    treated as EE scopes — individual joint targets are ignored.
+    Note: wheeled-humanoid ``robotJoints`` also lists Chassis/Arms joints — those
+    joint targets are skipped; only non-joint mount Xforms under EE structure
+    become extra scan scopes.
     """
     from pxr import Usd, UsdPhysics
 
@@ -144,23 +316,6 @@ def _iter_usd_ee_joint_prims(stage, target_path: str):
 
     scopes = [target]
     ee_mount_roots: list[str] = []
-    # Only EE/hand mounts from isaac:physics:robotJoints. Wheeled humanoids also
-    # list Chassis/Lift/Body/Arms there — those must NOT become EE scan scopes
-    # (otherwise every arm/wheel joint is mis-tagged as a hand DOF).
-    _ee_mount_markers = (
-        "/EE/",
-        "/Hand/",
-        "/hand/",
-        "/DexHand/",
-        "/Dex1/",
-        "/Dex3/",
-        "/gripper/",
-        "/Gripper/",
-        "/Revo1/",
-        "/Revo2/",
-        "/RubberHand/",
-        "/Zerith_H1_Gripper/",
-    )
     try:
         rel = target.GetRelationship("isaac:physics:robotJoints")
         if rel:
@@ -168,13 +323,12 @@ def _iter_usd_ee_joint_prims(stage, target_path: str):
                 prim = stage.GetPrimAtPath(path)
                 if not prim or not prim.IsValid():
                     continue
-                # Full-body IsaacRobotAPI lists each joint; skip those.
                 if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
                     continue
                 if prim.IsA(UsdPhysics.Joint):
                     continue
                 path_s = str(prim.GetPath())
-                if not any(marker in path_s for marker in _ee_mount_markers):
+                if not _usd_path_looks_like_ee_mount(path_s):
                     continue
                 scopes.append(prim)
                 ee_mount_roots.append(path_s)
@@ -190,19 +344,7 @@ def _iter_usd_ee_joint_prims(stage, target_path: str):
             if path in seen:
                 continue
             name = prim.GetName()
-            under_ee = any(
-                token in path
-                for token in (
-                    "/EE/",
-                    "/Hand/",
-                    "/hand/",
-                    "/DexHand/",
-                    "/gripper/",
-                    "/Revo1/",
-                    "/Revo2/",
-                    "/Zerith_H1_Gripper/",
-                )
-            )
+            under_ee = _usd_path_looks_like_ee_mount(path)
             under_ee_mount = any(path.startswith(root) for root in ee_mount_roots)
             if under_ee or under_ee_mount or _is_ee_joint_name(name):
                 seen.add(path)
@@ -796,6 +938,7 @@ class OgnROS2ControlLaunchInternalState:
         self._description_publisher = RobotDescriptionPublisher()
         self._atm_proc: subprocess.Popen | None = None
         self._atm_params_path: str = ""
+        self._namespace: str = ""
         self._ros_setup: str = ""
 
     def ensure_timeline_subscription(self) -> None:
@@ -837,12 +980,18 @@ class OgnROS2ControlLaunchInternalState:
         except Exception as exc:
             carb.log_warn(f"ROS2ControlLaunch: ATM stop failed: {exc}")
 
-    def start_arms_target_manager(self, params_path: str) -> None:
+    def start_arms_target_manager(self, params_path: str, namespace: str = "") -> None:
         """Spawn ATM as a host OS process on wall clock (not a Kit/sim thread).
 
         Independent of Isaac ``use_sim_time`` / ``/clock`` so VR and markers do
         not ride the physics step. ``nice`` yields CPU to the sim; Stop still
         tears the process down with the ControllerManager.
+
+        When ``namespace`` is set, ATM joins ``/<ns>`` so relative topics
+        (``cmd_vel``, ``fsm_command``, gripper targets, ``tf``) align with the CM.
+        Isaac publishes TF on ``/<ns>/tf`` (OG ``nodeNamespace``). ATM/WBC use
+        relative ``tf``/``tf_static``; keep ``/tf:=tf`` remaps as belt-and-
+        suspenders for any leftover absolute listeners in the process.
         """
         self.stop_arms_target_manager()
         if not params_path or not os.path.isfile(params_path):
@@ -850,13 +999,37 @@ class OgnROS2ControlLaunchInternalState:
 
         env = os.environ.copy()
         setup = _resolve_ros_setup(self._ros_setup, env)
+        ns = (namespace or "").strip().strip("/")
+        node_name = f"arms_target_manager_{ns}" if ns else "arms_target_manager"
+        ros_args = [
+            "--ros-args",
+            "-r",
+            f"__node:={node_name}",
+        ]
+        if ns:
+            # Remaps keep any absolute-/tf leftovers on the namespaced tree.
+            ros_args.extend(
+                [
+                    "-r",
+                    f"__ns:=/{ns}",
+                    "-r",
+                    "/tf:=tf",
+                    "-r",
+                    "/tf_static:=tf_static",
+                ]
+            )
+        ros_args.extend(
+            [
+                "--params-file",
+                shlex.quote(params_path),
+                "-p",
+                "use_sim_time:=false",
+            ]
+        )
         # Host bash + sourced workspace: Kit PYTHONPATH must not shadow rclpy.
-        # Always wall-clock (override any params-file use_sim_time).
         inner = (
             "exec nice -n 10 ros2 run arms_target_manager arms_target_manager_node "
-            "--ros-args -r __node:=arms_target_manager "
-            f"--params-file {shlex.quote(params_path)} "
-            "-p use_sim_time:=false"
+            + " ".join(ros_args)
         )
         if setup:
             _prepare_host_ros_env(env)
@@ -873,7 +1046,8 @@ class OgnROS2ControlLaunchInternalState:
         )
         carb.log_info(
             f"ROS2ControlLaunch: arms_target_manager host pid={self._atm_proc.pid} "
-            f"(wall-clock, nice=10, not Kit thread) params={params_path}"
+            f"(wall-clock, nice=10, ns={ns or '(global)'}, node={node_name}) "
+            f"params={params_path}"
         )
 
     def _on_stop(self, _event) -> None:
@@ -971,6 +1145,7 @@ def _run_emit(
     left_type: str = "",
     right_type: str = "",
     enable_arms_target_manager: bool = True,
+    arms: str = "",
 ) -> dict:
     if not os.path.isfile(_EMIT_SCRIPT):
         raise RuntimeError(f"emit_control.py not found: {_EMIT_SCRIPT}")
@@ -992,6 +1167,8 @@ def _run_emit(
         right_type or "",
         "--enable-arms-target-manager",
         "true" if enable_arms_target_manager else "false",
+        "--arms",
+        arms or "",
     ]
     if profile:
         args.extend(["--profile", profile])
@@ -1096,7 +1273,9 @@ class OgnROS2ControlLaunch:
             # Controllers active — spawn ATM for VR / interactive markers.
             if state._atm_params_path:
                 try:
-                    state.start_arms_target_manager(state._atm_params_path)
+                    state.start_arms_target_manager(
+                        state._atm_params_path, namespace=state._namespace
+                    )
                 except Exception as exc:
                     carb.log_error(
                         f"ROS2ControlLaunch: arms_target_manager spawn failed: {exc}"
@@ -1127,13 +1306,14 @@ class OgnROS2ControlLaunch:
             state._failed = True
             return False
 
-        robot = str(db.inputs.robot or "").strip()
-        if not robot:
-            db.log_error("ROS2ControlLaunch: robot is required")
+        prim_path = str(target_prims[0])
+        try:
+            robot = _resolve_robot_name(prim_path, str(db.inputs.robot or ""))
+        except RuntimeError as exc:
+            db.log_error(str(exc))
             state._failed = True
             return False
 
-        prim_path = str(target_prims[0])
         try:
             ensure_isaac_ros2_library_path()
             update_rate = _isaac_physics_update_rate_hz()
@@ -1159,9 +1339,17 @@ class OgnROS2ControlLaunch:
             stage = omni.usd.get_context().get_stage()
             if stage is None:
                 raise RuntimeError("no active USD stage")
-            raw_synth = _urdf_synth.build_full_urdf(stage, prim_path)
+            # Keep setup/createArticulationView on ArtRoot (prim_path). Expand synth
+            # export scope to the robot Xform when DOFs are siblings (W2 base_link).
+            synth_scope = _synth_joint_scope_path(stage, prim_path)
+            if synth_scope != prim_path:
+                carb.log_info(
+                    f"ROS2ControlLaunch: synth joint scope {prim_path!r} → {synth_scope!r} "
+                    "(ArtRoot sibling DOFs)"
+                )
+            raw_synth = _urdf_synth.build_full_urdf(stage, synth_scope)
             fixed_synth, injected_joints, removed_joints = _fix_synth_urdf(
-                stage, prim_path, raw_synth
+                stage, synth_scope, raw_synth
             )
             try:
                 dump = f"/tmp/fasim_synth_urdf_{os.getpid()}.urdf"
@@ -1180,8 +1368,15 @@ class OgnROS2ControlLaunch:
                             hw_joints.add(name)
             except Exception:
                 pass
+            if not hw_joints:
+                raise RuntimeError(
+                    f"synth <ros2_control> has no joints under scope {synth_scope!r} "
+                    f"(ArtRoot {prim_path!r}). Nested ArticulationRootAPI still present? "
+                    "Mute child ArtRoots (Head/Torso/EE/arm root_joint); "
+                    "ensure Physics variant matches active engine (VariantSwitcher)."
+                )
 
-            usd_ee_names = [p.GetName() for p in _iter_usd_ee_joint_prims(stage, prim_path)]
+            usd_ee_names = [p.GetName() for p in _iter_usd_ee_joint_prims(stage, synth_scope)]
             hw_ee = [n for n in hw_joints if _is_ee_joint_name(n)]
             # Align with robot_common_launch: enable_gripper means "detect and
             # spawn hand/gripper controllers". Only fall back to arm-only when
@@ -1189,7 +1384,7 @@ class OgnROS2ControlLaunch:
             if enable_gripper and not hw_ee and not usd_ee_names:
                 carb.log_warn(
                     "ROS2ControlLaunch: enableGripper/EE requested but no USD EE joints "
-                    f"under {prim_path!r}; skipping hand/gripper controllers "
+                    f"under {synth_scope!r}; skipping hand/gripper controllers "
                     f"(hw={sorted(hw_joints)}, injected={injected_joints}, "
                     f"removed={removed_joints})"
                 )
@@ -1207,6 +1402,7 @@ class OgnROS2ControlLaunch:
                 )
 
             enable_atm = bool(getattr(db.inputs, "enableArmsTargetManager", True))
+            arms = str(getattr(db.inputs, "arms", "") or "").strip()
             state._ros_setup = str(db.inputs.rosSetup or "")
             payload = _run_emit(
                 robot=robot,
@@ -1220,12 +1416,14 @@ class OgnROS2ControlLaunch:
                 left_type=left_type,
                 right_type=right_type,
                 enable_arms_target_manager=enable_atm,
+                arms=arms,
             )
             yaml_path = payload["yaml_path"]
             activate = list(payload["activate"])
             hand_controllers = list(payload.get("hand_controllers") or [])
             atm_params = str(payload.get("arms_target_manager_params") or "")
             state._atm_params_path = atm_params if enable_atm else ""
+            state._namespace = namespace
             if hand_controllers:
                 carb.log_info(
                     "ROS2ControlLaunch: hand/gripper controllers (robot_common_launch detect): "
@@ -1253,17 +1451,28 @@ class OgnROS2ControlLaunch:
             _orig_synth = _urdf_synth.build_full_urdf
 
             def _build_fixed(stage_arg, target, sensor_overlay_urdf_path=None):
-                if str(target) == prim_path and sensor_overlay_urdf_path is None:
+                # Manager setup still passes ArtRoot prim_path; return scoped synth.
+                if str(target) in (prim_path, synth_scope) and sensor_overlay_urdf_path is None:
                     return fixed_synth
+                scope = _synth_joint_scope_path(stage_arg, str(target))
                 raw = _orig_synth(
-                    stage_arg, target, sensor_overlay_urdf_path=sensor_overlay_urdf_path
+                    stage_arg,
+                    scope,
+                    sensor_overlay_urdf_path=sensor_overlay_urdf_path,
                 )
-                fixed, _, _ = _fix_synth_urdf(stage_arg, str(target), raw)
+                fixed, _, _ = _fix_synth_urdf(stage_arg, scope, raw)
                 return fixed
 
             _cm_mod.build_full_urdf = _build_fixed
             _urdf_synth.build_full_urdf = _build_fixed
             try:
+                # Extension reload / ignored Stop-during-activate can leave a live
+                # CM while node state is fresh (_prim_path empty). Tear down any
+                # stale registration before setup so we never hit "already registered".
+                try:
+                    Ros2ControlManager.teardown(prim_path)
+                except Exception:
+                    pass
                 Ros2ControlManager.setup(
                     prim_path=prim_path,
                     controller_config=yaml_path,
@@ -1298,12 +1507,14 @@ class OgnROS2ControlLaunch:
             carb.log_error(f"ROS2ControlLaunch setup failed for {prim_path!r}: {exc}")
             state.stop_arms_target_manager()
             state._description_publisher.stop()
-            if state._prim_path:
+            # Always tear down the intended prim — setup may have failed before
+            # state._prim_path was assigned (e.g. already-registered after reload).
+            for path in {p for p in (prim_path, state._prim_path) if p}:
                 try:
-                    Ros2ControlManager.teardown(state._prim_path)
+                    Ros2ControlManager.teardown(path)
                 except Exception:
                     pass
-                state._prim_path = ""
+            state._prim_path = ""
             state._atm_params_path = ""
             state._failed = True
             return False

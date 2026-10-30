@@ -32,17 +32,37 @@ the **node + synth + ATM** playbook from G1/G1D bring-up.
 `createArticulationView(path)` / tensors match the prim that has
 `PhysicsArticulationRootAPI` **and** a successfully parsed PhysX articulation.
 
-| Pattern | ArtRoot on | Controllers target | When |
-|---------|------------|--------------------|------|
-| **W2** | `/FiveAges_W2/base_link` | same | `base_link` hosts native body joints |
-| **G1D composite** | `/G1D` (robot Xform) | `/G1D` | Stub hub `/G1D/base_link` is Assembler-only — ArtRoot there → `Pattern did not match any articulations` |
+| Pattern | ArtRoot on | `targetPrim` / CM | Synth joint scope | When |
+|---------|------------|------------------|-------------------|------|
+| **W2** | `/FiveAges_W2/base_link` | same (createArticulationView) | node expands to `/FiveAges_W2` | DOFs under sibling `joints/` + arms; nested Head/Torso/EE ArtRoot must be deleted |
+| **G1D composite** | `/G1D` (robot Xform) | `/G1D` | same | Stub hub `/G1D/base_link` is Assembler-only — ArtRoot there → `Pattern did not match` |
+
+### W2 / W2R: `Robot` variant == description stem
+
+Same USD asset [`FiveAges/Gen2/W2`](robots/humanoid/FiveAges/Gen2/W2/). Product SKU is the
+`Robot` variant name (Galaxea-style arm pin + emit robot, **no remap table**):
+
+| `Robot=` | Arms pinned | emit `--robot` | Env |
+|----------|-------------|----------------|-----|
+| `fiveages_w2` | `M6_CCS` | `fiveages_w2` | `env/fiveages.usda`, `env/xhand1.usda` (EE=Xhand1) |
+| `fiveages_w2r` | `AR5_CCS_V2` | `fiveages_w2r` | `env/fiveages_w2r.usda` |
+| `robot` (legacy) | same as w2 | node aliases → `fiveages_w2` | — |
+| `none` | (manual Arm_*) | error if `inputs:robot` empty | — |
+
+`ROS=fiveages` → [`payloads/ROS/fiveages.usda`](robots/humanoid/FiveAges/Gen2/W2/payloads/ROS/fiveages.usda):
+CM + `/clock`; **no** body JointState topic bridge; pushes `Linkhou_S2` `ROS=enable`
+for chassis cmd_vel/odom. `inputs:robot=""` → node walks ArtRoot ancestors for
+`Robot` (ArtRoot is `base_link`, variant lives on `/FiveAges_W2`).
 
 Rules:
 
 - Sole **active** ArtRoot on the whole robot; strip Chassis/Lift/Body/Arms importer roots.
   EE uses §2.1 (`root_joint active=false`), not `delete` ArtRoot on the gripper base.
 - Floating hub (`/G1D/base_link`): `RigidBody` + real mass/inertia (tiny mass rattles); **not** ArtRoot on G1D-style composites.
-- Env: pin `Physics=physx` so VariantSwitcher cannot flip to mujoco before CM configure.
+- Physics backend ↔ `Physics` variant；`ROS=fiveages` / OCS2 正交。`IsaacSimSystem` = **PhysX + Newton**。
+  - **Asset root** may default `Physics=physx`（G1D：空选择 → 无 ArtRoot → Assembler 双臂散架）。
+  - **Mount / env 禁止 sticky `Physics=`**；子件由父 `payloads/Physics/{physx,mujoco}.usda` push。
+  - Newton：改选 `Physics=mujoco`（或清掉根默认后靠 VariantSwitcher）；卡住则 Reload Stage。勿用 env pin 绑死。
 - Do **not** change EE variants while Playing — deleted finger prims invalidate tensors.
 
 ## 2. AssemblerFixedJoint must match authored TF
@@ -187,28 +207,71 @@ split_body / demo: use arm `task.info`; markers often stay on footprint/base_lin
 
 ```
 - [ ] targetPrim = ArtRoot prim (G1D: /World/G1D; W2: /World/FiveAges_W2/base_link)
-- [ ] mode = full_body | split_body | demo; robot = unitree_g1d / unitree_g1 / …
-- [ ] enableArmsTargetManager; type empty → EE variant names map to ROS keys
-- [ ] Physics=physx pinned; ROS=fiveages; /clock present if useSimTime
+- [ ] mode = full_body | split_body | demo
+- [ ] robot = unitree_g1d / … OR empty + Robot=fiveages_w2|fiveages_w2r (name == package stem)
+- [ ] enableArmsTargetManager; type empty → EE / EE_Left|Right / Left_Arm|Right_Arm EE → 运控 key (PascalCase→lower except CR5 AG2F*)
+- [ ] Physics=physx pinned; ROS=fiveages; PhysX-only PhysicsScene; /clock if useSimTime
+- [ ] W2 Xhand/Dex EE: mount deletes nested ArtRoot schemas (not only `active=false`)
+- [ ] W2: Linkhou child ROS=enable for DiffDrive; no body JointState↔ArticulationController bridge
 - [ ] target_manager.yaml present for that description package (src + install)
 - [ ] Chassis/EE Assembler localPos matches USD TF; EE body0 is RigidBody
 - [ ] After Play: no “link not unique”, no tensors invalidated, ATM logs correct frames
+```
+
+### Multi-robot namespace (dual G1D / …)
+
+Same string on **all** of: `ROS2ControlLaunch.inputs:namespace`, DiffDrive/odom TF
+`nodeNamespace`, ATM `__ns` (node auto-spawns with `__ns:=/<ns>`).
+
+| Rule | Detail |
+|------|--------|
+| Business topics | Relative only — never leading `/`. Robot-level: `fsm_command`/`cmd_vel`/`robot_description`. Controller-private: keep name → `controller_name + "/waist_*"` / `"/target_command"` (→ `/<ns>/<ctrl>/…`) |
+| Global OK | `/clock`, `/parameter_events`, `/diagnostics`; VR headset `/teleop/*` may stay global |
+| TF | Per-robot `/<ns>/tf` (+ static). Do **not** merge fleets onto one `/tf`. Frame names may stay `base_link` |
+| `world→odom` | **Play-first latch** of chassis world pose (`LatchWorld2Odom`). Spawn G1D at **z=0**. Not every-frame current base. **Must re-latch on Stop→Play** via simTime rewind / frame drop / (`odom≈0` + hub jumped >10cm); settle ~5 ticks. ScriptNode `setup()` does not re-run — without this, TF sticks after moving ArtRoot while Stopped. Reload ROS payload after editing |
+| `odom→*` | `IsaacComputeOdometry` **relative** displacement from Play (`/odom` + `odom→base_footprint`) |
+| WBC `tf_topic` | Must be relative `tf` (→ `/<ns>/tf`), **not** absolute `/tf`. Otherwise activate probe misses Isaac TF and disables unlocked-base planning |
+| Chassis topics | Payload `topicName` = relative `cmd_vel` / `odom` (+ `nodeNamespace`) |
+| ATM | Node `arms_target_manager_<ns>` under `/<ns>`; spawn also remaps `/tf:=tf` and `/tf_static:=tf_static` (TransformListener ignores `__ns` for absolute `/tf`) |
+| RViz / tf2 CLI | Default listens `/tf`. Use `ros2 run tf2_ros tf2_echo world base_link --ros-args -r /tf:=/g1d/tf -r /tf_static:=/g1d/tf_static` (or RViz TF topic remaps). Empty `/tf` with ns enabled ≠ missing Isaac TF |
+| Helper nodes | Same short name under ns prefix: `/<ns>/fasim_robot_description`, `/<ns>/fasim_ros2_control_launch` |
+
+Dual room acceptance (`environment/.../G1D/dual/room.usda`, ATM off OK):
+
+```
+- [ ] CM / DiffDrive / odom TF nodeNamespace == ROS2ControlLaunch.namespace (`g1d`, `g1d_01`)
+- [ ] `/g1d/cmd_vel` and `/g1d_01/cmd_vel` both exist; root `/cmd_vel` gone (or only unrelated nodes)
+- [ ] `/g1d/odom` and `/g1d_01/odom`; `/g1d/tf` + `/g1d_01/tf` (no fleet merge on global `/tf`)
+- [ ] Play: `tf2_echo world base_link` on `/g1d/tf` ≈ stage G1D pose (not origin); `/g1d/odom` pose still ~0 and accumulates; `world→odom` stays latched
+- [ ] `/g1d` vs `/g1d_01` have distinct `world→odom` (different spawn); Stop→Play relatch
+- [ ] No global `/fsm_command` `/fsm_state` `/ocs2_wbc_controller/*` `/*_gripper_*` business leaks
+- [ ] Controllers under `/g1d/...` and `/g1d_01/...` (relative/`~/` expanded)
+- [ ] Single-robot `namespace=""` still uses root paths (`/cmd_vel`, `/fsm_command`, …)
 ```
 
 ## 6. Common errors → fix
 
 | Log / symptom | Fix |
 |---------------|-----|
-| `Pattern '…/base_link' did not match any articulations` | ArtRoot on robot Xform (composite); retarget controllers |
+| `Pattern '…/base_link' did not match any articulations` | (1) `Physics` 变体与当前引擎不一致（Switcher 未切到 / sticky 挡住）— 勿 env pin，清 mount sticky，Reload。 (2) Nested EE ArtRoot: mount `active=false` + `delete apiSchemas`。 (3) Composite ArtRoot 在 robot Xform — retarget `targetPrim` |
+| JSB `No state interfaces found to publish` | Synth HW empty: W2 ArtRoot=`base_link` but DOFs are siblings — node must expand synth scope to robot Xform; also mute nested ArtRoots so `discover_articulations` sees exactly one root |
+| `'/World' contains N ArticulationRootAPI` (dual robot) | Synth scope must not expand ArtRoot→World when siblings are other robots; each CM `targetPrim` stays on its robot ArtRoot |
 | `disjointed body transforms` / whole robot snaps | Fix Assembler `localPos0` to match link offset |
-| MimicJoint / nested ArtRoot / Dex1 | ArtRoot on `root_joint`; mount `active=false`; weld to wrist RB |
+| MimicJoint / nested ArtRoot / Dex1 | ArtRoot on `root_joint`; mount `active=false` + `delete apiSchemas`; weld to tcp/wrist |
+| Dual G1D arms scatter (Dex3) | (1) Dex3 `Side=right` must not re-payload Hand/right Physics (double ArtRoot). (2) Mount: `root_joint` active=false + delete ArtRoot on palm. (3) Place `G1D_01` — missing TF → origin depenetration kills both arts |
+| JSB `left_gripper_joint/position` not available (Dex3) | `dex3` must be in `eef_control_registry` as **hand** (unitree_dex `dex3.side.yaml`). Unregistered → gripper template → JSB claims `left_gripper_joint` while Isaac HW has `left_hand_*` |
+| Dual EE type keys | G1D `EE_Left`/`EE_Right` → emit `left_type`/`right_type`; `dex1`=gripper, `dex3`=hand |
+| Global `/fsm_*` `/cmd_vel` `/ocs2_wbc_controller/*` with dual ns | Controllers/ATM used absolute `/…`; must be relative (controller-private keep `ctrl/…`). Rebuild arms packages; ATM spawn must pass `__ns` |
 | `link 'base_link' is not unique` | Need `_dedupe_urdf_duplicate_names` (reload node) |
 | ATM VR “weird” / no teleop | Add/fix `target_manager.yaml` frames; enable_vr |
 | Continuous track offset on mobile WBC | `control_base_frame`+`marker` must be `world`; vr_follow stays footprint |
 | tensors invalidated mid-run | Don’t flip EE/Physics variants on Play; fix snap first |
+| G1D 进场景后再选 Physics → 双臂掉落 | mount/env sticky Physics 与 session 打架 → Assembler `disjointed`。G1D 已去 sticky；子件由父 Physics payload push；换引擎卡住 Reload |
+| Newton 下 fiveages 异常 | `IsaacSimSystem` 支持 Newton；先确认 `Physics=mujoco` 与引擎一致、资产 mujoco 轨完整。勿用 env pin PhysX 绕过 |
 | `get_ros2_control_robot_description returned empty` (G1D / caster xacro) | Post-guard partial AMENT + stub `/opt/ros/.../component_models` shadows ros2_ws. `_prepare_host_ros_env` must clear AMENT/COLCON/CMAKE/PYTHONPATH before `source setup.bash` so overlay wins |
 | `dlopen … libtracetools.so: cannot open shared object file` / ocs2_wbc load fail | `./run.sh` must use `FASIM_FULL_HOST_ROS=1` (keep `/opt/ros` on LD) + exclude pink. Do **not** strip underlay LD. `ensure_isaac_ros2_library_path` keeps ws `lib/` before `/opt/ros` so apt `libocs2_*` cannot shadow |
 | apt `libocs2_*.so` shadows workspace (pinocchio SONAME mismatch) | Overlay-first LD; or remove apt ocs2 packages. Workspace sourced ⇒ its `install/*/lib` must precede `/opt/ros/*/lib` |
+| W2 `inputs:robot` empty + `Robot=none` | Set `Robot=fiveages_w2` or `fiveages_w2r`, or hardcode `inputs:robot` |
 
 ## Related
 

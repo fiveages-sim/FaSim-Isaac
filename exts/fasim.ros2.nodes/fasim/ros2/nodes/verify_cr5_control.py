@@ -1,4 +1,4 @@
-#!/usr/bin/scene python3
+#!/usr/bin/env python3
 """Headless smoke test: open CR5 scene/control.usda, Play, list active controllers."""
 
 from __future__ import annotations

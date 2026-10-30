@@ -17,12 +17,12 @@
             "robot": {
                 "type": "string",
                 "default": "",
-                "description": "Robot name without _description (e.g. cr5, zerith_h1)."
+                "description": "Robot name without _description (e.g. unitree_g1d, fiveages_w2). Empty: use USD Robot variant selection as-is (must match the description package stem; none is an error)."
             },
             "type": {
                 "type": "string",
                 "default": "",
-                "description": "robot_common_launch type key. Empty: use Isaac EE / EE_Left / EE_Right variant names as-is (must match ROS keys: AG2F90-C, AG2F120S, gripper, revo1, …; none→no EE)."
+                "description": "robot_common_launch type key. Empty: read EE / EE_Left / EE_Right (and Left_Arm|Right_Arm EE on W2); PascalCase without '-' folds to lowercase (Xhand1→xhand1); AG2F90-C kept; none→no EE."
             },
             "mode": {
                 "type": "token",
@@ -66,6 +66,11 @@
                 "type": "bool",
                 "default": true,
                 "description": "After controllers activate, spawn arms_target_manager as a host OS process on wall clock (not Kit/sim thread; use_sim_time=false, nice=10). Stop tears it down with the CM. Same role as robot_common_launch enable_arms_target_manager."
+            },
+            "arms": {
+                "type": "string",
+                "default": "",
+                "description": "robot_common_launch arms xacro key (e.g. piper, h, l, x). Empty: use robot xacro default arms."
             }
         },
         "outputs": {

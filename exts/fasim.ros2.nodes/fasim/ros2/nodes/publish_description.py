@@ -5,13 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 
-def _topic(namespace: str) -> str:
-    ns = (namespace or "").strip().strip("/")
-    return f"/{ns}/robot_description" if ns else "/robot_description"
+def _ns(namespace: str) -> str:
+    return (namespace or "").strip().strip("/")
 
 
 class RobotDescriptionPublisher:
-    """Keep a transient_local /robot_description publisher alive until stop()."""
+    """Keep a transient_local robot_description publisher alive until stop()."""
 
     def __init__(self) -> None:
         self._context: Any = None
@@ -32,17 +31,24 @@ class RobotDescriptionPublisher:
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
 
-        self._topic = _topic(namespace)
+        ns = _ns(namespace)
         self._context = rclpy.Context()
         rclpy.init(context=self._context, args=None)
-        self._node = rclpy.create_node("fasim_robot_description", context=self._context)
+        # Same short name; uniqueness via namespace prefix → /<ns>/fasim_robot_description
+        # Relative topic "robot_description" → /<ns>/robot_description (empty ns → /robot_description).
+        self._node = rclpy.create_node(
+            "fasim_robot_description",
+            context=self._context,
+            namespace=ns or "",
+        )
         qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self._publisher = self._node.create_publisher(String, self._topic, qos)
+        self._publisher = self._node.create_publisher(String, "robot_description", qos)
+        self._topic = self._publisher.topic_name
         msg = String()
         msg.data = urdf_xml
         self._publisher.publish(msg)

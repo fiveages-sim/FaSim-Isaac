@@ -1,4 +1,4 @@
-#!/usr/bin/scene python3
+#!/usr/bin/env python3
 """Diagnose CR5 in-process ros2_control setup without the OmniGraph node."""
 
 from __future__ import annotations

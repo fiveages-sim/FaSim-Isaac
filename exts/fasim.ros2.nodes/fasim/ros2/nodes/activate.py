@@ -8,8 +8,13 @@ from typing import Iterable
 import carb
 
 
+def _ns(namespace: str) -> str:
+    return (namespace or "").strip().strip("/")
+
+
 def _cm_name(namespace: str) -> str:
-    ns = (namespace or "").strip("/")
+    # Absolute service path under the robot namespace (same prefix model as topics).
+    ns = _ns(namespace)
     return f"/{ns}/controller_manager" if ns else "/controller_manager"
 
 
@@ -45,9 +50,15 @@ def activate_controllers(controllers: Iterable[str], namespace: str = "") -> Non
     if not names:
         raise RuntimeError("activate list is empty")
 
+    ns = _ns(namespace)
     context = rclpy.Context()
     rclpy.init(context=context, args=None)
-    node = rclpy.create_node("fasim_ros2_control_launch", context=context)
+    # Same short name; uniqueness via namespace → /<ns>/fasim_ros2_control_launch
+    node = rclpy.create_node(
+        "fasim_ros2_control_launch",
+        context=context,
+        namespace=ns or "",
+    )
     executor = SingleThreadedExecutor(context=context)
     executor.add_node(node)
     cm = _cm_name(namespace)
