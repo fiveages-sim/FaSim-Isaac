@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 import carb
 import omni.graph.core as og
@@ -935,11 +936,26 @@ class OgnROS2ControlLaunchInternalState:
         self._activate_thread: threading.Thread | None = None
         self._activate_error: str | None = None
         self._activate_done = False
+        self._activate_t0 = 0.0
         self._description_publisher = RobotDescriptionPublisher()
         self._atm_proc: subprocess.Popen | None = None
         self._atm_params_path: str = ""
         self._namespace: str = ""
         self._ros_setup: str = ""
+        # emit_control runs in a host subprocess. Several robots start theirs on
+        # the same playback tick; only communicate() waits, off the Kit thread.
+        self._emit_lock = threading.Lock()
+        self._emit_generation = 0
+        self._emit_thread: threading.Thread | None = None
+        self._emit_proc: subprocess.Popen | None = None
+        self._emit_error: str | None = None
+        self._emit_payload: dict | None = None
+        self._emit_stderr: str = ""
+        self._emit_done = False
+        self._emit_t0 = 0.0
+        self._emitted_with_gripper = False
+        self._force_disable_gripper = False
+        self._gripper_reemit_used = False
 
     def ensure_timeline_subscription(self) -> None:
         if self._timeline_sub is not None:
@@ -1056,6 +1072,9 @@ class OgnROS2ControlLaunchInternalState:
         if self._activate_thread is not None and not self._activate_done:
             carb.log_warn("ROS2ControlLaunch: ignoring Stop during activate")
             return
+        # Bump the generation before kill so a late communicate() cannot publish
+        # its payload into the next Play.
+        self.cancel_emit()
         self.stop_arms_target_manager()
         self._description_publisher.stop()
         if self._prim_path:
@@ -1067,12 +1086,106 @@ class OgnROS2ControlLaunchInternalState:
         self._activate_thread = None
         self._activate_error = None
         self._activate_done = False
+        self._activate_t0 = 0.0
         self._atm_params_path = ""
         self._needs_reconfigure = True
+
+    def launch_emit(self, cmd: list[str], env: dict) -> None:
+        """Fork emit_control and wait for it on a daemon thread.
+
+        ``Popen`` runs on the caller (Kit main thread) so Stop can signal the
+        process group even if the waiter has not been scheduled yet. The child
+        does the slow xacro work; this call returns as soon as the process exists.
+        """
+        with self._emit_lock:
+            generation = self._emit_generation
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+        worker = threading.Thread(
+            target=self._emit_worker,
+            args=(generation, proc),
+            name="fasim_ros2_emit",
+            daemon=True,
+        )
+        with self._emit_lock:
+            if generation != self._emit_generation:
+                _signal_process_group(proc)
+                raise RuntimeError("ROS2ControlLaunch: emit cancelled before start")
+            self._emit_proc = proc
+            self._emit_thread = worker
+            self._emit_done = False
+            self._emit_error = None
+            self._emit_payload = None
+            self._emit_stderr = ""
+            self._emit_t0 = time.monotonic()
+        worker.start()
+
+    def _emit_worker(self, generation: int, proc: subprocess.Popen) -> None:
+        stderr_text = ""
+        payload: dict | None = None
+        error: str | None = None
+        try:
+            stdout, stderr = proc.communicate()
+            stderr_text = stderr or ""
+            payload = _parse_emit_result(proc.returncode, stdout or "", stderr_text)
+        except Exception as exc:
+            error = str(exc)
+        with self._emit_lock:
+            if generation != self._emit_generation:
+                return
+            self._emit_stderr = stderr_text
+            self._emit_payload = payload
+            self._emit_error = error
+            self._emit_done = True
+
+    def cancel_emit(self) -> None:
+        """Stop an in-flight emit_control and drop any late result."""
+        with self._emit_lock:
+            self._emit_generation += 1
+            proc = self._emit_proc
+            thread = self._emit_thread
+        if proc is not None:
+            _signal_process_group(proc)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive() and proc is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                thread.join(timeout=1.0)
+                if thread.is_alive():
+                    carb.log_warn(
+                        "ROS2ControlLaunch: emit thread still running after SIGKILL"
+                    )
+        self._reset_emit_slot()
+        self._emitted_with_gripper = False
+        self._force_disable_gripper = False
+        self._gripper_reemit_used = False
+
+    def _reset_emit_slot(self) -> None:
+        """Forget the finished emit so a re-emit (or the next Play) can start."""
+        with self._emit_lock:
+            self._emit_thread = None
+            self._emit_proc = None
+            self._emit_done = False
+            self._emit_payload = None
+            self._emit_error = None
+            self._emit_stderr = ""
 
     def start_activate(self, controllers: list[str], namespace: str) -> None:
         self._activate_error = None
         self._activate_done = False
+        self._activate_t0 = time.monotonic()
 
         def _worker() -> None:
             try:
@@ -1132,7 +1245,47 @@ def _prepare_host_ros_env(env: dict) -> None:
         env.pop(key, None)
 
 
-def _run_emit(
+def _emit_cache_dir() -> str:
+    """Disk cache for emit_control. Empty string disables.
+
+    ``FASIM_EMIT_CACHE_DIR`` overrides ``/tmp/fasim/emit_control``. Set the
+    variable to an empty string to skip the cache.
+    """
+    if "FASIM_EMIT_CACHE_DIR" in os.environ:
+        return os.path.expanduser(os.environ["FASIM_EMIT_CACHE_DIR"].strip())
+    return "/tmp/fasim/emit_control"
+
+
+def _signal_process_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the emit_control process group. The waiter reaps it via communicate()."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _parse_emit_result(returncode: int, stdout: str, stderr: str) -> dict:
+    if returncode != 0:
+        detail = (stderr or stdout or "").strip()
+        raise RuntimeError(f"emit_control exited {returncode}: {detail}")
+    lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("emit_control produced no stdout JSON")
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"emit_control JSON parse failed: {lines[-1]!r}") from exc
+    if not isinstance(payload, dict) or "yaml_path" not in payload or "activate" not in payload:
+        raise RuntimeError(f"emit_control payload missing keys: {payload!r}")
+    return payload
+
+
+def _build_emit_popen_args(
     *,
     robot: str,
     robot_type: str,
@@ -1146,7 +1299,12 @@ def _run_emit(
     right_type: str = "",
     enable_arms_target_manager: bool = True,
     arms: str = "",
-) -> dict:
+) -> tuple[list[str], dict]:
+    """Build the host command for emit_control. Does not start the process.
+
+    Copies ``os.environ`` after ``ensure_isaac_ros2_library_path()`` so the child
+    does not race Kit's process-wide environment.
+    """
     if not os.path.isfile(_EMIT_SCRIPT):
         raise RuntimeError(f"emit_control.py not found: {_EMIT_SCRIPT}")
 
@@ -1174,6 +1332,9 @@ def _run_emit(
         args.extend(["--profile", profile])
     if update_rate and int(update_rate) > 0:
         args.extend(["--update-rate", str(int(update_rate))])
+    cache_dir = _emit_cache_dir()
+    if cache_dir:
+        args.extend(["--cache-dir", cache_dir])
 
     env = os.environ.copy()
     # Kit / isaac-sim.sh rewrites PYTHONPATH for Omniverse; AMENT_PREFIX_PATH can
@@ -1203,31 +1364,385 @@ def _run_emit(
             "Cannot find ros2_ws install/setup.bash; source the workspace or set "
             "inputs:rosSetup (AMENT_PREFIX_PATH alone is not enough inside Kit)"
         )
+    return cmd, env
 
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
-    if proc.stderr:
-        for line in proc.stderr.splitlines():
-            carb.log_info(f"emit_control: {line}")
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"emit_control exited {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()}"
+
+def _kick_emit(db: og.Database, state: OgnROS2ControlLaunchInternalState) -> bool:
+    """Resolve inputs and fork emit_control. Returns False when setup must stop."""
+    prep_t0 = time.monotonic()
+    target_prims = db.inputs.targetPrim
+    if not target_prims:
+        db.log_error("ROS2ControlLaunch: targetPrim is required")
+        state._failed = True
+        return False
+    if len(target_prims) != 1:
+        db.log_error(
+            f"ROS2ControlLaunch: exactly one targetPrim is required, got {len(target_prims)}"
         )
-    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
-    if not lines:
-        raise RuntimeError("emit_control produced no stdout JSON")
+        state._failed = True
+        return False
+
+    prim_path = str(target_prims[0])
     try:
-        payload = json.loads(lines[-1])
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"emit_control JSON parse failed: {lines[-1]!r}") from exc
-    if not isinstance(payload, dict) or "yaml_path" not in payload or "activate" not in payload:
-        raise RuntimeError(f"emit_control payload missing keys: {payload!r}")
-    return payload
+        robot = _resolve_robot_name(prim_path, str(db.inputs.robot or ""))
+        # Mutates process environ; must finish before any emit thread is alive.
+        # launch_emit copies the env into the child, so later robots can call this
+        # again safely (it is idempotent) before their own Popen.
+        ensure_isaac_ros2_library_path()
+        update_rate = _isaac_physics_update_rate_hz()
+        carb.log_info(
+            f"ROS2ControlLaunch: aligning ros2_control update_rate to Isaac physics "
+            f"{update_rate} Hz"
+        )
+        robot_type, left_type, right_type, enable_gripper = _resolve_ee_launch_types(
+            prim_path,
+            str(db.inputs.type or ""),
+            bool(db.inputs.enableGripper),
+        )
+        if state._force_disable_gripper:
+            enable_gripper = False
+            carb.log_info(
+                "ROS2ControlLaunch: re-emit with enable_gripper=false "
+                f"(no USD EE joints under {prim_path!r})"
+            )
+        namespace = str(db.inputs.namespace or "")
+        state._ros_setup = str(db.inputs.rosSetup or "")
+        state._namespace = namespace
+        state._emitted_with_gripper = bool(enable_gripper)
+        enable_atm = bool(getattr(db.inputs, "enableArmsTargetManager", True))
+        arms = str(getattr(db.inputs, "arms", "") or "").strip()
+        cmd, env = _build_emit_popen_args(
+            robot=robot,
+            robot_type=robot_type,
+            mode=str(db.inputs.mode or "demo"),
+            profile=str(db.inputs.profile or ""),
+            enable_gripper=enable_gripper,
+            ros_setup=state._ros_setup,
+            namespace=namespace,
+            update_rate=update_rate,
+            left_type=left_type,
+            right_type=right_type,
+            enable_arms_target_manager=enable_atm,
+            arms=arms,
+        )
+        state.launch_emit(cmd, env)
+    except Exception as exc:
+        carb.log_error(f"ROS2ControlLaunch emit start failed for {prim_path!r}: {exc}")
+        state._failed = True
+        return False
+
+    pid = state._emit_proc.pid if state._emit_proc is not None else "?"
+    carb.log_info(
+        f"ROS2ControlLaunch: emit started robot={robot!r} ns={namespace!r} "
+        f"pid={pid} (prep {time.monotonic() - prep_t0:.3f}s)"
+    )
+    return True
+
+
+def _poll_activation(db: og.Database, state: OgnROS2ControlLaunchInternalState) -> bool:
+    """Harvest the activate thread. ATM spawn stays on the Kit thread."""
+    if not state._activate_done:
+        return True
+    elapsed = time.monotonic() - state._activate_t0 if state._activate_t0 else 0.0
+    state._activate_thread = None
+    if state._activate_error:
+        carb.log_error(
+            f"ROS2ControlLaunch activate failed for {state._prim_path!r} "
+            f"in {elapsed:.2f}s: {state._activate_error}"
+        )
+        state.stop_arms_target_manager()
+        state._description_publisher.stop()
+        if state._prim_path:
+            try:
+                Ros2ControlManager.teardown(state._prim_path)
+            except Exception:
+                pass
+            state._prim_path = ""
+        state._failed = True
+        return False
+    carb.log_info(
+        f"ROS2ControlLaunch: controllers activated for {state._prim_path!r} "
+        f"in {elapsed:.2f}s"
+    )
+    # Controllers active — spawn ATM for VR / interactive markers.
+    if state._atm_params_path:
+        try:
+            state.start_arms_target_manager(
+                state._atm_params_path, namespace=state._namespace
+            )
+        except Exception as exc:
+            carb.log_error(
+                f"ROS2ControlLaunch: arms_target_manager spawn failed: {exc}"
+            )
+            state.stop_arms_target_manager()
+            state._description_publisher.stop()
+            if state._prim_path:
+                try:
+                    Ros2ControlManager.teardown(state._prim_path)
+                except Exception:
+                    pass
+                state._prim_path = ""
+            state._failed = True
+            return False
+    db.state.configured = True
+    db.outputs.execOut = og.ExecutionAttributeState.ENABLED
+    return True
+
+
+def _install_controller_manager(
+    db: og.Database,
+    state: OgnROS2ControlLaunchInternalState,
+    payload: dict,
+    prim_path: str,
+) -> str | None:
+    """Synth URDF and register the in-process ControllerManager.
+
+    Returns ``"reemit"`` when the USD has no EE joints but emit ran with
+    ``enable_gripper=true`` (the YAML would advertise joints the HW does not
+    have). Returns None after a successful setup. Raises on failure.
+    Synth and ``Ros2ControlManager.setup`` stay on the caller thread: USD and
+    the ``build_full_urdf`` monkey-patch are not safe to run concurrently.
+    """
+    setup_t0 = time.monotonic()
+    _robot_type, _left, _right, enable_gripper = _resolve_ee_launch_types(
+        prim_path,
+        str(db.inputs.type or ""),
+        bool(db.inputs.enableGripper),
+    )
+
+    import omni.usd
+    import isaacsim.ros2.control.ros2_control_manager as _cm_mod
+    import isaacsim.ros2.control.urdf_synth as _urdf_synth
+    from xml.etree import ElementTree as ET
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("no active USD stage")
+    # Keep setup/createArticulationView on ArtRoot (prim_path). Expand synth
+    # export scope to the robot Xform when DOFs are siblings (W2 base_link).
+    synth_scope = _synth_joint_scope_path(stage, prim_path)
+    if synth_scope != prim_path:
+        carb.log_info(
+            f"ROS2ControlLaunch: synth joint scope {prim_path!r} → {synth_scope!r} "
+            "(ArtRoot sibling DOFs)"
+        )
+    raw_synth = _urdf_synth.build_full_urdf(stage, synth_scope)
+    fixed_synth, injected_joints, removed_joints = _fix_synth_urdf(
+        stage, synth_scope, raw_synth
+    )
+    try:
+        safe_ns = (state._namespace or "global").replace("/", "_")
+        dump = f"/tmp/fasim_synth_urdf_{os.getpid()}_{safe_ns}.urdf"
+        with open(dump, "w", encoding="utf-8") as handle:
+            handle.write(fixed_synth)
+        carb.log_info(f"ROS2ControlLaunch: wrote fixed synth URDF to {dump}")
+    except Exception:
+        pass
+
+    hw_joints: set[str] = set()
+    try:
+        for rc in ET.fromstring(fixed_synth).findall("ros2_control"):
+            for jel in rc.findall("joint"):
+                name = jel.get("name")
+                if name:
+                    hw_joints.add(name)
+    except Exception:
+        pass
+    if not hw_joints:
+        raise RuntimeError(
+            f"synth <ros2_control> has no joints under scope {synth_scope!r} "
+            f"(ArtRoot {prim_path!r}). Nested ArticulationRootAPI still present? "
+            "Mute child ArtRoots (Head/Torso/EE/arm root_joint); "
+            "ensure Physics variant matches active engine (VariantSwitcher)."
+        )
+
+    usd_ee_names = [p.GetName() for p in _iter_usd_ee_joint_prims(stage, synth_scope)]
+    hw_ee = [n for n in hw_joints if _is_ee_joint_name(n)]
+    # Align with robot_common_launch: enable_gripper means "detect and
+    # spawn hand/gripper controllers". Only fall back to arm-only when
+    # the stage itself has no EE DOFs to claim.
+    if enable_gripper and not hw_ee and not usd_ee_names:
+        carb.log_warn(
+            "ROS2ControlLaunch: enableGripper/EE requested but no USD EE joints "
+            f"under {synth_scope!r}; skipping hand/gripper controllers "
+            f"(hw={sorted(hw_joints)}, injected={injected_joints}, "
+            f"removed={removed_joints})"
+        )
+        # emit already ran in parallel with this synth. If it included gripper
+        # controllers, throw that YAML away and emit once more without them.
+        if (
+            state._emitted_with_gripper
+            and not state._force_disable_gripper
+            and not state._gripper_reemit_used
+        ):
+            state._force_disable_gripper = True
+            state._gripper_reemit_used = True
+            carb.log_info(
+                "ROS2ControlLaunch: re-running emit_control with enable_gripper=false "
+                f"after {time.monotonic() - setup_t0:.2f}s synth"
+            )
+            return "reemit"
+        enable_gripper = False
+    elif enable_gripper and usd_ee_names and not hw_ee:
+        missing = sorted(set(usd_ee_names) - hw_joints)
+        carb.log_error(
+            "ROS2ControlLaunch: USD EE joints present but still missing from "
+            f"synth HW after repair (usd_ee={usd_ee_names}, missing={missing}, "
+            f"injected={injected_joints}). Hand/gripper activate may fail."
+        )
+    elif enable_gripper and hw_ee:
+        carb.log_info(
+            "ROS2ControlLaunch: EE joints in synth HW: " + ", ".join(sorted(hw_ee))
+        )
+
+    namespace = str(db.inputs.namespace or "")
+    enable_atm = bool(getattr(db.inputs, "enableArmsTargetManager", True))
+    yaml_path = payload["yaml_path"]
+    hand_controllers = list(payload.get("hand_controllers") or [])
+    atm_params = str(payload.get("arms_target_manager_params") or "")
+    state._atm_params_path = atm_params if enable_atm else ""
+    state._namespace = namespace
+    if hand_controllers:
+        carb.log_info(
+            "ROS2ControlLaunch: hand/gripper controllers (robot_common_launch detect): "
+            + ", ".join(hand_controllers)
+        )
+    elif enable_gripper:
+        carb.log_warn(
+            "ROS2ControlLaunch: enable_gripper=true but detect_controllers "
+            "found no hand/gripper (check type/xacro robot_description joints)"
+        )
+    if enable_atm and not atm_params:
+        carb.log_warn(
+            "ROS2ControlLaunch: enableArmsTargetManager=true but emit_control "
+            "did not return arms_target_manager_params (VR teleop unavailable)"
+        )
+    elif atm_params:
+        carb.log_info(
+            f"ROS2ControlLaunch: ATM params ready ({atm_params}); "
+            "will spawn after controller activate"
+        )
+    if not os.path.isfile(yaml_path):
+        raise RuntimeError(f"merged YAML missing: {yaml_path}")
+
+    _orig_cm = _cm_mod.build_full_urdf
+    _orig_synth = _urdf_synth.build_full_urdf
+
+    def _build_fixed(stage_arg, target, sensor_overlay_urdf_path=None):
+        # Manager setup still passes ArtRoot prim_path; return scoped synth.
+        if str(target) in (prim_path, synth_scope) and sensor_overlay_urdf_path is None:
+            return fixed_synth
+        scope = _synth_joint_scope_path(stage_arg, str(target))
+        raw = _orig_synth(
+            stage_arg,
+            scope,
+            sensor_overlay_urdf_path=sensor_overlay_urdf_path,
+        )
+        fixed, _, _ = _fix_synth_urdf(stage_arg, scope, raw)
+        return fixed
+
+    _cm_mod.build_full_urdf = _build_fixed
+    _urdf_synth.build_full_urdf = _build_fixed
+    try:
+        # Extension reload / ignored Stop-during-activate can leave a live
+        # CM while node state is fresh (_prim_path empty). Tear down any
+        # stale registration before setup so we never hit "already registered".
+        try:
+            Ros2ControlManager.teardown(prim_path)
+        except Exception:
+            pass
+        Ros2ControlManager.setup(
+            prim_path=prim_path,
+            controller_config=yaml_path,
+            urdf_path=None,
+            namespace=namespace,
+            publish_robot_description=False,
+            use_sim_time=bool(db.inputs.useSimTime),
+        )
+    finally:
+        _cm_mod.build_full_urdf = _orig_cm
+        _urdf_synth.build_full_urdf = _orig_synth
+    state._prim_path = prim_path
+
+    if bool(getattr(db.inputs, "publishRobotDescription", True)):
+        desc_path = str(payload.get("robot_description_path") or "")
+        if not desc_path or not os.path.isfile(desc_path):
+            raise RuntimeError(
+                "publishRobotDescription is set but emit_control did not "
+                "return robot_description_path"
+            )
+        with open(desc_path, encoding="utf-8") as handle:
+            urdf_xml = handle.read()
+        topic = state._description_publisher.start(urdf_xml, namespace=namespace)
+        carb.log_info(
+            f"ROS2ControlLaunch: latched robot_common_launch description on {topic} "
+            f"({len(urdf_xml)} bytes, enable_gripper={enable_gripper}, "
+            f"hw_joints={sorted(hw_joints)})"
+        )
+
+    carb.log_info(
+        f"ROS2ControlLaunch: synth+setup finished for {prim_path!r} "
+        f"in {time.monotonic() - setup_t0:.2f}s"
+    )
+    return None
+
+
+def _harvest_emit(db: og.Database, state: OgnROS2ControlLaunchInternalState) -> bool:
+    """Main-thread synth + CM setup once emit_control has exited."""
+    thread = state._emit_thread
+    if thread is not None:
+        thread.join(timeout=0.0)
+    with state._emit_lock:
+        payload = state._emit_payload
+        error = state._emit_error
+        stderr = state._emit_stderr
+        emit_t0 = state._emit_t0
+    elapsed = time.monotonic() - emit_t0 if emit_t0 else 0.0
+    if stderr:
+        for line in stderr.splitlines():
+            carb.log_info(f"emit_control: {line}")
+    if error or payload is None:
+        carb.log_error(
+            f"ROS2ControlLaunch emit failed ns={state._namespace!r} "
+            f"in {elapsed:.2f}s: {error or 'empty payload'}"
+        )
+        state._failed = True
+        state._reset_emit_slot()
+        return False
+    carb.log_info(
+        f"ROS2ControlLaunch: emit finished ns={state._namespace!r} in {elapsed:.2f}s"
+    )
+
+    prim_path = ""
+    try:
+        target_prims = db.inputs.targetPrim
+        prim_path = str(target_prims[0]) if target_prims else ""
+        if not prim_path:
+            raise RuntimeError("ROS2ControlLaunch: targetPrim is required")
+        action = _install_controller_manager(db, state, payload, prim_path)
+    except Exception as exc:
+        carb.log_error(f"ROS2ControlLaunch setup failed for {prim_path!r}: {exc}")
+        state.stop_arms_target_manager()
+        state._description_publisher.stop()
+        # Always tear down the intended prim — setup may have failed before
+        # state._prim_path was assigned (e.g. already-registered after reload).
+        for path in {p for p in (prim_path, state._prim_path) if p}:
+            try:
+                Ros2ControlManager.teardown(path)
+            except Exception:
+                pass
+        state._prim_path = ""
+        state._atm_params_path = ""
+        state._failed = True
+        state._reset_emit_slot()
+        return False
+
+    if action == "reemit":
+        state._reset_emit_slot()
+        return _kick_emit(db, state)
+
+    state.start_activate(list(payload["activate"]), namespace=state._namespace)
+    return True
 
 
 class OgnROS2ControlLaunch:
@@ -1252,271 +1767,14 @@ class OgnROS2ControlLaunch:
 
         # Activation runs off-thread so physics post-step can keep updating the CM.
         if state._activate_thread is not None:
-            if not state._activate_done:
-                return True
-            state._activate_thread = None
-            if state._activate_error:
-                carb.log_error(
-                    f"ROS2ControlLaunch activate failed for {state._prim_path!r}: "
-                    f"{state._activate_error}"
-                )
-                state.stop_arms_target_manager()
-                state._description_publisher.stop()
-                if state._prim_path:
-                    try:
-                        Ros2ControlManager.teardown(state._prim_path)
-                    except Exception:
-                        pass
-                    state._prim_path = ""
-                state._failed = True
-                return False
-            # Controllers active — spawn ATM for VR / interactive markers.
-            if state._atm_params_path:
-                try:
-                    state.start_arms_target_manager(
-                        state._atm_params_path, namespace=state._namespace
-                    )
-                except Exception as exc:
-                    carb.log_error(
-                        f"ROS2ControlLaunch: arms_target_manager spawn failed: {exc}"
-                    )
-                    state.stop_arms_target_manager()
-                    state._description_publisher.stop()
-                    if state._prim_path:
-                        try:
-                            Ros2ControlManager.teardown(state._prim_path)
-                        except Exception:
-                            pass
-                        state._prim_path = ""
-                    state._failed = True
-                    return False
-            db.state.configured = True
-            db.outputs.execOut = og.ExecutionAttributeState.ENABLED
+            return _poll_activation(db, state)
+
+        # OnPlaybackTick calls compute every frame until configured. The first
+        # tick only forks emit_control (so sibling robots start together); later
+        # ticks either wait or run the main-thread synth + CM setup.
+        if not state._emit_done:
+            if state._emit_thread is None:
+                return _kick_emit(db, state)
             return True
 
-        target_prims = db.inputs.targetPrim
-        if not target_prims:
-            db.log_error("ROS2ControlLaunch: targetPrim is required")
-            state._failed = True
-            return False
-        if len(target_prims) != 1:
-            db.log_error(
-                f"ROS2ControlLaunch: exactly one targetPrim is required, got {len(target_prims)}"
-            )
-            state._failed = True
-            return False
-
-        prim_path = str(target_prims[0])
-        try:
-            robot = _resolve_robot_name(prim_path, str(db.inputs.robot or ""))
-        except RuntimeError as exc:
-            db.log_error(str(exc))
-            state._failed = True
-            return False
-
-        try:
-            ensure_isaac_ros2_library_path()
-            update_rate = _isaac_physics_update_rate_hz()
-            carb.log_info(
-                f"ROS2ControlLaunch: aligning ros2_control update_rate to Isaac physics "
-                f"{update_rate} Hz"
-            )
-            robot_type, left_type, right_type, enable_gripper = _resolve_ee_launch_types(
-                prim_path,
-                str(db.inputs.type or ""),
-                bool(db.inputs.enableGripper),
-            )
-            namespace = str(db.inputs.namespace or "")
-
-            # Probe + repair Isaac synth: seamless EE joints (gripper_joint) are
-            # often listed in <ros2_control> but omitted from kinematic export.
-            # Inject them from USD so CM/JSB/gripper_controller stay consistent.
-            import omni.usd
-            import isaacsim.ros2.control.ros2_control_manager as _cm_mod
-            import isaacsim.ros2.control.urdf_synth as _urdf_synth
-            from xml.etree import ElementTree as ET
-
-            stage = omni.usd.get_context().get_stage()
-            if stage is None:
-                raise RuntimeError("no active USD stage")
-            # Keep setup/createArticulationView on ArtRoot (prim_path). Expand synth
-            # export scope to the robot Xform when DOFs are siblings (W2 base_link).
-            synth_scope = _synth_joint_scope_path(stage, prim_path)
-            if synth_scope != prim_path:
-                carb.log_info(
-                    f"ROS2ControlLaunch: synth joint scope {prim_path!r} → {synth_scope!r} "
-                    "(ArtRoot sibling DOFs)"
-                )
-            raw_synth = _urdf_synth.build_full_urdf(stage, synth_scope)
-            fixed_synth, injected_joints, removed_joints = _fix_synth_urdf(
-                stage, synth_scope, raw_synth
-            )
-            try:
-                dump = f"/tmp/fasim_synth_urdf_{os.getpid()}.urdf"
-                with open(dump, "w", encoding="utf-8") as handle:
-                    handle.write(fixed_synth)
-                carb.log_info(f"ROS2ControlLaunch: wrote fixed synth URDF to {dump}")
-            except Exception:
-                pass
-
-            hw_joints: set[str] = set()
-            try:
-                for rc in ET.fromstring(fixed_synth).findall("ros2_control"):
-                    for jel in rc.findall("joint"):
-                        name = jel.get("name")
-                        if name:
-                            hw_joints.add(name)
-            except Exception:
-                pass
-            if not hw_joints:
-                raise RuntimeError(
-                    f"synth <ros2_control> has no joints under scope {synth_scope!r} "
-                    f"(ArtRoot {prim_path!r}). Nested ArticulationRootAPI still present? "
-                    "Mute child ArtRoots (Head/Torso/EE/arm root_joint); "
-                    "ensure Physics variant matches active engine (VariantSwitcher)."
-                )
-
-            usd_ee_names = [p.GetName() for p in _iter_usd_ee_joint_prims(stage, synth_scope)]
-            hw_ee = [n for n in hw_joints if _is_ee_joint_name(n)]
-            # Align with robot_common_launch: enable_gripper means "detect and
-            # spawn hand/gripper controllers". Only fall back to arm-only when
-            # the stage itself has no EE DOFs to claim.
-            if enable_gripper and not hw_ee and not usd_ee_names:
-                carb.log_warn(
-                    "ROS2ControlLaunch: enableGripper/EE requested but no USD EE joints "
-                    f"under {synth_scope!r}; skipping hand/gripper controllers "
-                    f"(hw={sorted(hw_joints)}, injected={injected_joints}, "
-                    f"removed={removed_joints})"
-                )
-                enable_gripper = False
-            elif enable_gripper and usd_ee_names and not hw_ee:
-                missing = sorted(set(usd_ee_names) - hw_joints)
-                carb.log_error(
-                    "ROS2ControlLaunch: USD EE joints present but still missing from "
-                    f"synth HW after repair (usd_ee={usd_ee_names}, missing={missing}, "
-                    f"injected={injected_joints}). Hand/gripper activate may fail."
-                )
-            elif enable_gripper and hw_ee:
-                carb.log_info(
-                    "ROS2ControlLaunch: EE joints in synth HW: " + ", ".join(sorted(hw_ee))
-                )
-
-            enable_atm = bool(getattr(db.inputs, "enableArmsTargetManager", True))
-            arms = str(getattr(db.inputs, "arms", "") or "").strip()
-            state._ros_setup = str(db.inputs.rosSetup or "")
-            payload = _run_emit(
-                robot=robot,
-                robot_type=robot_type,
-                mode=str(db.inputs.mode or "demo"),
-                profile=str(db.inputs.profile or ""),
-                enable_gripper=enable_gripper,
-                ros_setup=state._ros_setup,
-                namespace=namespace,
-                update_rate=update_rate,
-                left_type=left_type,
-                right_type=right_type,
-                enable_arms_target_manager=enable_atm,
-                arms=arms,
-            )
-            yaml_path = payload["yaml_path"]
-            activate = list(payload["activate"])
-            hand_controllers = list(payload.get("hand_controllers") or [])
-            atm_params = str(payload.get("arms_target_manager_params") or "")
-            state._atm_params_path = atm_params if enable_atm else ""
-            state._namespace = namespace
-            if hand_controllers:
-                carb.log_info(
-                    "ROS2ControlLaunch: hand/gripper controllers (robot_common_launch detect): "
-                    + ", ".join(hand_controllers)
-                )
-            elif enable_gripper:
-                carb.log_warn(
-                    "ROS2ControlLaunch: enable_gripper=true but detect_controllers "
-                    "found no hand/gripper (check type/xacro robot_description joints)"
-                )
-            if enable_atm and not atm_params:
-                carb.log_warn(
-                    "ROS2ControlLaunch: enableArmsTargetManager=true but emit_control "
-                    "did not return arms_target_manager_params (VR teleop unavailable)"
-                )
-            elif atm_params:
-                carb.log_info(
-                    f"ROS2ControlLaunch: ATM params ready ({atm_params}); "
-                    "will spawn after controller activate"
-                )
-            if not os.path.isfile(yaml_path):
-                raise RuntimeError(f"merged YAML missing: {yaml_path}")
-
-            _orig_cm = _cm_mod.build_full_urdf
-            _orig_synth = _urdf_synth.build_full_urdf
-
-            def _build_fixed(stage_arg, target, sensor_overlay_urdf_path=None):
-                # Manager setup still passes ArtRoot prim_path; return scoped synth.
-                if str(target) in (prim_path, synth_scope) and sensor_overlay_urdf_path is None:
-                    return fixed_synth
-                scope = _synth_joint_scope_path(stage_arg, str(target))
-                raw = _orig_synth(
-                    stage_arg,
-                    scope,
-                    sensor_overlay_urdf_path=sensor_overlay_urdf_path,
-                )
-                fixed, _, _ = _fix_synth_urdf(stage_arg, scope, raw)
-                return fixed
-
-            _cm_mod.build_full_urdf = _build_fixed
-            _urdf_synth.build_full_urdf = _build_fixed
-            try:
-                # Extension reload / ignored Stop-during-activate can leave a live
-                # CM while node state is fresh (_prim_path empty). Tear down any
-                # stale registration before setup so we never hit "already registered".
-                try:
-                    Ros2ControlManager.teardown(prim_path)
-                except Exception:
-                    pass
-                Ros2ControlManager.setup(
-                    prim_path=prim_path,
-                    controller_config=yaml_path,
-                    urdf_path=None,
-                    namespace=namespace,
-                    publish_robot_description=False,
-                    use_sim_time=bool(db.inputs.useSimTime),
-                )
-            finally:
-                _cm_mod.build_full_urdf = _orig_cm
-                _urdf_synth.build_full_urdf = _orig_synth
-            state._prim_path = prim_path
-
-            if bool(getattr(db.inputs, "publishRobotDescription", True)):
-                desc_path = str(payload.get("robot_description_path") or "")
-                if not desc_path or not os.path.isfile(desc_path):
-                    raise RuntimeError(
-                        "publishRobotDescription is set but emit_control did not "
-                        "return robot_description_path"
-                    )
-                with open(desc_path, encoding="utf-8") as handle:
-                    urdf_xml = handle.read()
-                topic = state._description_publisher.start(urdf_xml, namespace=namespace)
-                carb.log_info(
-                    f"ROS2ControlLaunch: latched robot_common_launch description on {topic} "
-                    f"({len(urdf_xml)} bytes, enable_gripper={enable_gripper}, "
-                    f"hw_joints={sorted(hw_joints)})"
-                )
-
-            state.start_activate(activate, namespace=namespace)
-        except Exception as exc:
-            carb.log_error(f"ROS2ControlLaunch setup failed for {prim_path!r}: {exc}")
-            state.stop_arms_target_manager()
-            state._description_publisher.stop()
-            # Always tear down the intended prim — setup may have failed before
-            # state._prim_path was assigned (e.g. already-registered after reload).
-            for path in {p for p in (prim_path, state._prim_path) if p}:
-                try:
-                    Ros2ControlManager.teardown(path)
-                except Exception:
-                    pass
-            state._prim_path = ""
-            state._atm_params_path = ""
-            state._failed = True
-            return False
-
-        return True
+        return _harvest_emit(db, state)

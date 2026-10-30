@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
+import hashlib
 import json
 import os
+import shutil
 import sys
+import time
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -73,6 +77,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--arms",
         default="",
         help="robot_common_launch arms xacro key (e.g. piper, h, l, x). Empty: xacro default.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default="",
+        help=(
+            "Directory for emit artifacts keyed by args + package mtimes. "
+            "Empty disables the cache. Hits print the cached JSON and skip xacro."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -564,13 +576,291 @@ def emit(args: argparse.Namespace) -> dict:
     }
 
 
+# Bump when the cached payload schema or the fingerprint inputs change.
+_CACHE_VERSION = 1
+
+# Mesh/texture blobs do not change the xacro text emit writes. Skipping them
+# keeps the per-hit fingerprint walk well under the xacro it replaces.
+_FINGERPRINT_SKIP_DIRS = frozenset(
+    {"__pycache__", "meshes", "mesh", "textures", "texturesets"}
+)
+
+
+def _workspace_prefixes() -> list[str]:
+    """Non-underlay AMENT prefixes, absolute and sorted so the key is stable."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in (os.environ.get("AMENT_PREFIX_PATH") or "").split(":"):
+        raw = raw.strip().rstrip("/")
+        if not raw or raw.startswith("/opt/ros"):
+            continue
+        prefix = os.path.abspath(raw)
+        if prefix in seen or not os.path.isdir(prefix):
+            continue
+        seen.add(prefix)
+        found.append(prefix)
+    return sorted(found)
+
+
+def _package_dirs(prefixes: list[str], pkg: str, *, include_python: bool) -> list[str]:
+    dirs: list[str] = []
+    for prefix in prefixes:
+        share = os.path.join(prefix, "share", pkg)
+        if os.path.isdir(share):
+            dirs.append(share)
+        if not include_python:
+            continue
+        lib = os.path.join(prefix, "lib")
+        if not os.path.isdir(lib):
+            continue
+        try:
+            names = os.listdir(lib)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith("python"):
+                continue
+            site = os.path.join(lib, name, "site-packages", pkg)
+            if os.path.isdir(site):
+                dirs.append(site)
+    return dirs
+
+
+def _tree_fingerprint(root: str) -> tuple[int, int]:
+    """Return (max mtime_ns, file count), ignoring bytecode and mesh payloads."""
+    latest = 0
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _FINGERPRINT_SKIP_DIRS]
+        for name in filenames:
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            try:
+                latest = max(latest, os.stat(os.path.join(dirpath, name)).st_mtime_ns)
+            except OSError:
+                continue
+            count += 1
+    return latest, count
+
+
+def _cache_key(args: argparse.Namespace) -> str:
+    """sha256 of emit inputs plus the description/launch packages they read.
+
+    Computed with only the stdlib so a hit can return before robot_common_launch
+    (and the OCS2/xacro stack behind it) is imported.
+    """
+    prefixes = _workspace_prefixes()
+    robot = (args.robot or "").strip()
+    packages: dict[str, list[dict]] = {}
+    for pkg, include_python in (
+        (f"{robot}_description", False),
+        ("robot_common_launch", True),
+        ("arms_target_manager", True),
+    ):
+        stats: list[dict] = []
+        for directory in _package_dirs(prefixes, pkg, include_python=include_python):
+            mtime_ns, count = _tree_fingerprint(directory)
+            stats.append({"path": directory, "mtime_ns": mtime_ns, "files": count})
+        packages[pkg] = stats
+
+    profile = (args.profile or "").strip()
+    profile_info: dict | None = None
+    if profile:
+        profile_abs = os.path.abspath(profile)
+        try:
+            st = os.stat(profile_abs)
+            profile_info = {
+                "path": profile_abs,
+                "mtime_ns": st.st_mtime_ns,
+                "size": st.st_size,
+            }
+        except OSError:
+            profile_info = {"path": profile_abs, "missing": True}
+
+    try:
+        emit_mtime_ns = os.stat(os.path.abspath(__file__)).st_mtime_ns
+    except OSError:
+        emit_mtime_ns = 0
+
+    material = {
+        "v": _CACHE_VERSION,
+        "args": {
+            "robot": robot,
+            "type": (args.robot_type or "").strip(),
+            "left_type": (getattr(args, "left_type", "") or "").strip(),
+            "right_type": (getattr(args, "right_type", "") or "").strip(),
+            "mode": args.mode,
+            "enable_gripper": _as_bool(args.enable_gripper),
+            "enable_body": _as_bool(getattr(args, "enable_body", "true")),
+            "namespace": (args.namespace or "").strip().strip("/"),
+            "update_rate": int(getattr(args, "update_rate", 0) or 0),
+            "enable_arms_target_manager": _as_bool(
+                getattr(args, "enable_arms_target_manager", "true")
+            ),
+            "arms": (getattr(args, "arms", "") or "").strip(),
+            "profile": profile_info,
+        },
+        "prefixes": prefixes,
+        "packages": packages,
+        "emit_mtime_ns": emit_mtime_ns,
+    }
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+_CACHE_FILES = (
+    ("yaml_path", "controllers.yaml", True),
+    ("robot_description_path", "robot_description.urdf", True),
+    ("arms_target_manager_params", "arms_target_manager.yaml", False),
+)
+
+
+def _read_cache(cache_dir: str, key: str) -> dict | None:
+    final = os.path.join(cache_dir, key)
+    payload_path = os.path.join(final, "payload.json")
+    if not os.path.isfile(payload_path):
+        return None
+    try:
+        with open(payload_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or "activate" not in payload:
+        return None
+    for field, _name, required in _CACHE_FILES:
+        path = payload.get(field) or ""
+        if not path:
+            if required:
+                return None
+            continue
+        if not os.path.isfile(path):
+            return None
+    return payload
+
+
+def _remove_temp_artifacts(payload: dict, cache_dir: str) -> None:
+    """Drop mkstemp files once their bytes live in the cache directory."""
+    root = os.path.abspath(cache_dir) + os.sep
+    for field, _name, _required in _CACHE_FILES:
+        src = payload.get(field) or ""
+        if not src or not os.path.isfile(src):
+            continue
+        if os.path.abspath(src).startswith(root):
+            continue
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
+
+def _rename_cache_dir(staging: str, final: str) -> None:
+    """Publish a staging dir. Linux uses ENOTEMPTY when ``final`` already exists."""
+    try:
+        os.rename(staging, final)
+    except OSError as exc:
+        if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+            raise
+        raise FileExistsError(exc.errno, exc.strerror) from exc
+
+
+def _write_cache(cache_dir: str, key: str, payload: dict) -> dict:
+    """Copy emit artifacts into ``cache_dir/key`` and return paths that stay there.
+
+    ``os.rename`` of the staging directory is atomic on the same filesystem, so a
+    concurrent emit of the same key either publishes a complete entry or leaves
+    the previous one in place.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    final = os.path.join(cache_dir, key)
+    staging = os.path.join(cache_dir, f".{key}.{os.getpid()}.tmp")
+    if os.path.isdir(staging):
+        shutil.rmtree(staging)
+    os.makedirs(staging)
+    rewritten = dict(payload)
+    try:
+        for field, name, required in _CACHE_FILES:
+            src = payload.get(field) or ""
+            if not src:
+                if required:
+                    raise RuntimeError(f"emit cache: missing {field}")
+                rewritten[field] = None
+                continue
+            if not os.path.isfile(src):
+                if required:
+                    raise RuntimeError(f"emit cache: {field} is not a file: {src}")
+                rewritten[field] = None
+                continue
+            shutil.copyfile(src, os.path.join(staging, name))
+            rewritten[field] = os.path.join(final, name)
+        with open(os.path.join(staging, "payload.json"), "w", encoding="utf-8") as handle:
+            json.dump(rewritten, handle)
+        try:
+            _rename_cache_dir(staging, final)
+        except FileExistsError:
+            shutil.rmtree(staging, ignore_errors=True)
+            existing = _read_cache(cache_dir, key)
+            if existing is not None:
+                _remove_temp_artifacts(payload, cache_dir)
+                return existing
+            # Leftover partial directory from a crashed writer.
+            shutil.rmtree(final, ignore_errors=True)
+            os.makedirs(staging)
+            for field, name, required in _CACHE_FILES:
+                src = payload.get(field) or ""
+                if not src or not os.path.isfile(src):
+                    if required:
+                        raise RuntimeError(f"emit cache: missing {field}")
+                    continue
+                shutil.copyfile(src, os.path.join(staging, name))
+            with open(os.path.join(staging, "payload.json"), "w", encoding="utf-8") as handle:
+                json.dump(rewritten, handle)
+            _rename_cache_dir(staging, final)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    _remove_temp_artifacts(payload, cache_dir)
+    return rewritten
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    cache_dir = (getattr(args, "cache_dir", "") or "").strip()
+    key = ""
+    if cache_dir:
+        # Lookup stays above emit() so a hit never imports robot_common_launch.
+        try:
+            lookup_t0 = time.monotonic()
+            key = _cache_key(args)
+            hit = _read_cache(cache_dir, key)
+            lookup_ms = (time.monotonic() - lookup_t0) * 1000.0
+        except Exception as exc:
+            print(f"[WARN] emit_control cache lookup failed: {exc}", file=sys.stderr)
+            hit = None
+            key = ""
+            lookup_ms = 0.0
+        if hit is not None:
+            print(
+                f"[INFO] emit_control cache hit {key[:12]} ({lookup_ms:.0f}ms)",
+                file=sys.stderr,
+            )
+            print(json.dumps(hit, separators=(",", ":")))
+            return 0
+        if key:
+            print(
+                f"[INFO] emit_control cache miss {key[:12]} ({lookup_ms:.0f}ms)",
+                file=sys.stderr,
+            )
     try:
         payload = emit(args)
     except Exception as exc:
         print(f"[ERROR] emit_control failed: {exc}", file=sys.stderr)
         return 1
+    if cache_dir and key:
+        try:
+            payload = _write_cache(cache_dir, key, payload)
+            print(f"[INFO] emit_control cache stored {key[:12]}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[WARN] emit_control cache store failed: {exc}", file=sys.stderr)
     print(json.dumps(payload, separators=(",", ":")))
     return 0
 
