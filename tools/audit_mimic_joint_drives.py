@@ -3,14 +3,28 @@
 
 Why
 ---
-``isaacsim.ros2.control`` (IsaacSimSystem) tracks a mimic joint through a
-position drive on the mimic joint itself.  Without one it logs at startup::
+``isaacsim.ros2.control`` (IsaacSimSystem) sets the follower's drive target to
+``gearing * leader + offset`` every tick, so without a drive it logs at startup::
 
     IsaacSimSystem: mimic joint '<j>' has no position drive (stiffness=0);
     it cannot track leader '<l>'. Author a position DriveAPI on the mimic joint.
 
 ``isaacsim.asset.exporter.urdf`` also warns about mimic joints without a drive
 ("has no finite effort limit and no active drive").
+
+!! CAUTION -- DO NOT APPLY BLINDLY !!
+The assets in this repo already carry ``PhysxMimicJointAPI`` / ``NewtonMimicAPI``,
+so the physics solver enforces the mimic relation itself. Both warnings above
+are then informational: the exporter still emits ``<mimic>`` and exports effort 0
+for the passive follower, and ros2_control lists the joint as state-only either
+way (``urdf_synth.synthesize_hardware_block`` forces ``command_kind=None`` for
+any joint in the mimic map).
+
+Adding a drive on top of an existing mimic constraint puts two force sources on
+the same DOF; with an authored ``targetPosition = 0`` the follower's own drive
+fights the constraint and gripper behaviour degrades (this was tried and
+reverted in robot_usds 8a201d9). Only use ``--apply`` on assets that have a
+mimic relationship *without* the PhysX/Newton mimic API.
 
 Usage
 -----
