@@ -25,6 +25,8 @@ CLI_PHYSICS=""
 CLI_CPU=""
 CLI_ROS_WS=""
 CLI_INSTANCE=""
+CLI_KIT_PROFILE=""
+LIST_KIT_PROFILES=0
 NONINTERACTIVE=0
 
 usage() {
@@ -39,6 +41,8 @@ usage() {
   --cpu 0|1|auto        CPU performance（0=跳过）
   --ros-ws PATH         默认加载的 ROS2 工作空间（含 install/setup.bash）
   --instance N          Headless 实例序号（端口 / ROS_DOMAIN_ID）
+  --kit-profile NAME    Kit settings 预设档位（默认 none）
+  --list-kit-profiles   列出可用档位后退出
   -y, --yes             非交互：全部用配置/默认值
   -h, --help
 EOF
@@ -58,6 +62,12 @@ while [ $# -gt 0 ]; do
             ;;
         --instance)
             CLI_INSTANCE="${2:-}"; shift 2
+            ;;
+        --kit-profile)
+            CLI_KIT_PROFILE="${2:-}"; shift 2
+            ;;
+        --list-kit-profiles)
+            LIST_KIT_PROFILES=1; shift
             ;;
         -y|--yes) NONINTERACTIVE=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -84,6 +94,21 @@ if [ -f "$FA_SIM_LOCAL_CONFIG" ]; then
     # shellcheck source=/dev/null
     source "$FA_SIM_LOCAL_CONFIG"
     print_info "已加载本机覆盖: config/fa_sim.local.conf"
+fi
+
+if [ "${LIST_KIT_PROFILES:-0}" = "1" ]; then
+    echo "可用 kit 预设档位（--kit-profile NAME）:"
+    printf '  %-22s %-7s %s\n' "none" "-" "不追加任何 settings 覆盖"
+    for _p in $(printf '%s\n' "${!ISAAC_KIT_PROFILE_DESC[@]}" | sort); do
+        case "$_p" in
+            newton-*) _tag="newton" ;;
+            physx-*)  _tag="physx" ;;
+            *)        _tag="-" ;;
+        esac
+        printf '  %-22s %-7s %s\n' "$_p" "$_tag" "${ISAAC_KIT_PROFILE_DESC[$_p]}"
+    done
+    echo "  （newton-* 仅用于 --physics newton，physx-* 仅用于 --physics physx）"
+    exit 0
 fi
 
 # 交互默认值（local.conf / 环境变量可覆盖）
@@ -234,6 +259,7 @@ save_local_conf() {
             echo "ISAACSIM_DIR=\"${ISAACSIM_DIR}\""
         fi
         echo "RUN_PHYSICS_BACKEND=\"${RUN_PHYSICS_BACKEND}\""
+        echo "RUN_KIT_PROFILE=\"${RUN_KIT_PROFILE:-none}\""
         echo "RUN_SET_CPU_PERFORMANCE=\"${RUN_SET_CPU_PERFORMANCE}\""
         echo "RUN_ROS2_WS=\"${RUN_ROS2_WS}\""
         echo "RUN_ISAAC_ROS_WS=\"${RUN_ISAAC_ROS_WS}\""
@@ -242,7 +268,7 @@ save_local_conf() {
             while IFS= read -r line || [ -n "$line" ]; do
                 case "$line" in
                     ''|\#*) continue ;;
-                    ISAACSIM_DIR=*|RUN_PHYSICS_BACKEND=*|RUN_SET_CPU_PERFORMANCE=*|RUN_ROS2_WS=*|RUN_ISAAC_ROS_WS=*|RUN_SAVE_LOCAL=*)
+                    ISAACSIM_DIR=*|RUN_PHYSICS_BACKEND=*|RUN_KIT_PROFILE=*|RUN_SET_CPU_PERFORMANCE=*|RUN_ROS2_WS=*|RUN_ISAAC_ROS_WS=*|RUN_SAVE_LOCAL=*)
                         continue
                         ;;
                     unset\ PYTHONPATH*|unset\ PYTHONPATH|PYTHONPATH=*)
@@ -264,6 +290,7 @@ print_config_summary() {
     echo "  物理:     ${RUN_PHYSICS_BACKEND}"
     echo "  CPU:      ${RUN_SET_CPU_PERFORMANCE}"
     echo "  ROS2 WS:  ${RUN_ROS2_WS}"
+    echo "  Kit预设:  ${RUN_KIT_PROFILE:-none}"
     if [ "$HEADLESS" -eq 1 ]; then
         echo "  Instance: ${FA_SIM_INSTANCE:-0}"
     fi
@@ -290,12 +317,48 @@ apply_cli_overrides() {
     if [ -n "$CLI_ROS_WS" ]; then
         RUN_ROS2_WS="$CLI_ROS_WS"
     fi
+    if [ -n "$CLI_KIT_PROFILE" ]; then
+        RUN_KIT_PROFILE="$CLI_KIT_PROFILE"
+    fi
     if [ -n "${CLI_INSTANCE}" ]; then
         if ! is_nonneg_int "${CLI_INSTANCE}"; then
             print_error "实例序号必须是非负整数，当前: ${CLI_INSTANCE}"
             exit 1
         fi
         FA_SIM_INSTANCE="${CLI_INSTANCE}"
+    fi
+}
+
+kit_profile_candidates() {
+    # 按物理后端列出适用的档位（none + 前缀匹配），供菜单/校验使用
+    local backend="${1:-}" name
+    echo "none"
+    for name in $(printf '%s\n' "${!ISAAC_KIT_PROFILE_DESC[@]}" | sort); do
+        case "$name" in
+            newton-*)
+                if [ -z "$backend" ] || [ "$backend" = "newton" ]; then echo "$name"; fi
+                ;;
+            physx-*)
+                if [ -z "$backend" ] || [ "$backend" = "physx" ]; then echo "$name"; fi
+                ;;
+            *)
+                echo "$name"
+                ;;
+        esac
+    done
+}
+
+normalize_kit_profile() {
+    # 档位与物理后端不匹配时回退 none（比如从 newton 切到 physx）
+    local backend="${1:-}" profile="${RUN_KIT_PROFILE:-none}"
+    [ -n "$profile" ] || profile="none"
+    if [ "$profile" = "none" ]; then
+        RUN_KIT_PROFILE="none"
+        return 0
+    fi
+    if ! kit_profile_candidates "$backend" | grep -qx -- "$profile"; then
+        print_warn "Kit 档位 ${profile} 不适用于 --physics ${backend}，已重置为 none"
+        RUN_KIT_PROFILE="none"
     fi
 }
 
@@ -362,6 +425,35 @@ prompt_reselect_config() {
             ;;
     esac
 
+    # --- Kit 预设档位（按当前物理后端过滤）---
+    normalize_kit_profile "$RUN_PHYSICS_BACKEND"
+    echo ""
+    echo "Kit 设置预设（当前物理: ${RUN_PHYSICS_BACKEND}，none=不追加）:"
+    local kit_i=0 kit_p kit_default=1
+    local -a kit_menu=()
+    while IFS= read -r kit_p; do
+        kit_menu+=("$kit_p")
+        kit_i=$((kit_i + 1))
+        if [ "$kit_p" = "none" ]; then
+            printf '  %d) %-22s %s\n' "$kit_i" "$kit_p" "不追加任何 settings 覆盖"
+        else
+            printf '  %d) %-22s %s\n' "$kit_i" "$kit_p" "${ISAAC_KIT_PROFILE_DESC[$kit_p]}"
+        fi
+        [ "$kit_p" = "${RUN_KIT_PROFILE:-none}" ] && kit_default="$kit_i"
+    done < <(kit_profile_candidates "$RUN_PHYSICS_BACKEND")
+    prompt_choice "选择序号或名称" "$kit_default"
+    ans="$REPLY"
+    if [[ "$ans" =~ ^[0-9]+$ ]]; then
+        if [ "$ans" -ge 1 ] && [ "$ans" -le "${#kit_menu[@]}" ]; then
+            RUN_KIT_PROFILE="${kit_menu[$((ans - 1))]}"
+        else
+            print_error "序号超出范围: $ans（有效 1-${#kit_menu[@]}）"
+            exit 1
+        fi
+    else
+        RUN_KIT_PROFILE="$ans"
+    fi
+
     if [ "$HEADLESS" -eq 1 ]; then
         instance="${FA_SIM_INSTANCE:-0}"
         echo ""
@@ -386,6 +478,8 @@ interactive_config() {
     FA_SIM_INSTANCE="${FA_SIM_INSTANCE:-0}"
 
     apply_cli_overrides
+    # 物理后端确定后，再校验档位是否适用（--physics physx 时自动丢弃 newton-* 档位）
+    normalize_kit_profile "$RUN_PHYSICS_BACKEND"
 
     echo ""
     echo -e "${CYAN}══ FaSim-Isaac 启动配置 ══${NC}"
@@ -519,6 +613,70 @@ build_isaac_excluded_ext_args() {
     done
 }
 
+resolve_kit_profile() {
+    # 把 RUN_KIT_PROFILE 对应的预设数组展开到 ISAAC_KIT_PROFILE_SETTINGS
+    local name="${RUN_KIT_PROFILE:-none}"
+    ISAAC_KIT_PROFILE_SETTINGS=()
+    case "$name" in
+        ""|none) return 0 ;;
+    esac
+
+    local var
+    var="ISAAC_KIT_PROFILE_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    if ! declare -p "$var" >/dev/null 2>&1; then
+        print_error "未知 kit 预设档位: ${name}"
+        echo "可用档位:"
+        printf '  %-22s %s\n' "none" "不追加任何 settings 覆盖"
+        local p
+        for p in $(printf '%s\n' "${!ISAAC_KIT_PROFILE_DESC[@]}" | sort); do
+            printf '  %-22s %s\n' "$p" "${ISAAC_KIT_PROFILE_DESC[$p]}"
+        done
+        exit 1
+    fi
+    local -n _profile_ref="$var"
+    ISAAC_KIT_PROFILE_SETTINGS=("${_profile_ref[@]}")
+
+    case "$name" in
+        physx-*)
+            [ "${RUN_PHYSICS_BACKEND}" = "physx" ] || \
+                print_warn "档位 ${name} 面向 --physics physx，当前物理=${RUN_PHYSICS_BACKEND}"
+            ;;
+        newton-*)
+            [ "${RUN_PHYSICS_BACKEND}" = "newton" ] || \
+                print_warn "档位 ${name} 面向 --physics newton，当前物理=${RUN_PHYSICS_BACKEND}"
+            ;;
+    esac
+}
+
+build_isaac_setting_args() {
+    # 先展开预设档位，再追加用户手工覆盖（config/fa_sim.conf: ISAAC_KIT_SETTINGS）
+    resolve_kit_profile
+    local s
+    for s in "${ISAAC_KIT_PROFILE_SETTINGS[@]:-}"; do
+        [ -n "$s" ] || continue
+        ISAAC_KIT_EXTRA_ARGS+=("$s")
+    done
+    for s in "${ISAAC_KIT_SETTINGS[@]:-}"; do
+        [ -n "$s" ] || continue
+        ISAAC_KIT_EXTRA_ARGS+=("$s")
+    done
+}
+
+enable_crash_debug() {
+    [ "${RUN_CRASH_DEBUG:-0}" = "1" ] || return 0
+    if ulimit -c unlimited 2>/dev/null; then
+        print_info "崩溃调试：ulimit -c = $(ulimit -c)"
+    else
+        print_warn "崩溃调试：无法开启 core dump（受 hard limit 限制）"
+    fi
+    local plugins_dir="${ISAACSIM_DIR}/kit/kernel/plugins"
+    if [ -d "$plugins_dir" ]; then
+        export PATH="${plugins_dir}:${PATH}"
+        print_info "崩溃调试：crashreport.gui 已加入 PATH"
+    fi
+    print_info "崩溃调试：core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+}
+
 sanitize_host_ros_paths_for_isaac() {
     # Full host ROS for OCS2 / ros2_control: keep /opt/ros on LD+AMENT, strip
     # only PYTHONPATH, disable pink (see ISAAC_EXCLUDED_EXTS). Vanilla
@@ -572,9 +730,18 @@ fi
 
 sanitize_host_ros_paths_for_isaac
 build_isaac_excluded_ext_args
-if [ "${#ISAAC_KIT_EXTRA_ARGS[@]}" -gt 0 ]; then
+if [ "${#ISAAC_EXCLUDED_EXTS[@]}" -gt 0 ]; then
     print_info "禁用冲突扩展: ${ISAAC_EXCLUDED_EXTS[*]}"
 fi
+build_isaac_setting_args
+if [ "${#ISAAC_KIT_PROFILE_SETTINGS[@]}" -gt 0 ]; then
+    print_info "Kit 预设档位: ${RUN_KIT_PROFILE} -> ${ISAAC_KIT_PROFILE_SETTINGS[*]}"
+fi
+if [ "${#ISAAC_KIT_SETTINGS[@]}" -gt 0 ]; then
+    print_info "Kit 手工覆盖: ${ISAAC_KIT_SETTINGS[*]}"
+fi
+enable_crash_debug
+print_info "kit 额外参数: ${ISAAC_KIT_EXTRA_ARGS[*]:-无}"
 
 cd "${ISAACSIM_DIR}" || { print_error "无法进入目录: ${ISAACSIM_DIR}"; exit 1; }
 
