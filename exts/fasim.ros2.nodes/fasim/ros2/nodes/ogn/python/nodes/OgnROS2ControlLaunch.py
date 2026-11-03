@@ -1796,14 +1796,28 @@ def _install_controller_manager(
             )
         with open(desc_path, encoding="utf-8") as handle:
             urdf_xml = handle.read()
-        topic = state._description_publisher.start(urdf_xml, namespace=namespace)
+        # robot_state_publisher already latches /robot_description
+        # (TRANSIENT_LOCAL) from its ``robot_description`` parameter. Publishing
+        # it a second time from our own node makes the in-process
+        # controller_manager log
+        #   "ResourceManager has already loaded a urdf and is initialized.
+        #    Ignoring attempt to reload a robot description."
+        # once per extra publisher, so only fall back to our own latched
+        # publisher when RSP is not running.
         state.start_robot_state_publisher(
             urdf_xml,
             namespace=namespace,
             use_sim_time=bool(db.inputs.useSimTime),
         )
+        ns_prefix = f"/{namespace.strip('/')}" if namespace.strip("/") else ""
+        if state._rsp_proc is None:
+            state._description_publisher.start(urdf_xml, namespace=namespace)
+            source = "fasim latch (rsp unavailable)"
+        else:
+            source = "robot_state_publisher"
         carb.log_info(
-            f"ROS2ControlLaunch: latched robot_common_launch description on {topic} "
+            f"ROS2ControlLaunch: robot_common_launch description on "
+            f"{ns_prefix}/robot_description via {source} "
             f"({len(urdf_xml)} bytes, enable_gripper={enable_gripper}, "
             f"hw_joints={sorted(hw_joints)})"
         )

@@ -174,6 +174,8 @@ Debug dumps: `/tmp/fasim_synth_urdf_*.urdf`, `/tmp/arms_target_manager_*.yaml`.
 ## 4. ATM / VR frames (`target_manager.yaml`)
 
 ATM is a **host** process (`use_sim_time=false`, nice=10). CM stays on sim time + `/clock`.
+The `ROS=fiveages` payload sets `ReadSimTime.inputs:resetOnStop=1`, so `/clock`
+restarts from 0 on Stop→Play (the topic-bridge variant `ROS=enable` keeps `0`).
 
 Each robot **must** ship `config/ocs2/target_manager.yaml`. Without it, defaults are W2-centric and break other robots:
 
@@ -211,6 +213,7 @@ split_body / demo: use arm `task.info`; markers often stay on footprint/base_lin
 - [ ] robot = unitree_g1d / … OR empty + Robot=fiveages_w2|fiveages_w2r (name == package stem)
 - [ ] enableArmsTargetManager; type empty → EE / EE_Left|Right / Left_Arm|Right_Arm EE → 运控 key (PascalCase→lower except CR5 AG2F*)
 - [ ] Physics=physx pinned; ROS=fiveages; PhysX-only PhysicsScene; /clock if useSimTime
+- [ ] `ROS=fiveages` clock node `resetOnStop=1` (sim time restarts on Stop)
 - [ ] W2 Xhand/Dex EE: mount deletes nested ArtRoot schemas (not only `active=false`)
 - [ ] W2: Linkhou child ROS=enable for DiffDrive; no body JointState↔ArticulationController bridge
 - [ ] target_manager.yaml present for that description package (src + install)
