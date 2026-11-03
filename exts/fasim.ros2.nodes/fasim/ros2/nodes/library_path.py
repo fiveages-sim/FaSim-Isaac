@@ -41,14 +41,30 @@ def ensure_isaac_ros2_library_path() -> str | None:
 
     isaac_lib: str | None = None
     if core_path:
-        isaac_lib = os.path.join(core_path, distro, "lib")
-        if not os.path.isdir(isaac_lib):
-            isaac_lib = None
+        primary = os.path.join(core_path, distro, "lib")
+        if os.path.isdir(primary):
+            isaac_lib = primary
+        else:
             for candidate in ("jazzy", "humble"):
+                if candidate == distro:
+                    continue
                 alt = os.path.join(core_path, candidate, "lib")
                 if os.path.isdir(alt):
                     isaac_lib = alt
+                    carb.log_warn(
+                        "fasim.ros2: isaacsim.ros2.core "
+                        f"'{distro}/lib' not found; using '{candidate}/lib' ({alt}). "
+                        "Controller plugins may load a different ROS distro."
+                    )
                     break
+            if isaac_lib is None:
+                looked = ", ".join(dict.fromkeys((distro, "jazzy", "humble")))
+                carb.log_warn(
+                    "fasim.ros2: no isaacsim.ros2.core lib directory "
+                    f"(tried {looked} under {core_path}). "
+                    "LD_LIBRARY_PATH will omit Isaac ROS libs; "
+                    "controller plugin dlopen may fail (tinyxml2 / libtracetools)."
+                )
 
     overlay: list[str] = []
     underlay: list[str] = []

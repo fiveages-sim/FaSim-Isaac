@@ -9,8 +9,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+
+import yaml
 
 import carb
 import omni.graph.core as og
@@ -938,6 +941,8 @@ class OgnROS2ControlLaunchInternalState:
         self._activate_done = False
         self._activate_t0 = 0.0
         self._description_publisher = RobotDescriptionPublisher()
+        self._rsp_proc: subprocess.Popen | None = None
+        self._rsp_params_path: str = ""
         self._atm_proc: subprocess.Popen | None = None
         self._atm_params_path: str = ""
         self._namespace: str = ""
@@ -971,6 +976,121 @@ class OgnROS2ControlLaunchInternalState:
         self._timeline_sub = stream.create_subscription_to_pop_by_type(
             int(omni.timeline.TimelineEventType.STOP),
             self._on_stop,
+        )
+
+    def stop_robot_state_publisher(self) -> None:
+        proc = self._rsp_proc
+        self._rsp_proc = None
+        params_path = self._rsp_params_path
+        self._rsp_params_path = ""
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            proc.kill()
+                        proc.wait(timeout=2.0)
+                carb.log_info("ROS2ControlLaunch: robot_state_publisher stopped")
+            except Exception as exc:
+                carb.log_warn(f"ROS2ControlLaunch: robot_state_publisher stop failed: {exc}")
+        if params_path:
+            try:
+                os.remove(params_path)
+            except OSError:
+                pass
+
+    def start_robot_state_publisher(
+        self,
+        urdf_xml: str,
+        namespace: str = "",
+        use_sim_time: bool = True,
+    ) -> None:
+        """Publish link TF from the latched xacro, including fixed frames such as eef.
+
+        joint_state_broadcaster already publishes joint states. This node only
+        turns that stream plus the URDF into ``tf`` / ``tf_static``. Isaac keeps
+        ``world → odom → base_footprint``; ``base_footprint → base_link`` and
+        the arm tree come from this publisher.
+        """
+        self.stop_robot_state_publisher()
+        if not (urdf_xml or "").strip():
+            raise RuntimeError("robot_state_publisher: robot_description is empty")
+
+        ns = (namespace or "").strip().strip("/")
+        node_name = f"robot_state_publisher_{ns}" if ns else "robot_state_publisher"
+        params = {
+            "/**": {
+                "ros__parameters": {
+                    "robot_description": urdf_xml,
+                    "publish_frequency": 100.0,
+                    "use_tf_static": True,
+                    "use_sim_time": bool(use_sim_time),
+                }
+            }
+        }
+        fd, params_path = tempfile.mkstemp(
+            prefix=f"robot_state_publisher_{ns or 'global'}_", suffix=".yaml"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(params, handle, sort_keys=False, allow_unicode=True)
+        self._rsp_params_path = params_path
+
+        env = os.environ.copy()
+        setup = _resolve_ros_setup(self._ros_setup, env)
+        ros_args = [
+            "--ros-args",
+            "-r",
+            f"__node:={node_name}",
+        ]
+        if ns:
+            ros_args.extend(["-r", f"__ns:=/{ns}"])
+        # tf2 broadcasters publish absolute /tf. Remap onto this robot's tree.
+        ros_args.extend(
+            [
+                "-r",
+                "/tf:=tf",
+                "-r",
+                "/tf_static:=tf_static",
+                "-r",
+                "/joint_states:=joint_states",
+                "--params-file",
+                shlex.quote(params_path),
+                "-p",
+                f"use_sim_time:={'true' if use_sim_time else 'false'}",
+            ]
+        )
+        inner = "exec ros2 run robot_state_publisher robot_state_publisher " + " ".join(
+            ros_args
+        )
+        if setup:
+            _prepare_host_ros_env(env)
+            cmd = ["bash", "-c", f'source "{setup}" && {inner}']
+        else:
+            cmd = ["bash", "-c", inner]
+
+        try:
+            self._rsp_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception:
+            self.stop_robot_state_publisher()
+            raise
+        carb.log_info(
+            f"ROS2ControlLaunch: robot_state_publisher host pid={self._rsp_proc.pid} "
+            f"(ns={ns or '(global)'}, node={node_name}, use_sim_time={use_sim_time}) "
+            f"params={params_path}"
         )
 
     def stop_arms_target_manager(self) -> None:
@@ -1075,6 +1195,7 @@ class OgnROS2ControlLaunchInternalState:
         # Bump the generation before kill so a late communicate() cannot publish
         # its payload into the next Play.
         self.cancel_emit()
+        self.stop_robot_state_publisher()
         self.stop_arms_target_manager()
         self._description_publisher.stop()
         if self._prim_path:
@@ -1450,6 +1571,7 @@ def _poll_activation(db: og.Database, state: OgnROS2ControlLaunchInternalState) 
             f"ROS2ControlLaunch activate failed for {state._prim_path!r} "
             f"in {elapsed:.2f}s: {state._activate_error}"
         )
+        state.stop_robot_state_publisher()
         state.stop_arms_target_manager()
         state._description_publisher.stop()
         if state._prim_path:
@@ -1474,6 +1596,7 @@ def _poll_activation(db: og.Database, state: OgnROS2ControlLaunchInternalState) 
             carb.log_error(
                 f"ROS2ControlLaunch: arms_target_manager spawn failed: {exc}"
             )
+            state.stop_robot_state_publisher()
             state.stop_arms_target_manager()
             state._description_publisher.stop()
             if state._prim_path:
@@ -1674,6 +1797,11 @@ def _install_controller_manager(
         with open(desc_path, encoding="utf-8") as handle:
             urdf_xml = handle.read()
         topic = state._description_publisher.start(urdf_xml, namespace=namespace)
+        state.start_robot_state_publisher(
+            urdf_xml,
+            namespace=namespace,
+            use_sim_time=bool(db.inputs.useSimTime),
+        )
         carb.log_info(
             f"ROS2ControlLaunch: latched robot_common_launch description on {topic} "
             f"({len(urdf_xml)} bytes, enable_gripper={enable_gripper}, "
@@ -1722,6 +1850,7 @@ def _harvest_emit(db: og.Database, state: OgnROS2ControlLaunchInternalState) -> 
         action = _install_controller_manager(db, state, payload, prim_path)
     except Exception as exc:
         carb.log_error(f"ROS2ControlLaunch setup failed for {prim_path!r}: {exc}")
+        state.stop_robot_state_publisher()
         state.stop_arms_target_manager()
         state._description_publisher.stop()
         # Always tear down the intended prim — setup may have failed before

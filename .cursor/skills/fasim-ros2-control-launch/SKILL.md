@@ -227,14 +227,14 @@ Same string on **all** of: `ROS2ControlLaunch.inputs:namespace`, DiffDrive/odom 
 |------|--------|
 | Business topics | Relative only — never leading `/`. Robot-level: `fsm_command`/`cmd_vel`/`robot_description`. Controller-private: keep name → `controller_name + "/waist_*"` / `"/target_command"` (→ `/<ns>/<ctrl>/…`) |
 | Global OK | `/clock`, `/parameter_events`, `/diagnostics`; VR headset `/teleop/*` may stay global |
-| TF | Per-robot `/<ns>/tf` (+ static). Do **not** merge fleets onto one `/tf`. Frame names may stay `base_link` |
+| TF | Per-robot `/<ns>/tf` (+ static). Do **not** merge fleets onto one `/tf`. Frame names may stay `base_link`. Isaac publishes `world → odom → base_footprint` only. `robot_state_publisher` (spawned with the latched xacro) publishes `base_footprint → base_link` and the arm/eef tree, including fixed frames such as `right_eef` |
 | `world→odom` | **Play-first latch** of chassis world pose (`LatchWorld2Odom`). Spawn G1D at **z=0**. Not every-frame current base. **Must re-latch on Stop→Play** via simTime rewind / frame drop / (`odom≈0` + hub jumped >10cm); settle ~5 ticks. ScriptNode `setup()` does not re-run — without this, TF sticks after moving ArtRoot while Stopped. Reload ROS payload after editing |
 | `odom→*` | `IsaacComputeOdometry` **relative** displacement from Play (`/odom` + `odom→base_footprint`) |
 | WBC `tf_topic` | Must be relative `tf` (→ `/<ns>/tf`), **not** absolute `/tf`. Otherwise activate probe misses Isaac TF and disables unlocked-base planning |
 | Chassis topics | Payload `topicName` = relative `cmd_vel` / `odom` (+ `nodeNamespace`) |
 | ATM | Node `arms_target_manager_<ns>` under `/<ns>`; spawn also remaps `/tf:=tf` and `/tf_static:=tf_static` (TransformListener ignores `__ns` for absolute `/tf`) |
 | RViz / tf2 CLI | Default listens `/tf`. Use `ros2 run tf2_ros tf2_echo world base_link --ros-args -r /tf:=/g1d/tf -r /tf_static:=/g1d/tf_static` (or RViz TF topic remaps). Empty `/tf` with ns enabled ≠ missing Isaac TF |
-| Helper nodes | Same short name under ns prefix: `/<ns>/fasim_robot_description`, `/<ns>/fasim_ros2_control_launch` |
+| Helper nodes | Same short name under ns prefix: `/<ns>/fasim_robot_description`, `/<ns>/fasim_ros2_control_launch`, `/<ns>/robot_state_publisher` (or `robot_state_publisher_<ns>`). RSP remaps `/tf:=tf` and `/tf_static:=tf_static` |
 
 Dual room acceptance (`environment/.../G1D/dual/room.usda`, ATM off OK):
 

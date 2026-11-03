@@ -170,18 +170,23 @@ def activate_controllers(controllers: Iterable[str], namespace: str = "") -> Non
 
     started = time.monotonic()
     ns = _ns(namespace)
-    context = rclpy.Context()
-    rclpy.init(context=context, args=None)
-    # Same short name; uniqueness via namespace → /<ns>/fasim_ros2_control_launch
-    node = rclpy.create_node(
-        "fasim_ros2_control_launch",
-        context=context,
-        namespace=ns or "",
-    )
-    executor = SingleThreadedExecutor(context=context)
-    executor.add_node(node)
-    cm = _cm_name(namespace)
+    # Assigned before try so a failure in init / create_node / executor
+    # still reaches finally without NameError, and does not leak the context.
+    context = None
+    node = None
+    executor = None
     try:
+        context = rclpy.Context()
+        rclpy.init(context=context, args=None)
+        # Same short name; uniqueness via namespace → /<ns>/fasim_ros2_control_launch
+        node = rclpy.create_node(
+            "fasim_ros2_control_launch",
+            context=context,
+            namespace=ns or "",
+        )
+        executor = SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        cm = _cm_name(namespace)
         list_client = node.create_client(ListControllers, f"{cm}/list_controllers")
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline and not list_client.service_is_ready():
@@ -215,8 +220,26 @@ def activate_controllers(controllers: Iterable[str], namespace: str = "") -> Non
         )
 
     finally:
-        executor.remove_node(node)
-        node.destroy_node()
-        executor.shutdown()
-        if context.ok():
-            rclpy.shutdown(context=context)
+        # Each step is isolated so a cleanup error cannot mask the original
+        # exception or skip the remaining teardown.
+        if executor is not None and node is not None:
+            try:
+                executor.remove_node(node)
+            except Exception as exc:
+                carb.log_warn(f"fasim.ros2: activate cleanup remove_node failed: {exc}")
+        if node is not None:
+            try:
+                node.destroy_node()
+            except Exception as exc:
+                carb.log_warn(f"fasim.ros2: activate cleanup destroy_node failed: {exc}")
+        if executor is not None:
+            try:
+                executor.shutdown()
+            except Exception as exc:
+                carb.log_warn(f"fasim.ros2: activate cleanup executor.shutdown failed: {exc}")
+        if context is not None:
+            try:
+                if context.ok():
+                    rclpy.shutdown(context=context)
+            except Exception as exc:
+                carb.log_warn(f"fasim.ros2: activate cleanup rclpy.shutdown failed: {exc}")

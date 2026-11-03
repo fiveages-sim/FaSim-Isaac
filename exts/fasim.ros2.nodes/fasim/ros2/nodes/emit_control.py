@@ -414,7 +414,7 @@ def emit(args: argparse.Namespace) -> dict:
         launch_configurations=launch_configurations,
         robot_profile=profile_path or None,
     )
-    if not robot_description:
+    if not isinstance(robot_description, str) or not robot_description.strip():
         raise RuntimeError(
             f"get_ros2_control_robot_description returned empty for '{robot_name}' "
             f"(type={robot_type!r}, hardware={hardware!r})"
