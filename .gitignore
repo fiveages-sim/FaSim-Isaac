@@ -43,3 +43,7 @@ environment/ArtVIP/
 environment/artvip-usd/ArtVIP/
 environment/labutopia-usd/LabUtopia/
 
+
+# robot_action_composer / motion-generation 运行状态（在 project usd 目录内启动时产生）
+.motion_last.json
+.ros2_stack/

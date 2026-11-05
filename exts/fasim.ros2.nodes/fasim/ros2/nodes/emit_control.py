@@ -405,7 +405,13 @@ def emit(args: argparse.Namespace) -> dict:
         raise RuntimeError(f"Planning URDF missing: {plan_path}")
 
     _deep_set_params(config, main_controller, planning_urdf_params)
+    # Isaac: reuse CppAD cache; YAML still overrides info, true forces rebuild.
+    _deep_set_params(config, main_controller, {"recompile_libraries": False})
     print(f"[INFO] OCS2 planning URDF: {plan_path}", file=sys.stderr)
+    print(
+        f"[INFO] Isaac: {main_controller}.recompile_libraries=false",
+        file=sys.stderr,
+    )
 
     robot_description = get_ros2_control_robot_description(
         robot_name,

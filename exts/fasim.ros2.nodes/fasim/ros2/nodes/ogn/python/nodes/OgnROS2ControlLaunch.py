@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import shutil
@@ -21,6 +22,12 @@ import omni.timeline
 from isaacsim.ros2.control import Ros2ControlManager
 
 from fasim.ros2.nodes.activate import activate_controllers
+from fasim.ros2.nodes.host_ros import (
+    find_workspace_setup,
+    prepare_host_ros_env,
+    resolve_ros_setup,
+    signal_process_group,
+)
 from fasim.ros2.nodes.library_path import ensure_isaac_ros2_library_path
 from fasim.ros2.nodes.publish_description import RobotDescriptionPublisher
 
@@ -776,7 +783,12 @@ def _fix_synth_urdf(stage, target_path: str, urdf_xml: str) -> tuple[str, list[s
 
     # 4) urdfdom rejects lower/upper=-inf (caster/wheel unlimited revolute). Isaac's
     #    _fix_joint_limits sometimes leaves them; convert ±inf revolute → continuous.
-    sanitized = _sanitize_urdf_joint_limits(root)
+    #    Velocity limits missing from the exporter are taken from the USD cap
+    #    (``physxJoint:maxJointVelocity``, deg/s) instead of a blanket 10 rad/s, so
+    #    the controller sees the same limit the physics engine enforces.
+    sanitized = _sanitize_urdf_joint_limits(
+        root, velocity_by_joint=_usd_joint_velocity_limits(stage, target_path)
+    )
     if sanitized:
         injected.extend(sanitized)
         carb.log_info(
@@ -817,9 +829,57 @@ def _finite_limit(value: str | None) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _sanitize_urdf_joint_limits(root) -> list[str]:
+def _usd_joint_velocity_limits(stage, target_path: str) -> dict[str, float]:
+    """``joint name -> max velocity in rad/s`` from USD ``physxJoint:maxJointVelocity``.
+
+    The attribute is authored in **degrees/second** (PhysX and Newton both read it
+    that way), so revolute/continuous values are converted. Prismatic joints are
+    skipped: the same attribute is linear there and the URDF/description value is
+    authoritative.
+    """
+    limits: dict[str, float] = {}
+    if stage is None:
+        return limits
+    try:
+        from pxr import Usd, UsdPhysics
+
+        # Joints may be siblings of the ArtRoot (W2: ``…/FiveAges_W2/joints``), so
+        # walk the same scope the synth uses instead of the ArtRoot prim alone.
+        scope_path = _synth_joint_scope_path(stage, target_path)
+        root = stage.GetPrimAtPath(scope_path)
+        if not root or not root.IsValid():
+            return limits
+        for prim in Usd.PrimRange(root):
+            attr = prim.GetAttribute("physxJoint:maxJointVelocity")
+            if not attr or not attr.HasAuthoredValue():
+                continue
+            if prim.IsA(UsdPhysics.PrismaticJoint):
+                continue
+            try:
+                value = float(attr.Get())
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0:
+                continue
+            limits.setdefault(prim.GetName(), value / 57.29577951308232)
+        if limits:
+            sample = ", ".join(f"{name}={vel:.3g}" for name, vel in list(limits.items())[:6])
+            carb.log_info(
+                f"ROS2ControlLaunch: USD joint velocity limits ({len(limits)} joints, rad/s): "
+                f"{sample}{' ...' if len(limits) > 6 else ''}"
+            )
+    except Exception as exc:  # pxr unavailable / malformed stage
+        carb.log_warn(f"ROS2ControlLaunch: USD joint velocity limits unavailable: {exc}")
+    return limits
+
+
+def _sanitize_urdf_joint_limits(
+    root, velocity_by_joint: dict[str, float] | None = None
+) -> list[str]:
     """Make joint <limit> parseable by urdfdom; prefer continuous for free spin.
 
+    ``velocity_by_joint`` (rad/s) supplies the velocity limit for joints whose
+    exporter output has none; joints with a finite authored value keep it.
     Returns short labels of joints that were changed (for logging).
     """
     import math
@@ -872,7 +932,12 @@ def _sanitize_urdf_joint_limits(root) -> list[str]:
         if _finite_limit(limit.get("effort")) is None:
             limit.set("effort", "1000.0")
         if _finite_limit(limit.get("velocity")) is None:
-            limit.set("velocity", "10.0")
+            usd_velocity = (velocity_by_joint or {}).get(name)
+            if usd_velocity is not None and jtype in ("revolute", "continuous"):
+                limit.set("velocity", f"{usd_velocity:.6g}")
+                changed.append(f"{name}.velocity={usd_velocity:.3g}")
+            else:
+                limit.set("velocity", "10.0")
 
     return changed
 
@@ -1021,6 +1086,9 @@ class OgnROS2ControlLaunchInternalState:
         the arm tree come from this publisher.
         """
         self.stop_robot_state_publisher()
+        # A previous Isaac session that was closed/killed leaves its publisher
+        # holding a DDS participant; reap it before adding ours.
+        _kill_orphan_robot_state_publishers(namespace)
         if not (urdf_xml or "").strip():
             raise RuntimeError("robot_state_publisher: robot_description is empty")
 
@@ -1325,45 +1393,67 @@ class OgnROS2ControlLaunchInternalState:
 
 
 def _find_workspace_setup(ament_prefix_path: str) -> str:
-    """Return install/setup.bash from the first non-/opt/ros ament prefix."""
-    for prefix in (ament_prefix_path or "").split(":"):
-        prefix = prefix.strip().rstrip("/")
-        if not prefix or prefix.startswith("/opt/ros"):
-            continue
-        parent = os.path.dirname(prefix)
-        for candidate in (
-            os.path.join(prefix, "setup.bash"),
-            os.path.join(parent, "setup.bash") if os.path.basename(parent) == "install" else "",
-        ):
-            if candidate and os.path.isfile(candidate):
-                return candidate
-    return ""
+    """Deprecated alias; see :func:`fasim.ros2.nodes.host_ros.find_workspace_setup`."""
+    return find_workspace_setup(ament_prefix_path)
 
 
 def _resolve_ros_setup(ros_setup: str, env: dict) -> str:
-    setup = (ros_setup or "").strip()
-    if setup and os.path.isfile(setup):
-        return setup
-    return _find_workspace_setup(env.get("AMENT_PREFIX_PATH", ""))
+    """Deprecated alias; see :func:`fasim.ros2.nodes.host_ros.resolve_ros_setup`."""
+    return resolve_ros_setup(ros_setup, env)
 
 
 def _prepare_host_ros_env(env: dict) -> None:
-    """Reset path vars so ``source install/setup.bash`` rebuilds overlay order.
+    """Deprecated alias; see :func:`fasim.ros2.nodes.host_ros.prepare_host_ros_env`."""
+    prepare_host_ros_env(env)
 
-    Kit launchers strip ``/opt/ros`` from AMENT (pinocchio/Kit NumPy crash), then
-    leave a *partial* prefix list. Re-sourcing setup.bash on top of that can
-    insert ``/opt/ros`` *before* some workspace packages. A stub
-    ``/opt/ros/.../share/component_models`` (no ``xacro/``) then shadows the real
-    ros2_ws package and ``get_ros2_control_robot_description`` returns empty.
-    Clearing these lets colcon rebuild workspace-first, underlay-last.
+
+def _proc_parent_name(ppid: int) -> str:
+    try:
+        with open(f"/proc/{ppid}/comm", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _kill_orphan_robot_state_publishers(namespace: str) -> None:
+    """Kill robot_state_publisher trees left behind by a closed Isaac session.
+
+    Closing the window / killing Kit skips the timeline STOP handler, so the host
+    ``ros2 run robot_state_publisher`` keeps its CycloneDDS participant. Enough
+    leaks and new nodes fail with "Failed to find a free participant index for
+    domain 0". Only orphans (reparented to init/systemd) are touched.
     """
-    for key in (
-        "PYTHONPATH",
-        "AMENT_PREFIX_PATH",
-        "COLCON_PREFIX_PATH",
-        "CMAKE_PREFIX_PATH",
-    ):
-        env.pop(key, None)
+    marker = f"robot_state_publisher_{namespace or 'global'}_"
+    killed: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+                stat_line = handle.read()
+            ppid = int(stat_line.rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        if ppid != 1 and _proc_parent_name(ppid) not in ("systemd", "init"):
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                cmdline = handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "robot_state_publisher" not in cmdline or marker not in cmdline:
+            continue
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        killed.append(pid)
+    if killed:
+        carb.log_warn(
+            "ROS2ControlLaunch: killed orphan robot_state_publisher from a previous session: "
+            + ", ".join(str(pid) for pid in killed)
+        )
 
 
 def _emit_cache_dir() -> str:
@@ -1378,16 +1468,8 @@ def _emit_cache_dir() -> str:
 
 
 def _signal_process_group(proc: subprocess.Popen) -> None:
-    """SIGTERM the emit_control process group. The waiter reaps it via communicate()."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+    """Deprecated alias; see :func:`fasim.ros2.nodes.host_ros.signal_process_group`."""
+    signal_process_group(proc)
 
 
 def _parse_emit_result(returncode: int, stdout: str, stderr: str) -> dict:

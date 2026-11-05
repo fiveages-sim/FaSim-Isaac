@@ -1,8 +1,8 @@
 [package]
-version = "0.1.0"
+version = "0.1.1"
 category = "Simulation"
-title = "FaSim ROS 2 Control Launch"
-description = "OmniGraph node that merges quick-start ros2_control YAML and brings up Isaac's in-process ControllerManager."
+title = "FaSim ROS 2 Control / Navigation Launch"
+description = "OmniGraph nodes that bring up Isaac's in-process ControllerManager (ROS2ControlLaunch) and host Nav2 (NavigationLaunch)."
 authors = ["FiveAges"]
 keywords = ["isaac", "omnigraph", "ros2", "ros2_control"]
 

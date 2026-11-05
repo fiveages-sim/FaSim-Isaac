@@ -24,8 +24,10 @@ the **node + synth + ATM** playbook from G1/G1D bring-up.
 | OGN | `exts/fasim.ros2.nodes/.../OgnROS2ControlLaunch.ogn` |
 | Node | `.../OgnROS2ControlLaunch.py` (`_fix_synth_urdf`, ATM spawn) |
 | Emit | `exts/fasim.ros2.nodes/.../emit_control.py` |
+| Host helpers | `fasim/ros2/nodes/host_ros.py` (setup.bash resolve, env reset, process group) |
+| Nav OGN | `.../OgnNavigationLaunch.ogn` + `OgnNavigationLaunch.py` (Nav2 on Play) |
 | Robot YAML | `<robot>_description/config/ros2_control/` + `config/ocs2/` |
-| Env wiring | `robots/**/payloads/ROS/fiveages.usda` → Graph `ROS2ControlLaunch` |
+| Env wiring | `robots/**/payloads/ROS/fiveages.usda` → Graph `ROS2ControlLaunch` / `ROS_Navigation` |
 
 ## 1. `targetPrim` = ArticulationRoot PhysX can see
 
@@ -171,6 +173,8 @@ After Python changes: reload extension or restart Kit.
 
 Debug dumps: `/tmp/fasim_synth_urdf_*.urdf`, `/tmp/arms_target_manager_*.yaml`.
 
+`emit_control` injects `recompile_libraries: false` on the main OCS2 controller so Isaac reuses CppAD caches under `/tmp/ocs2_ros2/...` (set `true` or clear the cache after model/constraint changes).
+
 ## 4. ATM / VR frames (`target_manager.yaml`)
 
 ATM is a **host** process (`use_sim_time=false`, nice=10). CM stays on sim time + `/clock`.
@@ -276,8 +280,45 @@ Dual room acceptance (`environment/.../G1D/dual/room.usda`, ATM off OK):
 | apt `libocs2_*.so` shadows workspace (pinocchio SONAME mismatch) | Overlay-first LD; or remove apt ocs2 packages. Workspace sourced ⇒ its `install/*/lib` must precede `/opt/ros/*/lib` |
 | W2 `inputs:robot` empty + `Robot=none` | Set `Robot=fiveages_w2` or `fiveages_w2r`, or hardcode `inputs:robot` |
 
+## 关节限速：URDF ↔ USD 对齐
+
+- `physxJoint:maxJointVelocity` 的单位是 **deg/s**（PhysX 与 Newton 都这么读）：`68.754931` = 1.2 rad/s、`572.9578` = 10 rad/s、`359.81747` = 6.28 rad/s。
+- in-process CM 合成 URDF 时，导出器缺 velocity 的关节**不再统一填 10 rad/s**，而是读
+  `physxJoint:maxJointVelocity`（deg/s → rad/s）；prismatic 跳过（该属性在线性关节是 m/s）。
+  日志：`sanitized non-finite joint limits: head_joint1.velocity=1.2, ...`。
+- 关节可能挂在 ArtRoot 的**兄弟** scope（W2：`…/FiveAges_W2/joints`），所以取限速要遍历
+  `_synth_joint_scope_path()` 返回的根，而不是 ArtRoot prim 本身。
+- 想让运控侧和仿真一致，先确认 USD 里给到了 cap；没写就退回默认 10 rad/s。
+
 ## Related
 
 - `USDA-OCS2-PhysX-Mujoco` — articulation / Physics variants / DiffDrive
 - `fasim-dexhand-asset` — EE Assembler + PhysX hand baseline
 - robot_common_launch: `prepare_arms_target_manager_parameters`, `parse_task_info`
+
+## 8. NavigationLaunch (Nav2 on Play)
+
+`fasim.ros2.nodes.NavigationLaunch` mirrors the control node for navigation:
+
+| | |
+|---|---|
+| Graph | `Graph/ROS_Navigation/NavigationLaunch` in `payloads/ROS/fiveages.usda`, `enabled=0` by default |
+| Command | `ros2 launch <launchPackage> <launchFile> map:=<abs> nav2_profile:=… scan_topic:=… odom_topic:=… use_sim_time:=… use_rviz:=… publish_map_world_tf:=…` |
+| Map | `inputs:map` 是 **string** 路径（不是 USD asset）：绝对路径直用，相对路径按打开的 env 层（root layer）解析，所以 `env/` 里写 `../../maps/<name>/map.yaml` 就指到项目目录 |
+| Lifecycle | `compute-on-request`; spawns a process group, SIGTERM on timeline STOP, re-launches on next Play |
+| Logs | `inputs:logFile`, else `<map dir>/nav2.log` |
+
+Rules that bite:
+
+- **新增/修改 `.ogn` 后必须让 OmniGraph 重新生成节点接口**：生成结果缓存在
+  `~/.cache/ov/ogn_generated/<graph 版本>/<ext名>-<ext版本>/`，**按扩展版本做 key**。
+  只改 `.ogn` 不改 `config/extension.toml` 的 `version` 时，Kit 会用旧缓存，报
+  `Could not find node type interface for 'fasim.ros2.nodes.NavigationLaunch'`。
+  做法：改版本号（或删掉该缓存目录），然后重启 Isaac Sim。
+
+- Pass **only** arguments the launch file declares (`navigation_isaac_gt.launch.py` rejects unknown `k:=v`). Extra args go through `inputs:extraArgs`, space separated.
+- `map->world` is a fixed identity TF in that launch: the occupancy map must be drawn in USD world coordinates. Otherwise add your own offset TF and set `publish_map_world_tf=0`.
+- Nav2 needs `/clock`; `ROS=fiveages` already publishes it (`PublishClock` in `ROS_Control`). Keep `use_sim_time=1`.
+- `ROS=fiveages` also pushes chassis `ROS=enable`, which owns `cmd_vel` / `/odom` / `world→odom→base_footprint`; do not start a second odom source.
+- `robot` empty → node reads the `Robot` variant from `targetPrim` ancestors (`robot` legacy alias → `fiveages_w2`).
+
