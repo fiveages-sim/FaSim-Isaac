@@ -1502,6 +1502,7 @@ def _build_emit_popen_args(
     right_type: str = "",
     enable_arms_target_manager: bool = True,
     arms: str = "",
+    info_file: str = "",
 ) -> tuple[list[str], dict]:
     """Build the host command for emit_control. Does not start the process.
 
@@ -1531,6 +1532,8 @@ def _build_emit_popen_args(
         "--arms",
         arms or "",
     ]
+    if info_file:
+        args.extend(["--info-file", info_file])
     if profile:
         args.extend(["--profile", profile])
     if update_rate and int(update_rate) > 0:
@@ -1627,6 +1630,7 @@ def _kick_emit(db: og.Database, state: OgnROS2ControlLaunchInternalState) -> boo
             right_type=right_type,
             enable_arms_target_manager=enable_atm,
             arms=arms,
+            info_file=str(getattr(db.inputs, "infoFile", "") or "").strip(),
         )
         state.launch_emit(cmd, env)
     except Exception as exc:

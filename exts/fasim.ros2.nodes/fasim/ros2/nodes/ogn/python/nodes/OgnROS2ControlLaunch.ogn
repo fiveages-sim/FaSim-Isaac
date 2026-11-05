@@ -71,6 +71,11 @@
                 "type": "string",
                 "default": "",
                 "description": "robot_common_launch arms xacro key (e.g. piper, h, l, x). Empty: use robot xacro default arms."
+            },
+            "infoFile": {
+                "type": "string",
+                "default": "",
+                "description": "Override the OCS2 .info basename for the main controller. Set 'fixed_base_tcp' in full_body mode to drop the virtual chassis DOFs so WBC plans body+arms only (base stops drifting). Empty: robot description default (e.g. mobile_base_tcp)."
             }
         },
         "outputs": {

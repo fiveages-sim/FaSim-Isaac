@@ -79,6 +79,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="robot_common_launch arms xacro key (e.g. piper, h, l, x). Empty: xacro default.",
     )
     parser.add_argument(
+        "--info-file",
+        default="",
+        dest="info_file",
+        help=(
+            "Override the OCS2 .info basename used by the main controller "
+            "(e.g. fixed_base_tcp disables chassis planning in full_body). "
+            "Empty keeps the robot description default."
+        ),
+    )
+    parser.add_argument(
         "--cache-dir",
         default="",
         help=(
@@ -373,6 +383,39 @@ def emit(args: argparse.Namespace) -> dict:
     )
     if not config:
         raise RuntimeError(f"No ros2_control config for robot '{robot_name}'")
+
+    # Optional override: point the main controller at a different OCS2 .info.
+    # ``fixed_base_tcp`` (manipulatorModelType 0) removes the virtual chassis DOFs,
+    # so WBC plans body/arms only and the base no longer drifts.
+    info_override = str(getattr(args, "info_file", "") or "").strip()
+    if info_override:
+        target_ctrl = "ocs2_wbc_controller" if mode == "full_body" else "ocs2_arm_controller"
+        section = config.get(target_ctrl)
+        if not isinstance(section, dict):
+            print(
+                f"[WARN] --info-file given but config has no {target_ctrl!r} section",
+                file=sys.stderr,
+            )
+        else:
+            params = section.setdefault("ros__parameters", {})
+            prev = params.get("info_file_name")
+            params["info_file_name"] = info_override
+            print(
+                f"[INFO] OCS2 info override: {target_ctrl}.info_file_name "
+                f"{prev!r} -> {info_override!r}",
+                file=sys.stderr,
+            )
+            # 固定基座 info 与 BASE_LOCK 是两套不同的机制，混用会把控制器搞成
+            # 「没有底盘自由度却收到锁底盘命令」，表现为 arm enable 永不释放。
+            if "fixed_base" in info_override and mode == "full_body":
+                print(
+                    "[WARN] full_body + fixed_base info: 规划里没有虚拟底盘自由度 "
+                    "(basePlan=0)，运行时的 BASE_LOCK 将无所约束，且 MPC 容易输出"
+                    "无法收敛的关节速度导致 LEFT/RIGHT_ARM_ENABLE 卡在 "
+                    "WAITING_FOR_ENABLE_POLICY。如果只是想锁底盘，请用 "
+                    "mobile_base_tcp + BASE_LOCK。",
+                    file=sys.stderr,
+                )
 
     if mode in ("demo", "split_body"):
         main_controller = "ocs2_arm_controller"
