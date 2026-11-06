@@ -60,7 +60,7 @@
             "useSimTime": {
                 "type": "bool",
                 "default": true,
-                "description": "Set use_sim_time on the ControllerManager. Requires /clock from ROS2PublishClock."
+                "description": "use_sim_time for ControllerManager / robot_state_publisher. hardware=isaac_sim always forces true (needs /clock from ROS2PublishClock); false is ignored with a warning."
             },
             "enableArmsTargetManager": {
                 "type": "bool",

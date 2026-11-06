@@ -96,6 +96,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Empty disables the cache. Hits print the cached JSON and skip xacro."
         ),
     )
+    parser.add_argument(
+        "--isaac-prim-path",
+        default="",
+        help=(
+            "USD ArticulationRoot path for isaacsim_ros2_control/IsaacSimSystem "
+            "(xacro arg isaac_prim_path). Required for FaSim in-process CM."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -334,13 +342,23 @@ def emit(args: argparse.Namespace) -> dict:
     profile_path = (args.profile or "").strip()
     enable_gripper = _as_bool(args.enable_gripper)
     enable_body = _as_bool(args.enable_body)
-    hardware = "isaac"
+    # In-process CM: IsaacSimSystem in xacro (not TopicBased / not USD synth).
+    hardware = "isaac_sim"
+    # Reuse existing config/ros2_control/isaac.yaml overlays when present.
+    hardware_yaml = "isaac"
+    isaac_prim_path = (getattr(args, "isaac_prim_path", None) or "").strip()
+    if not isaac_prim_path:
+        raise RuntimeError(
+            "emit_control --isaac-prim-path is required for hardware=isaac_sim "
+            "(ArticulationRoot for IsaacSimSystem)"
+        )
 
     arms = (getattr(args, "arms", None) or "").strip()
     launch_configurations: dict[str, str] = {
         "robot": robot_name,
         "type": robot_type,
         "hardware": hardware,
+        "isaac_prim_path": isaac_prim_path,
     }
     if left_type:
         launch_configurations["left_type"] = left_type
@@ -379,7 +397,7 @@ def emit(args: argparse.Namespace) -> dict:
         control_right=control_right,
         control_patch=control_patch,
         robot_variant=robot_variant,
-        hardware=hardware,
+        hardware=hardware_yaml,
     )
     if not config:
         raise RuntimeError(f"No ros2_control config for robot '{robot_name}'")
@@ -468,6 +486,24 @@ def emit(args: argparse.Namespace) -> dict:
             f"get_ros2_control_robot_description returned empty for '{robot_name}' "
             f"(type={robot_type!r}, hardware={hardware!r})"
         )
+    if "isaacsim_ros2_control/IsaacSimSystem" not in robot_description:
+        raise RuntimeError(
+            f"robot_description for '{robot_name}' is missing IsaacSimSystem "
+            f"(hardware={hardware!r}, prim={isaac_prim_path!r}). "
+            "Update the robot's ros2_control xacro to use simulation_hardware_plugin "
+            "with isaac_sim."
+        )
+    if f"<param name=\"prim_path\">{isaac_prim_path}</param>" not in robot_description:
+        # xacro may pretty-print; accept either form.
+        if isaac_prim_path not in robot_description:
+            raise RuntimeError(
+                f"robot_description missing isaac_prim_path={isaac_prim_path!r}"
+            )
+    print(
+        f"[INFO] IsaacSimSystem robot_description ready prim={isaac_prim_path!r} "
+        f"({len(robot_description)} bytes)",
+        file=sys.stderr,
+    )
 
     activate = ["joint_state_broadcaster", main_controller]
     hand_controllers: list[str] = []
@@ -626,7 +662,7 @@ def emit(args: argparse.Namespace) -> dict:
 
 
 # Bump when the cached payload schema or the fingerprint inputs change.
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 
 # Mesh/texture blobs do not change the xacro text emit writes. Skipping them
 # keeps the per-hit fingerprint walk well under the xacro it replaces.
@@ -747,6 +783,7 @@ def _cache_key(args: argparse.Namespace) -> str:
                 getattr(args, "enable_arms_target_manager", "true")
             ),
             "arms": (getattr(args, "arms", "") or "").strip(),
+            "isaac_prim_path": (getattr(args, "isaac_prim_path", "") or "").strip(),
             "profile": profile_info,
         },
         "prefixes": prefixes,

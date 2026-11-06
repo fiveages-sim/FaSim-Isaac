@@ -1502,6 +1502,7 @@ def _build_emit_popen_args(
     right_type: str = "",
     enable_arms_target_manager: bool = True,
     arms: str = "",
+    isaac_prim_path: str = "",
     info_file: str = "",
 ) -> tuple[list[str], dict]:
     """Build the host command for emit_control. Does not start the process.
@@ -1531,6 +1532,8 @@ def _build_emit_popen_args(
         "true" if enable_arms_target_manager else "false",
         "--arms",
         arms or "",
+        "--isaac-prim-path",
+        isaac_prim_path or "",
     ]
     if info_file:
         args.extend(["--info-file", info_file])
@@ -1630,6 +1633,7 @@ def _kick_emit(db: og.Database, state: OgnROS2ControlLaunchInternalState) -> boo
             right_type=right_type,
             enable_arms_target_manager=enable_atm,
             arms=arms,
+            isaac_prim_path=prim_path,
             info_file=str(getattr(db.inputs, "infoFile", "") or "").strip(),
         )
         state.launch_emit(cmd, env)
@@ -1704,13 +1708,13 @@ def _install_controller_manager(
     payload: dict,
     prim_path: str,
 ) -> str | None:
-    """Synth URDF and register the in-process ControllerManager.
+    """Register the in-process ControllerManager from emit's xacro description.
 
-    Returns ``"reemit"`` when the USD has no EE joints but emit ran with
-    ``enable_gripper=true`` (the YAML would advertise joints the HW does not
-    have). Returns None after a successful setup. Raises on failure.
-    Synth and ``Ros2ControlManager.setup`` stay on the caller thread: USD and
-    the ``build_full_urdf`` monkey-patch are not safe to run concurrently.
+    Prefer the description package's ``isaac_sim`` / IsaacSimSystem block over
+    Isaac's live USD→URDF synth (UsdToUrdfConverter mesh export is ~tens of
+    seconds on W2). Returns ``"reemit"`` when the USD has no EE joints but emit
+    ran with ``enable_gripper=true``. ``Ros2ControlManager.setup`` stays on the
+    caller thread: the ``build_full_urdf`` monkey-patch is not concurrency-safe.
     """
     setup_t0 = time.monotonic()
     _robot_type, _left, _right, enable_gripper = _resolve_ee_launch_types(
@@ -1727,45 +1731,72 @@ def _install_controller_manager(
     stage = omni.usd.get_context().get_stage()
     if stage is None:
         raise RuntimeError("no active USD stage")
-    # Keep setup/createArticulationView on ArtRoot (prim_path). Expand synth
-    # export scope to the robot Xform when DOFs are siblings (W2 base_link).
-    synth_scope = _synth_joint_scope_path(stage, prim_path)
-    if synth_scope != prim_path:
+
+    desc_path = str(payload.get("robot_description_path") or "")
+    if not desc_path or not os.path.isfile(desc_path):
+        raise RuntimeError(
+            "emit_control did not return robot_description_path "
+            "(required for IsaacSimSystem CM setup)"
+        )
+    with open(desc_path, encoding="utf-8") as handle:
+        cm_urdf = handle.read()
+    if not cm_urdf.strip():
+        raise RuntimeError(f"robot_description is empty: {desc_path}")
+
+    # Keep ArtRoot for createArticulationView; joint scope may be the robot Xform
+    # when DOFs are siblings (W2). Used only for USD EE discovery / reemit.
+    joint_scope = _synth_joint_scope_path(stage, prim_path)
+    if joint_scope != prim_path:
         carb.log_info(
-            f"ROS2ControlLaunch: synth joint scope {prim_path!r} → {synth_scope!r} "
+            f"ROS2ControlLaunch: USD joint scope {prim_path!r} → {joint_scope!r} "
             "(ArtRoot sibling DOFs)"
         )
-    raw_synth = _urdf_synth.build_full_urdf(stage, synth_scope)
-    fixed_synth, injected_joints, removed_joints = _fix_synth_urdf(
-        stage, synth_scope, raw_synth
-    )
-    try:
-        safe_ns = (state._namespace or "global").replace("/", "_")
-        dump = f"/tmp/fasim_synth_urdf_{os.getpid()}_{safe_ns}.urdf"
-        with open(dump, "w", encoding="utf-8") as handle:
-            handle.write(fixed_synth)
-        carb.log_info(f"ROS2ControlLaunch: wrote fixed synth URDF to {dump}")
-    except Exception:
-        pass
 
+    root = ET.fromstring(cm_urdf)
     hw_joints: set[str] = set()
-    try:
-        for rc in ET.fromstring(fixed_synth).findall("ros2_control"):
-            for jel in rc.findall("joint"):
-                name = jel.get("name")
-                if name:
-                    hw_joints.add(name)
-    except Exception:
-        pass
+    isaac_blocks = 0
+    for rc in root.findall("ros2_control"):
+        plugin = (rc.findtext("hardware/plugin") or "").strip()
+        if plugin == "isaacsim_ros2_control/IsaacSimSystem":
+            isaac_blocks += 1
+            for param in rc.findall("hardware/param"):
+                if param.get("name") == "prim_path" and (param.text or "").strip() != prim_path:
+                    carb.log_warn(
+                        "ROS2ControlLaunch: rewriting IsaacSimSystem prim_path "
+                        f"{(param.text or '').strip()!r} → {prim_path!r}"
+                    )
+                    param.text = prim_path
+        for jel in rc.findall("joint"):
+            name = jel.get("name")
+            if name:
+                hw_joints.add(name)
+    if isaac_blocks == 0:
+        raise RuntimeError(
+            f"robot_description has no IsaacSimSystem block ({desc_path}). "
+            "emit_control must use hardware=isaac_sim."
+        )
     if not hw_joints:
         raise RuntimeError(
-            f"synth <ros2_control> has no joints under scope {synth_scope!r} "
-            f"(ArtRoot {prim_path!r}). Nested ArticulationRootAPI still present? "
-            "Mute child ArtRoots (Head/Torso/EE/arm root_joint); "
-            "ensure Physics variant matches active engine (VariantSwitcher)."
+            f"IsaacSimSystem <ros2_control> has no joints in {desc_path} "
+            f"(ArtRoot {prim_path!r})"
         )
+    cm_urdf = ET.tostring(root, encoding="unicode")
+    if not cm_urdf.lstrip().startswith("<?xml"):
+        cm_urdf = '<?xml version="1.0" ?>\n' + cm_urdf
 
-    usd_ee_names = [p.GetName() for p in _iter_usd_ee_joint_prims(stage, synth_scope)]
+    try:
+        safe_ns = (state._namespace or "global").replace("/", "_")
+        dump = f"/tmp/fasim_cm_urdf_{os.getpid()}_{safe_ns}.urdf"
+        with open(dump, "w", encoding="utf-8") as handle:
+            handle.write(cm_urdf)
+        carb.log_info(
+            f"ROS2ControlLaunch: using xacro IsaacSimSystem URDF ({len(cm_urdf)} bytes) "
+            f"→ {dump}"
+        )
+    except Exception:
+        pass
+
+    usd_ee_names = [p.GetName() for p in _iter_usd_ee_joint_prims(stage, joint_scope)]
     hw_ee = [n for n in hw_joints if _is_ee_joint_name(n)]
     # Align with robot_common_launch: enable_gripper means "detect and
     # spawn hand/gripper controllers". Only fall back to arm-only when
@@ -1773,12 +1804,9 @@ def _install_controller_manager(
     if enable_gripper and not hw_ee and not usd_ee_names:
         carb.log_warn(
             "ROS2ControlLaunch: enableGripper/EE requested but no USD EE joints "
-            f"under {synth_scope!r}; skipping hand/gripper controllers "
-            f"(hw={sorted(hw_joints)}, injected={injected_joints}, "
-            f"removed={removed_joints})"
+            f"under {joint_scope!r}; skipping hand/gripper controllers "
+            f"(hw={sorted(hw_joints)})"
         )
-        # emit already ran in parallel with this synth. If it included gripper
-        # controllers, throw that YAML away and emit once more without them.
         if (
             state._emitted_with_gripper
             and not state._force_disable_gripper
@@ -1788,20 +1816,20 @@ def _install_controller_manager(
             state._gripper_reemit_used = True
             carb.log_info(
                 "ROS2ControlLaunch: re-running emit_control with enable_gripper=false "
-                f"after {time.monotonic() - setup_t0:.2f}s synth"
+                f"after {time.monotonic() - setup_t0:.2f}s setup"
             )
             return "reemit"
         enable_gripper = False
     elif enable_gripper and usd_ee_names and not hw_ee:
         missing = sorted(set(usd_ee_names) - hw_joints)
         carb.log_error(
-            "ROS2ControlLaunch: USD EE joints present but still missing from "
-            f"synth HW after repair (usd_ee={usd_ee_names}, missing={missing}, "
-            f"injected={injected_joints}). Hand/gripper activate may fail."
+            "ROS2ControlLaunch: USD EE joints present but missing from xacro HW "
+            f"(usd_ee={usd_ee_names}, missing={missing}). "
+            "Hand/gripper activate may fail."
         )
     elif enable_gripper and hw_ee:
         carb.log_info(
-            "ROS2ControlLaunch: EE joints in synth HW: " + ", ".join(sorted(hw_ee))
+            "ROS2ControlLaunch: EE joints in xacro HW: " + ", ".join(sorted(hw_ee))
         )
 
     namespace = str(db.inputs.namespace or "")
@@ -1838,9 +1866,13 @@ def _install_controller_manager(
     _orig_synth = _urdf_synth.build_full_urdf
 
     def _build_fixed(stage_arg, target, sensor_overlay_urdf_path=None):
-        # Manager setup still passes ArtRoot prim_path; return scoped synth.
-        if str(target) in (prim_path, synth_scope) and sensor_overlay_urdf_path is None:
-            return fixed_synth
+        # Prefer emit xacro; fall back to live synth only for unexpected targets.
+        if str(target) in (prim_path, joint_scope) and sensor_overlay_urdf_path is None:
+            return cm_urdf
+        carb.log_warn(
+            f"ROS2ControlLaunch: unexpected build_full_urdf target={target!r}; "
+            "falling back to USD synth"
+        )
         scope = _synth_joint_scope_path(stage_arg, str(target))
         raw = _orig_synth(
             stage_arg,
@@ -1860,13 +1892,21 @@ def _install_controller_manager(
             Ros2ControlManager.teardown(prim_path)
         except Exception:
             pass
+        # isaac_sim / IsaacSimSystem always follows Isaac /clock (仿真时钟).
+        # Pin may be left false by mistake; still force True for in-process CM.
+        use_sim_time = True
+        if not bool(db.inputs.useSimTime):
+            carb.log_warn(
+                "ROS2ControlLaunch: inputs:useSimTime=false ignored for "
+                "hardware=isaac_sim (ControllerManager requires /clock)"
+            )
         Ros2ControlManager.setup(
             prim_path=prim_path,
             controller_config=yaml_path,
             urdf_path=None,
             namespace=namespace,
             publish_robot_description=False,
-            use_sim_time=bool(db.inputs.useSimTime),
+            use_sim_time=use_sim_time,
         )
     finally:
         _cm_mod.build_full_urdf = _orig_cm
@@ -1874,26 +1914,12 @@ def _install_controller_manager(
     state._prim_path = prim_path
 
     if bool(getattr(db.inputs, "publishRobotDescription", True)):
-        desc_path = str(payload.get("robot_description_path") or "")
-        if not desc_path or not os.path.isfile(desc_path):
-            raise RuntimeError(
-                "publishRobotDescription is set but emit_control did not "
-                "return robot_description_path"
-            )
-        with open(desc_path, encoding="utf-8") as handle:
-            urdf_xml = handle.read()
-        # robot_state_publisher already latches /robot_description
-        # (TRANSIENT_LOCAL) from its ``robot_description`` parameter. Publishing
-        # it a second time from our own node makes the in-process
-        # controller_manager log
-        #   "ResourceManager has already loaded a urdf and is initialized.
-        #    Ignoring attempt to reload a robot description."
-        # once per extra publisher, so only fall back to our own latched
-        # publisher when RSP is not running.
+        # Same xacro feeds CM and /robot_description — no second TopicBased reload.
+        urdf_xml = cm_urdf
         state.start_robot_state_publisher(
             urdf_xml,
             namespace=namespace,
-            use_sim_time=bool(db.inputs.useSimTime),
+            use_sim_time=True,
         )
         ns_prefix = f"/{namespace.strip('/')}" if namespace.strip("/") else ""
         if state._rsp_proc is None:
@@ -1909,7 +1935,7 @@ def _install_controller_manager(
         )
 
     carb.log_info(
-        f"ROS2ControlLaunch: synth+setup finished for {prim_path!r} "
+        f"ROS2ControlLaunch: xacro+setup finished for {prim_path!r} "
         f"in {time.monotonic() - setup_t0:.2f}s"
     )
     return None

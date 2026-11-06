@@ -209,6 +209,55 @@ Each robot **must** ship `config/ocs2/target_manager.yaml`. Without it, defaults
 
 split_body / demo: use arm `task.info`; markers often stay on footprint/base_link.
 
+## 4.1 `/clock` must be physics-stepped, not render-frame (OnPlaybackTick)
+
+In-process CM (`use_sim_time=1`) reads its clock from `/clock`. If `/clock` is
+published from `OnPlaybackTick`, controller trajectory time (linear `percent_`
+and moveJ/doubles `real_t`) advances at the **render-frame** cadence, not the
+physics rate — duration lies.
+
+**Symptom (W2, PhysX 200 Hz / update_rate 200):** CM `update()` reports
+`period` jittering `0 / 0.015 / 0.020 s` instead of a steady `0.005 s`. moveJ
+`real_t` then races at ~3× sim time, so a `home_duration=5` finishes in ~1.5
+wall seconds. `period` always equals the sim-time delta (`diff=0`), so the bug
+is the **clock source**, not period accumulation.
+
+**Root cause:** `OnPlaybackTick` fires per render frame (~60–70 Hz, uneven).
+Between two frames the physics steps 3–4× (0.015–0.020 sim s), and sometimes 0×
+when a frame is fast. `PublishClock` bound to that tick forwards those jumps
+straight into the CM clock.
+
+**Fix (applied to all fiveages payloads):** publish `/clock` from the physics
+step in a **dedicated on-demand graph** `ROS_Clock`, sibling to `ROS_Control`:
+
+- `OnPhysicsStep` (`isaacsim.core.nodes.OnPhysicsStep`) only triggers in an
+  **on-demand (push)** graph. The `ROS_Control` graph is `Automatic` and must
+  stay that way for `ROS2ControlLaunch` / Nav, so the clock cannot live there.
+- Graph attrs that make it actually on-demand — **`pipelineStage =
+  "pipelineStageOnDemand"`** is the decisive one (just
+  `evaluationMode="OnDemand"` is not enough → `Physics OnSimulationStep node
+  detected in a non on-demand Graph`). Mirror the working
+  `robots/dexhands/Wuji/Hand2/payloads/Sensor/contact_force.usda` graph:
+  `evaluationMode="OnDemand"`, `evaluator:type="push"`,
+  `pipelineStage="pipelineStageOnDemand"`, and `prepend apiSchemas =
+  ["NodeGraphNodeAPI"]` on each node.
+- `OnPhysicsStep.step` → `PublishClock.execIn`; `ReadSimTime
+  (resetOnStop=1)` → `PublishClock.timeStamp`. Remove the old
+  `ReadSimTime`/`PublishClock` from `ROS_Control` so there is exactly one
+  `/clock` publisher.
+- Per-robot connection paths use that robot's root prim (`</CR5/...`,
+  `</G1D/...`, `</Zerith_H1/...`, `</Piper*/...`, `</FiveAges_W2/...`).
+
+**After the fix:** CM `period` is a steady `0.005 s` (`ratio=1.0000`), moveJ
+`real_t` advances ≈1:1 with sim time, and `home_duration` tracks sim seconds
+(wall ≈ sim / real-time-factor). Verify with `ros2 topic hz /clock` ≈ physics
+rate and a home switch.
+
+Covered payloads (all fixed): W2, Zerith H1, G1D, AgileX Piper / Piper_H /
+Piper_X / Piper_L, Dobot CR5 (`payloads/ROS/fiveages.usda`). New fiveages
+robots must follow the same `ROS_Clock` pattern — never bind `/clock` to
+`OnPlaybackTick`.
+
 ## 5. Env / Graph checklist
 
 ```
@@ -218,6 +267,7 @@ split_body / demo: use arm `task.info`; markers often stay on footprint/base_lin
 - [ ] enableArmsTargetManager; type empty → EE / EE_Left|Right / Left_Arm|Right_Arm EE → 运控 key (PascalCase→lower except CR5 AG2F*)
 - [ ] Physics=physx pinned; ROS=fiveages; PhysX-only PhysicsScene; /clock if useSimTime
 - [ ] `ROS=fiveages` clock node `resetOnStop=1` (sim time restarts on Stop)
+- [ ] `/clock` comes from the on-demand `ROS_Clock` graph (`OnPhysicsStep` → `PublishClock`), **not** `ROS_Control/OnPlaybackTick` (see §4.1)
 - [ ] W2 Xhand/Dex EE: mount deletes nested ArtRoot schemas (not only `active=false`)
 - [ ] W2: Linkhou child ROS=enable for DiffDrive; no body JointState↔ArticulationController bridge
 - [ ] target_manager.yaml present for that description package (src + install)
@@ -271,6 +321,8 @@ Dual room acceptance (`environment/.../G1D/dual/room.usda`, ATM off OK):
 | Global `/fsm_*` `/cmd_vel` `/ocs2_wbc_controller/*` with dual ns | Controllers/ATM used absolute `/…`; must be relative (controller-private keep `ctrl/…`). Rebuild arms packages; ATM spawn must pass `__ns` |
 | `link 'base_link' is not unique` | Need `_dedupe_urdf_duplicate_names` (reload node) |
 | ATM VR “weird” / no teleop | Add/fix `target_manager.yaml` frames; enable_vr |
+| home/moveJ duration too short (e.g. 5s→~1.5s wall); CM `period` jitters `0/0.015/0.020` | `/clock` bound to `OnPlaybackTick`. Move it to an on-demand `ROS_Clock` graph driven by `OnPhysicsStep` (§4.1) |
+| `Physics OnSimulationStep node detected in a non on-demand Graph` | `OnPhysicsStep` placed in an `Automatic` graph. Use a dedicated on-demand graph with `pipelineStage="pipelineStageOnDemand"` (§4.1) |
 | Continuous track offset on mobile WBC | `control_base_frame`+`marker` must be `world`; vr_follow stays footprint |
 | tensors invalidated mid-run | Don’t flip EE/Physics variants on Play; fix snap first |
 | G1D 进场景后再选 Physics → 双臂掉落 | mount/env sticky Physics 与 session 打架 → Assembler `disjointed`。G1D 已去 sticky；子件由父 Physics payload push；换引擎卡住 Reload |

@@ -663,7 +663,7 @@ build_isaac_setting_args() {
 }
 
 enable_crash_debug() {
-    [ "${RUN_CRASH_DEBUG:-0}" = "1" ] || return 0
+    [ "${RUN_CRASH_DEBUG:-1}" = "1" ] || return 0
     if ulimit -c unlimited 2>/dev/null; then
         print_info "崩溃调试：ulimit -c = $(ulimit -c)"
     else
@@ -674,7 +674,15 @@ enable_crash_debug() {
         export PATH="${plugins_dir}:${PATH}"
         print_info "崩溃调试：crashreport.gui 已加入 PATH"
     fi
-    print_info "崩溃调试：core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+    local pattern
+    pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown)
+    if [[ "$pattern" == *apport* ]]; then
+        print_info "崩溃调试：core 由 apport 收集，崩溃后看 /var/crash/_*isaacsim_kit_kit*"
+    elif [[ "$pattern" == core* ]]; then
+        print_info "崩溃调试：core 将写入运行目录（${pattern}）"
+    else
+        print_warn "崩溃调试：core_pattern=${pattern} 非文件模式，core 可能不落盘"
+    fi
 }
 
 sanitize_host_ros_paths_for_isaac() {
