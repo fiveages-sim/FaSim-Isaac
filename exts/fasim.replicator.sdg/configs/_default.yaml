@@ -1,0 +1,20 @@
+# FaSim Replicator SDG — 全局默认
+#
+# 机器人级配置在 configs/<robot_key>/robot.yaml
+# 任务级配置在 configs/<robot_key>/tasks/<task_key>.yaml
+# 本文件提供两者共享的默认值，任务配置可覆盖。
+
+output:
+  # 数据不放在仓库内（仓库要能干净克隆/移植）。
+  # 换机器时改这一行，或用 --output 覆盖。
+  dir: /home/fiveages/fasim_sdg
+
+record:
+  capture_fps: 30        # 录制采样率（与物理步解耦，由 EpisodeRecorder 按物理步记录）
+  physics_dt: 0.005      # 200 Hz 物理步（与场景 PhysicsScene timeStepsPerSecond 一致）
+  max_frames: 2000       # 单 episode 上限，防止跑飞
+
+replay:
+  render_interval: 1     # 每 N 帧渲染一次（1 = 每帧）
+  dlss_mode: 2           # 0=Performance 1=Balanced 2=Quality 3=Auto
+  write_raw_npz: true    # 每帧额外落一个 npz（便于检查，后续可关）

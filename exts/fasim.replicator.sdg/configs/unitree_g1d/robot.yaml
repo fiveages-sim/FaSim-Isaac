@@ -1,0 +1,27 @@
+# Unitree G1D —— 机器人级配置（跨任务复用）
+#
+# 只描述"这台机器人是什么"，不含任何场景/任务信息。
+
+robot_key: unitree_g1d
+
+# articulation（IsaacSimSystem / createArticulationView 的 targetPrim）
+articulation_prim: /World/G1D
+
+# 底盘/基座：用于把世界坐标换算到机体系
+base_prim: /World/G1D/base_link
+
+# 录制阶段的状态来源。任何最终 publish 到该话题的轨迹源都可以用
+# （当前 OCS2 运控；将来 VR 遥操）。
+joint_state_topic: /joint_states
+
+# 末端 prim（phase 1 也会记录它们的位姿，供训练时对齐 action）
+ee_prims:
+  left: /World/G1D/G1_Arms/left_wrist_yaw_link/left_tcp
+  right: /World/G1D/G1_Arms/right_wrist_yaw_link/right_tcp
+
+gripper_joints:
+  - left_gripper_joint
+  - right_gripper_joint
+
+# 关节总数（含夹爪），用于录制后自检
+expected_dof_count: 32

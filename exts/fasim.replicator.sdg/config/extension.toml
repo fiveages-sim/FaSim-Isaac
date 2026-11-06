@@ -1,0 +1,20 @@
+[package]
+version = "0.1.0"
+category = "Simulation"
+title = "FaSim Replicator SDG"
+description = "Offline synthetic data capture for FaSim robots via Isaac Replicator. Records articulation/rigid-body state with EpisodeRecorder (ROS2-side trajectory source), then replays it headlessly with RGB-D annotators — no ROS2 needed for capture."
+authors = ["FiveAges"]
+keywords = ["isaac", "replicator", "sdg", "synthetic-data", "dataset"]
+
+[dependencies]
+"omni.replicator.core" = {}
+"isaacsim.replicator.episode_recorder" = {}
+"isaacsim.core.prims" = {}
+"isaacsim.core.utils" = {}
+
+[[python.module]]
+name = "fasim.replicator.sdg"
+
+[fswatcher.patterns]
+include = ["*.py", "*.yaml", "*.md"]
+exclude = ["__pycache__"]

@@ -1,0 +1,78 @@
+# Unitree G1D + Sinopec 试管抓取 —— 任务级配置
+#
+# 场景：FaSim-Isaac environment/fa-project-usd/Sinopec/2026-10 Test Tube Picking/env/G1D/room.usda
+# 三个相机：头部 + 左右手腕（资产已确认存在，见下方 prim 路径）
+
+task_key: sinopec_test_tube
+
+# 相对 FaSim-Isaac 仓库根目录；也可写绝对路径
+scene_usda: environment/fa-project-usd/Sinopec/2026-10 Test Tube Picking/env/G1D/room.usda
+
+# 打开场景后要切的 variant（机器人在此场景里必须 ROS=fiveages 才有运控）
+variant_selection:
+  ROS: fiveages
+  EE_Left: dex1
+  EE_Right: dex1
+
+# 除机器人外需要记录位姿的物体。
+#
+# 只录**会被机器人移动**的刚体：试管/架子是独立刚体，不受关节角驱动；
+# 层2 回放必须逐帧 set_world_poses 还原它们，否则物体会停在初始位置
+# 而手在做动作，画面完全错位。
+#
+# 不录 lab_table：桌面是静态网格（无 RigidBodyAPI），本就恒定不动。
+# 硬录它只会浪费每帧一次服务调用（实测 4 个物体把采样从 50Hz 拖到 15Hz）。
+#
+# label 必须与 ee_traj.py 的 prim_label()（路径末段）一致，
+# renderer 靠它把 npz 里的 obj/<label>_* 映射到 prim。
+tracked_prims:
+  test_tube: /World/room/scene/test_tube
+  test_tube_rack: /World/room/scene/test_tube_rack
+  test_tube_rack_01: /World/room/scene/test_tube_rack_01
+
+# ---------------------------------------------------------------------------
+# 相机
+# ---------------------------------------------------------------------------
+# prim 路径说明：
+#   头部 d435_link/head_camera —— G1_Body 的 Sensor=sensors 变体提供
+#   手腕 dex1_{left,right}_camera —— Dex1 的 Sensor=camera 变体提供
+#     （G1D 的 EE_Left/EE_Right=dex1 已经把 Dex1 的 Sensor 固定为 camera）
+# 若某个 prim 在 stage 中不存在，capture 会报错并列出候选路径。
+cameras:
+  - name: head
+    prim: /World/G1D/G1_Body/torso_link/d435_link/head_camera
+    resolution: [640, 480]
+    annotators: [rgb, camera_params]
+    depth: true
+
+  - name: wrist_left
+    prim: /World/G1D/G1_Arms/left_wrist_yaw_link/left_tcp/Dex1/Geometry/dex1_base_link/dex1_camera_link/dex1_camera_optical_frame/dex1_left_camera
+    resolution: [640, 480]
+    annotators: [rgb, camera_params]
+    depth: true
+
+  - name: wrist_right
+    prim: /World/G1D/G1_Arms/right_wrist_yaw_link/right_tcp/Dex1/Geometry/dex1_base_link/dex1_camera_link/dex1_camera_optical_frame/dex1_right_camera
+    resolution: [640, 480]
+    annotators: [rgb, camera_params]
+    depth: true
+
+# 可选：再生成一个第三人称机位（场景里没有就现场创建）
+# - name: third_person
+#   create:
+#     position: [2.6, -0.9, 1.5]
+#     look_at: [1.8, 0.25, 0.88]
+#   resolution: [640, 480]
+#   annotators: [rgb]
+#   depth: true
+
+# ---------------------------------------------------------------------------
+# 输出（与 _default.yaml 的 output.dir 拼接为 <dir>/<robot>/<task>/）
+# ---------------------------------------------------------------------------
+output:
+  dir: /home/fiveages/fasim_sdg
+
+record:
+  capture_fps: 30
+  physics_dt: 0.005
+  max_frames: 2000
