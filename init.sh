@@ -1293,6 +1293,13 @@ install_fasim_ros2_nodes() {
     install_fasim_kit_extension "fasim.ros2.nodes" "ROS2 Control 节点"
 }
 
+# 合成数据采集：层2 离线回放 + 层2.5 旁路采集（随 Isaac 启动自动加载扩展）。
+# 只做两件事：把 exts/fasim.replicator.sdg 链进 extsUser，并在 kit 的
+# [dependencies] 里加一行 —— 不修改仓库跟踪的文件，Isaac 升级后重跑即可。
+install_fasim_replicator_sdg() {
+    install_fasim_kit_extension "fasim.replicator.sdg" "Replicator 合成数据"
+}
+
 # 让原版 ~/isaacsim/isaac-sim.sh 也能启动：默认剥掉 bashrc 的 /opt/ros
 #（否则 apt pinocchio/eigenpy 崩 pink）。./run.sh 另设 FASIM_FULL_HOST_ROS=1 保留完整 ROS。
 install_isaac_env_guard() {
@@ -1428,6 +1435,7 @@ load_artvip_scene() {
 if [ "$INIT_MODE" = "isaac_local" ]; then
     install_fasim_steering_nodes
     install_fasim_ros2_nodes
+    install_fasim_replicator_sdg
     install_isaac_env_guard
     install_isaac_script_silence
 elif [ "$INIT_MODE" = "artvip" ]; then

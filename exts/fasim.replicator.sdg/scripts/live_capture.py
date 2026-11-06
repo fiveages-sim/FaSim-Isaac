@@ -181,14 +181,22 @@ def arm_capture(
     )
 
     def _on_physics_step(dt: float) -> None:
-        """物理步进回调：按 every 降采样，渲染并落盘。必须快速返回。"""
+        """物理步进回调：按 every 降采样，取最近渲染的一帧落盘。必须快速返回。
+
+        **不要调 ``rep.orchestrator.step()``** —— 在 Kit 进程内它会抛
+        ``OrchestratorError: Synchronous call to step can only be performed in
+        a standalone workflow and may not be made from within Kit``。
+        （层2 能调是因为 ``SimulationApp(headless=True)`` 属于 standalone。）
+
+        Kit 里渲染由 Replicator 的 tick 图跟着 ``app.update()`` 自动驱动，
+        所以这里只要 ``get_data()`` 取最近一帧即可。实测 33/33 帧互不相同，
+        不存在重复缓冲问题。
+        """
         _S["step"] += 1
         if _S["step"] % _S["every"] != 0:
             _S["skipped"] += 1
             return
         try:
-            # 真正渲一帧（否则 annotator 会返回上一次的缓冲，出现重复帧）
-            rep.orchestrator.step(delta_time=0.0, pause_timeline=False)
             idx = _S["saved"]
             payload: dict[str, Any] = {
                 "frame": idx,
@@ -223,7 +231,17 @@ def arm_capture(
                 _log(f"frame {idx} step {_S['step']} "
                      f"({_S['saved']} 帧已存, {_S['skipped']} 步跳过)")
         except Exception as exc:  # noqa: BLE001
-            # 回调里绝不能抛异常，否则会打断物理步进 / 控制循环
+            # 回调里绝不能抛异常，否则会打断物理步进 / 控制循环。
+            # 但也不能静默 —— 首次失败必须把完整 traceback 打到 stdout，
+            # 否则表现就是"物理步数在涨、帧数一直是 0"，极难定位。
+            _S["errors"] = _S.get("errors", 0) + 1
+            if _S["errors"] == 1:
+                import traceback
+
+                _log("!" * 60)
+                _log(f"采帧失败（首次）: {exc!r}")
+                traceback.print_exc()
+                _log("!" * 60)
             carb.log_warn(f"[capture] 采帧失败: {exc}")
 
     sub = omni.physx.get_physx_interface().subscribe_physics_step_events(_on_physics_step)
@@ -260,6 +278,7 @@ def stop_capture() -> dict:
         "frames_saved": _S["saved"],
         "physics_steps": _S["step"],
         "steps_skipped": _S["skipped"],
+        "capture_errors": _S.get("errors", 0),
         "every": _S["every"],
         "duration_sec": (_S["t0"] is not None and __import__("time").monotonic() - _S["t0"]) or 0,
         "cameras": [

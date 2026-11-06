@@ -211,21 +211,27 @@ python3 tools/check_quality.py --episode ~/fa_data/pick_01.npz \
 
 ### 路线 B：层2.5 旁路采集（编排闭环跑，顺带采相机）
 
-不需要 npz，也不需要回放。编排正常跑，在同一 Isaac 进程里旁路采。
+不需要 npz，也不需要回放。编排正常跑，同一 Isaac 进程内旁路采，
+**用控制文件触发，不用 Script Editor**。
 
-```python
-# 1) ./run.sh 启动仿真，做好跑编排的准备
-# 2) Isaac 的 Window > Script Editor 里执行：
-import sys
-sys.path.insert(0, "/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg")
-exec(open("/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg/scripts/live_capture.py").read())
-arm_capture(out_dir="~/fasim_live/pick_01", every=10, camera="head")
+```bash
+# 1) ./init.sh 安装扩展（只需一次，和 ros2.nodes 一样的安装路径）
+cd /home/fiveages/FaSim-Isaac && ./init.sh    # 选 isaac_local
 
-# 3) 终端跑 motion-generation（和平时一样）
-# 4) 回 Script Editor: stop_capture()
+# 2) ./run.sh 启动仿真，做好跑编排的准备
+
+# 3) 新终端：开始采集
+echo 'start out=~/fasim_live/pick_01 every=20 camera=head' \
+  > ~/fasim_live/control.txt
+
+# 4) 终端跑 motion-generation（和平时一样）
+
+# 5) 结束
+echo stop > ~/fasim_live/control.txt
 ```
 
-详细步骤、产物格式、性能实测见 **`scripts/README_live_capture.md`**。
+详细步骤、控制文件命令、产物格式、实现要点见
+**`scripts/README_live_capture.md`**。
 
 ### 快速验证工具
 

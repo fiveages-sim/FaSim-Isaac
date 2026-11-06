@@ -15,6 +15,12 @@ keywords = ["isaac", "replicator", "sdg", "synthetic-data", "dataset"]
 [[python.module]]
 name = "fasim.replicator.sdg"
 
+# 随 Isaac Sim 自动加载：起一个 update 回调监听控制文件，实现
+# "echo start > ~/fasim_live/control.txt" 即开始旁路采集。
+# 见 fasim/replicator/sdg/scripts/extension.py。
+[[python.module]]
+name = "fasim.replicator.sdg.scripts.extension"
+
 [fswatcher.patterns]
 include = ["*.py", "*.yaml", "*.md"]
 exclude = ["__pycache__"]

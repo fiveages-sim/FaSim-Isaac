@@ -2,6 +2,8 @@
 
 > **目标**：编排当主干（闭环、高成功率），Replicator 当工具（出相机数据）。
 > 不额外起 ROS 通信、不接管控制 —— 只挂在同一个 Isaac 进程里"看"。
+>
+> **不需要 Script Editor**：扩展随 Isaac 自动加载，用控制文件触发。
 
 ## 为什么可行
 
@@ -10,49 +12,62 @@
 时钟。所以不存在"ROS 时间戳和 Isaac 时间戳不一致"的问题 —— 它们本来就是
 同一个时钟。
 
+## 一次性安装
+
+扩展走和 `fasim.ros2.nodes` / `fasim.steering.nodes` 完全一样的安装路径：
+
+```bash
+cd /home/fiveages/FaSim-Isaac
+./init.sh          # 选 isaac_local；会调用 install_fasim_replicator_sdg
+```
+
+它只做两件事（都不碰仓库跟踪的文件）：
+
+1. 把 `exts/fasim.replicator.sdg` 软链到 `~/isaacsim/extsUser/`；
+2. 在 `~/isaacsim/apps/*.kit` 的 `[dependencies]` 里加一行
+   `"fasim.replicator.sdg" = {}`。
+
+Isaac 升级后重跑一次即可。想手动撤销就删掉那个软链和 kit 里的那一行。
+
 ## 完整流程
 
 ### 1) 启动仿真（和以前完全一样）
 
 ```bash
 cd /home/fiveages/FaSim-Isaac
-./run.sh                      # GUI；物理选 physx，ROS WS 选 ~/ros2_ws
+./run.sh                      # GUI；物理 physx，ROS WS 选 ~/ros2_ws
 ```
 
-等你平时跑编排时的那些准备工作都做完（加载场景、切到 `ROS=fiveages` 变体、
-确认运控起来了）。
+加载场景、切 `ROS=fiveages` 变体、确认运控起来 —— 和平时一样。
+扩展加载后控制台会打印：
 
-### 2) 挂载采集器（在 Isaac 的 Script Editor 里）
-
-`Window > Script Editor`，粘贴执行：
-
-```python
-import sys
-sys.path.insert(0, "/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg")
-exec(open("/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg/scripts/live_capture.py").read())
-
-# 立刻返回，不会阻塞
-arm_capture(
-    out_dir="~/fasim_live/pick_01",
-    every=10,          # 每 10 个物理步采 1 帧（200Hz → 20fps）
-    camera="head",     # 只采头部相机；"" = 全部
-)
+```
+[live_capture] ==================================================================
+[live_capture] 旁路采集已就绪（文件触发，无需 Script Editor）
+[live_capture] 控制文件: /home/fiveages/fasim_live/control.txt
+[live_capture]   开始采集: echo start > /home/fiveages/fasim_live/control.txt
+[live_capture]   结束采集: echo stop  > /home/fiveages/fasim_live/control.txt
+[live_capture] ==================================================================
 ```
 
-看到这些输出就说明挂上了：
+### 2) 开始采集（新开一个终端，一行命令）
+
+```bash
+echo 'start out=~/fasim_live/pick_01 every=20 camera=head' \
+  > ~/fasim_live/control.txt
+```
+
+看到这条就说明挂上了：
 
 ```
 [capture] 相机 head: 640x480 @ /World/G1D/G1_Body/torso_link/d435_link/head_camera
-[capture] 关节标签: 32 个 DOF
 [capture] 已挂载 —— 输出 /home/fiveages/fasim_live/pick_01
-[capture] 现在去终端跑 motion-generation；结束后回来执行 stop_capture()
 ```
 
 ### 3) 跑编排（终端，和以前完全一样）
 
 ```bash
 cd /home/fiveages/lerobot_ros2/examples/IsaacSim/robots/Unitree/G1D/tools
-# 你平时怎么跑 motion-generation 就怎么跑
 motion-generation --robot unitree_g1d --task-key pick_tube_full --scene lift
 ```
 
@@ -60,10 +75,8 @@ motion-generation --robot unitree_g1d --task-key pick_tube_full --scene lift
 
 ### 4) 结束
 
-回到 Script Editor：
-
-```python
-stop_capture()
+```bash
+echo stop > ~/fasim_live/control.txt
 ```
 
 输出：
@@ -73,13 +86,27 @@ stop_capture()
 [capture] 产物: /home/fiveages/fasim_live/pick_01
 ```
 
+随时可以用 `echo status > ~/fasim_live/control.txt` 看进度。
+
+## 控制文件命令
+
+| 命令 | 作用 |
+|---|---|
+| `start` | 用默认参数开始 |
+| `start every=20 camera=head out=~/fasim_live/p2` | 带参数开始 |
+| `stop` | 结束并写 session.json |
+| `status` | 打印当前进度 |
+
+支持的参数：`out`(目录) / `every`(每 N 个物理步) / `camera`(逗号分隔) /
+`width` / `height` / `depth`(true/false) / `record_joints`(true/false)。
+
 ## 产物
 
 ```
 ~/fasim_live/pick_01/
 ├── frames/
 │   └── frame_000000.npz     每帧一个
-└── session.json             相机参数、帧数、物理步数、耗时
+└── session.json             相机参数、帧数、物理步数、错误数、耗时
 ```
 
 每个 `frame_XXXXXX.npz` 含：
@@ -92,6 +119,25 @@ stop_capture()
 | `joint_pos` | (1, 32) 关节角 —— action 标签 |
 | `joint_names` | 32 个 DOF 名字 |
 | `frame` / `sim_step` / `wall_time` | 帧号 / 物理步 / 相对时间 |
+
+## 实现要点（踩过的坑）
+
+**Kit 进程内不能调 `rep.orchestrator.step()`**：
+
+```
+OrchestratorError: Synchronous call to `step` can only be performed in a
+standalone workflow and may not be made from within Kit. Please use the
+async function `step_async`.
+```
+
+层2 能调是因为 `SimulationApp(headless=True)` 属于 standalone workflow。
+在 Kit 里渲染由 Replicator 的 tick 图跟着 `app.update()` **自动驱动**，
+所以回调里只要 `get_data()` 取最近一帧。
+
+实测：1000 物理步回调里取 33 帧，**33/33 互不相同**，不存在重复缓冲。
+
+**存盘用 `np.savez` 而不是 `savez_compressed`**：压缩一帧 640×480 RGB-D
+要 52ms（比渲染还久），无压缩 1.3ms（快 40 倍）。
 
 ## 性能（实测，RTX 4090 / 640×480 / 头相机 / 无头模式）
 
@@ -122,13 +168,27 @@ stop_capture()
 
 ## 注意事项
 
-- **绝不要**在 Script Editor 里写 `while` / `time.sleep()` 循环 ——
+- **绝不要**在 Script Editor 或任何回调里开 `while` / `time.sleep()` 循环 ——
   会饿死 Kit 主循环，物理停住、OCS2 卡死。本模块全部用回调，不阻塞。
-- 回调里抛异常会打断物理步进，所以内部全部 catch 并只 warn。
-- `orchestrator.step()` 是同步渲染。若发现控制受影响，先把 `every` 调大，
-  再考虑降分辨率。
+- 回调里抛异常会打断物理步进，所以内部全部 catch。但**首次失败会把完整
+  traceback 打到 stdout**（否则表现是"物理步数在涨、帧数一直是 0"，极难定位）。
+  错误计数写进 `session.json` 的 `capture_errors`。
+- 渲染由 tick 图自动驱动，采集频率完全由 `every` 控制。
 - 采集器不管 timeline 状态，只跟物理步进。编排没在跑就不会有帧
   （`frames_saved=0` 时会明确警告）。
+
+## 实测结果（full kit，2026-11-06）
+
+```
+[live_capture] 扩展 enabled = True
+控制文件 start out=/tmp/live_e2e every=20 camera=head
+[capture] 相机 head: 640x480
+[capture] 已挂载
+→ 采到 10 帧 / 203 物理步
+→ 10 个唯一 hash（无重复帧）
+→ rgb (480,640,4) mean=138.6，depth (480,640) float32，joint_pos (1,32)
+→ capture_errors: 0
+```
 
 ## 与层2（离线回放）的区别
 
