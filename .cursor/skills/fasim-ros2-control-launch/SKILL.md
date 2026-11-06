@@ -248,6 +248,19 @@ step in a **dedicated on-demand graph** `ROS_Clock`, sibling to `ROS_Control`:
 - Per-robot connection paths use that robot's root prim (`</CR5/...`,
   `</G1D/...`, `</Zerith_H1/...`, `</Piper*/...`, `</FiveAges_W2/...`).
 
+**Do NOT blanket-delete every `ReadSimTime`.** Only the `/clock` one in
+`ROS_Control` is relocated. Some robots carry a **second** `ReadSimTime` inside
+their own `ROS_Odometry` graph that feeds odom/TF `timeStamp` — G1D is one
+(`chassisFrameId=base_footprint`, `world→odom→base_footprint` live in
+`payloads/ROS/fiveages.usda`, not a separate chassis payload). A regex that
+drops `def OmniGraphNode "ReadSimTime"` everywhere orphaned G1D's 5 odom/TF
+publishers → stamp 0 → `Timestamp is invalid. Timestamp 0 will be neglected`
+for `world`/`odom`/`base_footprint`, while arm/dex TF (CM clock) stayed fine.
+Tell-tale: `/odom` stamp stuck at `sec:0 nanosec:0` but pose values still move.
+Fix = restore that graph's own `ReadSimTime` (`resetOnStop=1`). After any bulk
+edit, grep that every `Graph/<X>/ReadSimTime.outputs` reference still has a
+matching node definition.
+
 **After the fix:** CM `period` is a steady `0.005 s` (`ratio=1.0000`), moveJ
 `real_t` advances ≈1:1 with sim time, and `home_duration` tracks sim seconds
 (wall ≈ sim / real-time-factor). Verify with `ros2 topic hz /clock` ≈ physics
