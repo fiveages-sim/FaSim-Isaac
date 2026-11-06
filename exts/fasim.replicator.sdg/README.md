@@ -4,6 +4,14 @@ FaSim 机器人的**离线合成数据采集**扩展（基于 Isaac Replicator�
 
 ## 三层架构
 
+> **两条采集路线并存**：
+> - **层2 离线回放**（本 README 主体）：录 npz → 开环重放 → 出图。
+>   快、可批量、可做数据增广；但精细操作（如放试管进小孔）做不到，
+>   因为缺少闭环反馈。
+> - **层2.5 旁路采集**（`scripts/live_capture.py`）：编排正常闭环跑，
+>   在同一 Isaac 进程里旁路采相机。成功率 = 编排的成功率，能做精细操作。
+>   见 `scripts/README_live_capture.md`。
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ 层1  动作生成 + 录制                                           │
@@ -168,6 +176,8 @@ stiffness 提到 50000（决定手指跟随手的速度，太软追不上举手�
 
 ## 用法
 
+### 路线 A：层2 离线回放（录 npz → 重放 → 出图）
+
 ```bash
 cd /home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg
 
@@ -198,6 +208,24 @@ python3 tools/check_quality.py --episode ~/fa_data/pick_01.npz \
 ```bash
 ./scripts/sdg.sh render ... --episode xxx.npz --gui
 ```
+
+### 路线 B：层2.5 旁路采集（编排闭环跑，顺带采相机）
+
+不需要 npz，也不需要回放。编排正常跑，在同一 Isaac 进程里旁路采。
+
+```python
+# 1) ./run.sh 启动仿真，做好跑编排的准备
+# 2) Isaac 的 Window > Script Editor 里执行：
+import sys
+sys.path.insert(0, "/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg")
+exec(open("/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg/scripts/live_capture.py").read())
+arm_capture(out_dir="~/fasim_live/pick_01", every=10, camera="head")
+
+# 3) 终端跑 motion-generation（和平时一样）
+# 4) 回 Script Editor: stop_capture()
+```
+
+详细步骤、产物格式、性能实测见 **`scripts/README_live_capture.md`**。
 
 ### 快速验证工具
 
