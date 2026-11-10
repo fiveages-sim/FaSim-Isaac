@@ -107,10 +107,8 @@ def pack_episode(
                 q = np.asarray(z["joint_pos"], dtype=np.float64).reshape(-1)
                 cols.setdefault("joint_pos", []).append(q)
 
-            # 末端 + 物体：只取明确的 <side>_pos/_quat，排除 joint_pos/obj/
+            # 末端 + 物体：<side>_pos/_quat 与 obj/<label>_pos/_quat
             for k in keys:
-                if k.startswith("obj/"):
-                    continue
                 if k in ("joint_pos", "joint_vel", "joint_names"):
                     continue
                 if k.endswith("_pos") or k.endswith("_quat"):

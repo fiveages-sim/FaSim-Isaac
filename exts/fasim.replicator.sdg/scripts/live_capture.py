@@ -45,6 +45,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 #: 模块级句柄，供 stop_capture() 找到已挂载的会话
 _S: dict[str, Any] = {
     "armed": False,
@@ -77,6 +79,13 @@ def _camera_specs(task, camera: str | None):
     if not picked:
         _log(f"WARN 找不到相机 {want}，可选: {[s.name for s in specs]}")
     return picked
+
+
+def _to_np(x: Any) -> np.ndarray:
+    """warp array / torch tensor / numpy → numpy 数组。"""
+    if hasattr(x, "numpy"):
+        return np.asarray(x.numpy(), dtype=np.float64)
+    return np.asarray(x, dtype=np.float64)
 
 
 def arm_capture(
@@ -275,7 +284,7 @@ def arm_capture(
             if art is not None:
                 try:
                     q = art.get_dof_positions()
-                    payload["joint_pos"] = q.numpy() if hasattr(q, "numpy") else q
+                    payload["joint_pos"] = _to_np(q).astype(np.float32).reshape(1, -1)
                     payload["joint_names"] = dof_names
                 except Exception:  # noqa: BLE001
                     pass
@@ -283,19 +292,22 @@ def arm_capture(
             for side, view in _S.get("ee_views", {}).items():
                 try:
                     p, q = view.get_world_poses()
-                    payload[f"{side}_pos"] = np.asarray(p).reshape(-1)[:3]
-                    payload[f"{side}_quat"] = np.asarray(q).reshape(-1)[:4]
-                except Exception:  # noqa: BLE001
-                    pass
+                    payload[f"{side}_pos"] = _to_np(p).reshape(-1)[:3]
+                    payload[f"{side}_quat"] = _to_np(q).reshape(-1)[:4]
+                except Exception as exc:  # noqa: BLE001
+                    if _S.get("_ee_err", 0) < 2:
+                        _S["_ee_err"] = _S.get("_ee_err", 0) + 1
+                        _log(f"WARN 末端 {side} 取值失败: {exc!r}")
             # 物体位姿（world）：obj/<label>_pos / obj/<label>_quat
             for label, view in _S.get("obj_views", {}).items():
                 try:
                     p, q = view.get_world_poses()
-                    payload[f"obj/{label}_pos"] = np.asarray(p).reshape(-1)[:3]
-                    payload[f"obj/{label}_quat"] = np.asarray(q).reshape(-1)[:4]
-                except Exception:  # noqa: BLE001
-                    pass
-            import numpy as np
+                    payload[f"obj/{label}_pos"] = _to_np(p).reshape(-1)[:3]
+                    payload[f"obj/{label}_quat"] = _to_np(q).reshape(-1)[:4]
+                except Exception as exc:  # noqa: BLE001
+                    if _S.get("_obj_err", 0) < 2:
+                        _S["_obj_err"] = _S.get("_obj_err", 0) + 1
+                        _log(f"WARN 物体 {label} 取值失败: {exc!r}")
 
             # **不能用 savez_compressed**：实测 640x480 时压缩耗时 52ms，
             # 比渲染本身（19ms）还久，会把物理步进拖到 45ms/步。
