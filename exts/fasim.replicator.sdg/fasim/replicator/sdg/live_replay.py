@@ -201,6 +201,7 @@ def play_episode(
         "max_err": 0.0,
         "frames_done": 0,
         "pause_cm": bool(pause_cm),
+        "cm_done": True,  # _pause_controllers 会改成 False（异步流程）
     }
 
     if drive == "ee":
@@ -294,8 +295,13 @@ def play_episode(
         # **必须让运控交出控制权**。仿真里 in-process CM 每 tick 往同一批
         # 关节写位置，会和我们的目标互相覆盖 —— 表现是动作时快时慢、关节
         # 偏几厘米。层2 离线回放没有 CM 抢，所以只要 3 mrad。
+        #
+        # 注意：这里是**异步发起**，由 _on_update 每帧推进（不能阻塞等，
+        # 见 _pause_controllers 的 docstring）。
         if pause_cm:
-            ctx["paused_controllers"] = _pause_controllers(ctx)
+            _pause_controllers(ctx)
+        else:
+            ctx["cm_done"] = True
 
         _log(f"关节驱动 {len(target_idx)} 个，帧 {n_start}..{n_end}")
 
@@ -344,13 +350,24 @@ def _pause_controllers(ctx: dict) -> list[str]:
     - 关节偏几厘米（最终位置是两边的折中；实测 325 mrad，而层2 离线
       回放只要 3 mrad —— 差别就在有没有 CM 抢控制权）
 
-    返回成功停用的控制器名列表（回放结束后恢复）。
+    **绝对不能阻塞等待服务响应**
+    ============================
+    in-process CM 的 ``update()`` 由 Isaac 主循环驱动。我们在主循环的
+    回调里 ``spin_until_future_complete`` 等它，而它要等主循环推进才能
+    处理请求 —— 必然超时（实测 "Switch controller timed out after 3
+    seconds!"）。
+
+    所以：发请求 → 立刻返回；由 ``_on_update`` 每帧 ``spin_once`` 推进，
+    拿到结果后再真正开始回放。
     """
+    ctx["cm_done"] = False
+    ctx["cm_ok"] = False
     try:
         import rclpy
         from controller_manager_msgs.srv import ListControllers, SwitchController
     except ImportError:
         _log("WARN 没有 controller_manager_msgs，无法暂停运控 —— 回放精度会受影响")
+        ctx["cm_done"] = True
         return []
 
     try:
@@ -362,43 +379,137 @@ def _pause_controllers(ctx: dict) -> list[str]:
             ctx["cm_node"] = node
 
         lis = node.create_client(ListControllers, "controller_manager/list_controllers")
-        if not lis.wait_for_service(timeout_sec=2.0):
-            _log("WARN 找不到 controller_manager（运控没起？）—— 直接回放")
-            return []
-        fut = lis.call_async(ListControllers.Request())
-        rclpy.spin_until_future_complete(node, fut, timeout_sec=3.0)
-        if fut.result() is None:
-            _log("WARN list_controllers 无响应")
-            return []
-        active = [c.name for c in fut.result().controller if c.state == "active"]
-        if not active:
-            _log("运控里没有 active 控制器，直接回放")
+        if not lis.service_is_ready():
+            # 非阻塞：由 _poll_cm 每帧重试（wait_for_service 会阻塞主循环）
+            ctx["cm_phase"] = "wait_list"
+            ctx["cm_client"] = lis
+            ctx["cm_wait_list"] = 0
+            _log("等待 controller_manager 服务（异步）…")
             return []
 
-        sw = node.create_client(SwitchController, "controller_manager/switch_controller")
-        if not sw.wait_for_service(timeout_sec=2.0):
-            _log("WARN 没有 switch_controller 服务")
-            return []
-        req = SwitchController.Request()
-        req.deactivate_controllers = active
-        req.activate_controllers = []
-        req.strictness = SwitchController.Request.BEST_EFFORT
-        req.timeout = rclpy.duration.Duration(seconds=3.0).to_msg()
-        f2 = sw.call_async(req)
-        rclpy.spin_until_future_complete(node, f2, timeout_sec=5.0)
-        ok = f2.result() is not None and f2.result().ok
-        if ok:
-            _log(f"已暂停运控控制器（{len(active)} 个）: {active}")
-            return active
-        _log(f"WARN 暂停控制器失败（返回 {f2.result()}）")
+        fut = lis.call_async(ListControllers.Request())
+        ctx["cm_phase"] = "list"
+        ctx["cm_future"] = fut
+        ctx["cm_client"] = lis
+        _log("正在查询运控控制器列表（异步）…")
         return []
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN 暂停运控失败: {exc}")
+        ctx["cm_done"] = True
         return []
 
 
+def _poll_cm(ctx: dict) -> bool:
+    """每帧调用：推进 CM 服务请求。返回 True 表示处理完毕。"""
+    if ctx.get("cm_done"):
+        return True
+    node = ctx.get("cm_node")
+    if node is None:
+        ctx["cm_done"] = True
+        return True
+
+    try:
+        import rclpy
+
+        rclpy.spin_once(node, timeout_sec=0.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 阶段：等服务就绪（非阻塞重试）
+    if ctx.get("cm_phase") == "wait_list":
+        lis = ctx.get("cm_client")
+        if lis is not None and lis.service_is_ready():
+            try:
+                from controller_manager_msgs.srv import ListControllers
+
+                ctx["cm_future"] = lis.call_async(ListControllers.Request())
+                ctx["cm_phase"] = "list"
+                _log("controller_manager 已就绪，查询控制器列表")
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN 构造 list 请求失败: {exc}")
+                ctx["cm_done"] = True
+                return True
+        else:
+            n = ctx.get("cm_wait_list", 0) + 1
+            ctx["cm_wait_list"] = n
+            if n > 600:  # 约 600 帧 ≈ 10s
+                _log("WARN 等不到 controller_manager，跳过暂停运控")
+                ctx["cm_done"] = True
+                return True
+        return False
+
+    fut = ctx.get("cm_future")
+    if fut is None:
+        ctx["cm_done"] = True
+        return True
+    if not fut.done():
+        return False
+
+    phase = ctx.get("cm_phase")
+    try:
+        res = fut.result()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN CM 请求失败: {exc}")
+        ctx["cm_done"] = True
+        return True
+
+    if phase == "list":
+        active = [c.name for c in (res.controller if res else []) if c.state == "active"]
+        if not active:
+            _log("运控里没有 active 控制器，直接回放")
+            ctx["cm_done"] = True
+            return True
+        try:
+            from controller_manager_msgs.srv import SwitchController
+
+            sw = node.create_client(
+                SwitchController, "controller_manager/switch_controller"
+            )
+            if not sw.service_is_ready():
+                # 非阻塞：下一帧再试（wait_for_service 会阻塞主循环 → 死锁）
+                if not ctx.get("cm_wait_sw"):
+                    ctx["cm_wait_sw"] = 0
+                ctx["cm_wait_sw"] += 1
+                if ctx["cm_wait_sw"] > 200:  # 约 200 帧 ≈ 3s
+                    _log("WARN 等不到 switch_controller 服务，跳过暂停")
+                    ctx["cm_done"] = True
+                    return True
+                return False
+            req = SwitchController.Request()
+            req.deactivate_controllers = active
+            req.activate_controllers = []
+            req.strictness = SwitchController.Request.BEST_EFFORT
+            ctx["cm_active"] = active
+            ctx["cm_future"] = sw.call_async(req)
+            ctx["cm_phase"] = "switch"
+            _log(f"请求停用 {len(active)} 个控制器: {active}")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 构造 switch 请求失败: {exc}")
+            ctx["cm_done"] = True
+        return False
+
+    if phase == "switch":
+        ok = bool(res is not None and getattr(res, "ok", False))
+        active = ctx.get("cm_active") or []
+        if ok:
+            _log(f"已暂停运控控制器（{len(active)} 个）: {active}")
+            ctx["paused_controllers"] = active
+        else:
+            _log(f"WARN 暂停控制器失败: {getattr(res, 'message', res)}")
+        ctx["cm_done"] = True
+        return True
+
+    ctx["cm_done"] = True
+    return True
+
+
 def _resume_controllers(ctx: dict) -> None:
-    """回放结束后把之前暂停的控制器恢复。"""
+    """回放结束后把之前暂停的控制器恢复。
+
+    同样**不能阻塞**：这里只是发起请求，由后续帧推进。
+    若回放已结束、不会再进 _on_update，则用一个短轮询（此时不在回调里，
+    主循环仍能推进 CM）。
+    """
     names = ctx.get("paused_controllers") or []
     if not names:
         return
@@ -410,20 +521,28 @@ def _resume_controllers(ctx: dict) -> None:
         if node is None:
             return
         sw = node.create_client(SwitchController, "controller_manager/switch_controller")
-        if not sw.wait_for_service(timeout_sec=2.0):
+        if not sw.service_is_ready() and not sw.wait_for_service(timeout_sec=1.0):
             _log("WARN 恢复时找不到 switch_controller")
             return
         req = SwitchController.Request()
         req.activate_controllers = names
         req.deactivate_controllers = []
         req.strictness = SwitchController.Request.BEST_EFFORT
-        req.timeout = rclpy.duration.Duration(seconds=3.0).to_msg()
         fut = sw.call_async(req)
-        rclpy.spin_until_future_complete(node, fut, timeout_sec=5.0)
-        if fut.result() is not None and fut.result().ok:
+        # 短轮询：不 spin_until，但给 CM 几帧机会处理
+        import time
+
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < 2.0:
+            try:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            except Exception:  # noqa: BLE001
+                break
+            time.sleep(0.01)
+        if fut.done() and fut.result() is not None and fut.result().ok:
             _log(f"已恢复运控控制器: {names}")
         else:
-            _log(f"WARN 恢复控制器失败: {fut.result()}")
+            _log(f"WARN 恢复控制器失败: {fut.result() if fut.done() else '超时'}")
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN 恢复运控失败: {exc}")
     finally:
@@ -502,6 +621,18 @@ def _on_update(_event) -> None:
     if not ctx:
         _finish()
         return
+
+    # 阶段 0：等运控控制器停用完成（异步，不阻塞主循环）
+    if not ctx.get("cm_done", True):
+        if not _poll_cm(ctx):
+            return
+        # 停用完成（成功或失败）：清掉上一帧目标，从头开始
+        ctx["since_frame"] = 0.0
+        ctx["_last_sim_time"] = None
+        if ctx.get("paused_controllers"):
+            _log("运控已让出控制权，开始回放")
+        else:
+            _log("运控仍活跃 —— 关节可能被抢占（精度会下降）")
 
     app_dt = _ensure_app_dt(ctx)
     frame_dt = ctx.get("frame_dt", 0.05)
