@@ -41,9 +41,12 @@ usage() {
 数据检查与转换（不需要 Isaac python）:
   info        看采集会话里有什么（帧数、相机、关节数、体积）
   pack        采集会话 → episode npz（层2 能读的格式）
+  trim        切成任务片段，剔除待机段（ACT 训练必需）
 
-回放自检（需要 Isaac python）:
-  preview     用层2 的驱动回放 episode，确认关节都录到了
+回放自检（需要 Isaac python，preview 的 --drive ee 还需要运控在跑）:
+  preview     回放 episode 验证采集是否忠实
+              --drive joints  逐帧驱关节（默认，不需 ROS）
+              --drive ee      末端位姿发 /left_target,/right_target，OCS2 闭环
 
 配置与离线渲染（需要 Isaac python）:
   list        列出可用的机器人/任务
@@ -92,7 +95,7 @@ CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
 case "$CMD" in
-    capture|status|stop|doctor|info|pack)
+    capture|status|stop|doctor|info|pack|trim)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"

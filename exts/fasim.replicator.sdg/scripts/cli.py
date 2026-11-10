@@ -347,8 +347,16 @@ def cmd_pack(args: argparse.Namespace) -> int:
 def cmd_preview(args: argparse.Namespace) -> int:
     """用层2 的回放路径预览 episode —— 需要 Isaac python。
 
-    这会真的起一个 Isaac（headless 或 GUI），加载场景、锁底盘、drive 驱动
-    关节、让物理重演，并（可选）出图。用来确认「关节角是不是都录到了」。
+    支持两种驱动方式：
+
+    - ``--drive joints``（默认）：逐帧 drive 关节角，物理重演。
+      不需要 ROS，能验证「关节角录全了没」。
+    - ``--drive ee``：把末端位姿逐帧发到运控的 ``/left_target`` /
+      ``/right_target``（geometry_msgs/Pose），由 OCS2 自己算关节。
+      需要仿真里运控在跑（``ROS=fiveages`` 变体）。这验证的是
+      「末端轨迹是否与运控兼容」。
+
+    两者都能出图；``--drive ee`` 时关节由运控闭环控制，更接近真实执行。
     """
     from pathlib import Path as _P
 
@@ -356,6 +364,9 @@ def cmd_preview(args: argparse.Namespace) -> int:
     if not ep.is_file():
         _log(f"ERROR episode 不存在: {ep}")
         return 1
+
+    if args.drive == "ee":
+        return _preview_ee(ep, args)
 
     _log("预览需要 Isaac python 与渲染，正在启动…")
     from fasim.replicator.sdg import renderer as R
@@ -393,6 +404,111 @@ def cmd_preview(args: argparse.Namespace) -> int:
             app.close()
         except Exception:  # noqa: BLE001
             pass
+    return 0
+
+
+def _preview_ee(ep: Path, args: argparse.Namespace) -> int:
+    """``--drive ee``：把末端位姿发给运控，由 OCS2 闭环驱动。"""
+    import os
+    import time
+
+    # ROS 环境：和 ee_traj.sh 一致
+    ros_setup = os.environ.get("ROS_SETUP", "/opt/ros/jazzy/setup.bash")
+    ws_setup = os.environ.get("ROS_WS_SETUP", str(Path.home() / "ros2_ws/install/setup.bash"))
+    for f in (ros_setup, ws_setup):
+        if Path(f).is_file():
+            _log(f"提示：请先 source {f}（当前进程无法替你 source）")
+    os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_zenoh_cpp")
+    os.environ.setdefault("ROS_DISTRO", "jazzy")
+    os.environ.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
+    zenoh = Path.home() / "fa_w2_ws/zenoh/DEFAULT_RMW_ZENOH_SESSION_CONFIG.json5"
+    if zenoh.is_file():
+        os.environ.setdefault("ZENOH_SESSION_CONFIG_URI", str(zenoh))
+
+    try:
+        import rclpy
+        from geometry_msgs.msg import Pose
+    except ImportError:
+        _log("ERROR 当前 python 没有 rclpy。请用 source 过 ROS 的 python 跑，"
+             "或先执行 ./scripts/sdg.sh preview 走 ee_traj.sh 那套环境。")
+        return 1
+
+    from fasim.replicator.sdg.episode import Episode
+
+    episode = Episode.load(ep)
+    n = len(episode)
+    _log(f"episode: {n} 帧，{episode.num_joints} 关节")
+    if not np.all(np.isfinite(episode.left_pos)) or not np.all(np.isfinite(episode.right_pos)):
+        _log("ERROR 这个 episode 没有末端位姿（left_pos/right_pos 含 NaN）。"
+             "采集时要选 ee（sdg.sh capture --what joint,ee）。")
+        return 1
+
+    rclpy.init()
+    node = rclpy.create_node("sdg_preview_ee")
+    pub_l = node.create_publisher(Pose, args.left_topic, 1)
+    pub_r = node.create_publisher(Pose, args.right_topic, 1)
+
+    rate_hz = args.rate if args.rate > 0 else (1.0 / float(np.median(np.diff(episode.t)) if n > 1 else 0.05))
+    _log(f"以 {rate_hz:.1f} Hz 发到 {args.left_topic} / {args.right_topic}")
+    _log("等待订阅者（运控）……最多 10s")
+    t0 = time.monotonic()
+    while pub_l.get_subscription_count() == 0 and time.monotonic() - t0 < 10:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    if pub_l.get_subscription_count() == 0:
+        _log("WARN 没有订阅者 —— 运控起了吗？（ROS=fiveages 变体）")
+    else:
+        _log(f"订阅者: {pub_l.get_subscription_count()}")
+
+    def _mk(p: np.ndarray, q: np.ndarray) -> Pose:
+        m = Pose()
+        m.position.x, m.position.y, m.position.z = (float(x) for x in p[:3])
+        m.orientation.w, m.orientation.x, m.orientation.y, m.orientation.z = (
+            float(x) for x in q[:4]
+        )
+        return m
+
+    try:
+        period = 1.0 / rate_hz
+        t_start = time.monotonic()
+        for i in range(n):
+            pub_l.publish(_mk(episode.left_pos[i], episode.left_quat[i]))
+            pub_r.publish(_mk(episode.right_pos[i], episode.right_quat[i]))
+            rclpy.spin_once(node, timeout_sec=0.0)
+            if not args.gui:  # GUI 下靠用户 Ctrl+C 控制节奏没意义，仍按时间走
+                pass
+            target = t_start + (i + 1) * period
+            sleep = target - time.monotonic()
+            if sleep > 0:
+                time.sleep(sleep)
+            if i % 50 == 0:
+                _log(f"  {i}/{n}")
+        _log(f"发完 {n} 帧")
+    except KeyboardInterrupt:
+        _log("已中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+    return 0
+
+
+def cmd_trim(args: argparse.Namespace) -> int:
+    """把连续采集切成任务片段，剔除待机段。"""
+    from fasim.replicator.sdg import trim
+
+    try:
+        report = trim.trim_session(
+            args.session,
+            threshold=args.threshold,
+            pad_sec=args.pad,
+            min_len_sec=args.min_len,
+            merge_gap_sec=args.merge_gap,
+            write=args.write,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR {exc}")
+        return 1
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -459,7 +575,28 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--task", default="sinopec_test_tube")
     v.add_argument("--out", default="")
     v.add_argument("--gui", action="store_true", help="开窗口（默认无头）")
+    v.add_argument(
+        "--drive", choices=("joints", "ee"), default="joints",
+        help="joints=逐帧 drive 关节角（不需要 ROS）；"
+        "ee=把末端位姿发给运控 /left_target,/right_target（需要运控在跑）",
+    )
+    v.add_argument("--left-topic", default="/left_target")
+    v.add_argument("--right-topic", default="/right_target")
+    v.add_argument("--rate", type=float, default=0.0,
+                   help="--drive ee 时的发送频率；留空按 episode 的 dt")
     v.set_defaults(func=cmd_preview)
+
+    t = sub.add_parser("trim", help="把连续采集切成任务片段，剔除待机段")
+    t.add_argument("session", help="会话目录")
+    t.add_argument("--threshold", type=float, default=0.01,
+                   help="关节角变化率阈值 rad/s（默认 0.01）")
+    t.add_argument("--pad", type=float, default=1.0, help="每段前后缓冲秒数")
+    t.add_argument("--min-len", type=float, default=2.0, help="短于此秒数的段丢弃")
+    t.add_argument("--merge-gap", type=float, default=1.5,
+                   help="两段间隔短于此秒数则合并")
+    t.add_argument("--write", action="store_true", help="真的写出 segment_*.npz")
+    t.add_argument("--json", action="store_true", help="额外打印完整 JSON 报告")
+    t.set_defaults(func=cmd_trim)
 
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):
