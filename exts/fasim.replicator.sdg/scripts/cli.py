@@ -531,6 +531,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "robot_key": args.robot,
         "pause_cm": bool(args.pause_cm),
         "home_frames": int(args.home_frames),
+        "waist_gain": str(args.waist_gain),
     }
     if args.drive == "ee":
         req["left_topic"] = args.left_topic
@@ -716,6 +717,13 @@ def main(argv: list[str] | None = None) -> int:
         "--home-frames", type=int, default=60,
         help="归位过渡帧数（从当前姿态平滑过渡到第 0 帧，默认 60；"
         "0=不归位，直接从当前姿态跳到第 0 帧，可能把物体撞飞）",
+    )
+    lv.add_argument(
+        "--waist-gain", default="usd",
+        help="腰部（LZ_mt/LZ_it/waist_pitch）的 drive gain。"
+        "usd=用资产原值 60000/6000（默认，腰部和手臂物理特性不同）；"
+        "same=和手臂一样用 100000/10000；"
+        "或自定义 K,D[,maxForce] 如 60000,6000,5000",
     )
     lv.set_defaults(func=cmd_live)
 

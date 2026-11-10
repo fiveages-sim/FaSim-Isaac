@@ -121,6 +121,7 @@ def play_episode(
     right_topic: str = "/right_target",
     pause_cm: bool = True,
     home_frames: int = 60,
+    waist_gain: str = "usd",
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -202,6 +203,7 @@ def play_episode(
         "max_err": 0.0,
         "frames_done": 0,
         "pause_cm": bool(pause_cm),
+        "waist_gain": waist_gain,
         "cm_done": True,  # _pause_controllers 会改成 False（异步流程）
     }
 
@@ -276,22 +278,84 @@ def play_episode(
         except Exception as exc:  # noqa: BLE001
             _log(f"WARN 夹爪开关量失败（按位置回放）: {exc}")
 
+        # **剔除 mimic 关节**（如 Dex1 的 *_gripper_joint1，限位 [0,0]）。
+        # _build_gripper_switches 会跳过它们（不进 grip_specs），于是上面的
+        # gd 里没有它们 → 仍留在位置驱动列表里。
+        # 但它们挂了 PhysxMimicJointAPI，由主关节带动；再给它们设 drive
+        # target 会和 mimic 打架，扰动整条运动链（实测多驱动 4 个 mimic）。
+        try:
+            lims = art.get_dof_limits()
+            lo_all = np.asarray(lims[0]).reshape(-1)
+            hi_all = np.asarray(lims[1]).reshape(-1)
+            keep2 = [
+                i for i, d in enumerate(target_idx)
+                if float(hi_all[int(d)] - lo_all[int(d)]) > 1e-6
+            ]
+            dropped = [dofs[int(target_idx[i])] for i in range(len(target_idx))
+                       if i not in keep2]
+            if dropped:
+                _log(f"剔除 mimic 关节 {len(dropped)} 个（由 mimic API 跟随）: {dropped}")
+                target_idx = target_idx[keep2]
+                source_idx = source_idx[keep2]
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 剔除 mimic 失败: {exc}")
+
         ctx.update(art=art, target_idx=target_idx, source_idx=source_idx,
                    grip_specs=grip_specs)
         # 手臂 drive gain —— 与 render_episode 一致。
         # 不设的话用资产默认值（Dex1 的 gain 是给夹爪调的），手臂追不上
         # 目标，实测关节误差 268 mrad。
+        #
+        # **腰部（prismatic 升降）要单独处理**：USD 里是
+        #   LZ_mt_Joint: stiffness=60000 damping=6000 maxForce=5000
+        # 和手臂的 revolute 特性完全不同。统一设 100000 可能让它过硬/过阻尼，
+        # 实测编排里腰部上抬 8.1cm，回放幅度明显偏小。
         try:
-            n = len(target_idx)
-            k, d = 100000.0, 10000.0
-            art.set_dof_gains(
-                stiffnesses=np.full((1, n), k, dtype=np.float32),
-                dampings=np.full((1, n), d, dtype=np.float32),
-                dof_indices=target_idx,
-            )
-            _log(f"手臂 drive gain K={k:g} D={d:g}（{n} 个关节）")
+            arm_sel = target_idx
+            waist_sel = np.array([], dtype=np.int64)
+            if waist_gain and waist_gain.lower() != "same":
+                wset = {"LZ_mt_Joint", "LZ_it_Joint", "waist_pitch_joint", "waist_mount_joint"}
+                w_mask = np.array([dofs[int(d)] in wset for d in target_idx])
+                waist_sel = target_idx[w_mask]
+                arm_sel = target_idx[~w_mask]
+                if len(waist_sel):
+                    maxf = None
+                    if waist_gain.lower() == "usd":
+                        k, d = 60000.0, 6000.0  # USD 原值
+                        _log(f"腰部用 USD 原值 K={k:g} D={d:g}（{len(waist_sel)} 个）")
+                    else:
+                        parts = [float(x) for x in waist_gain.split(",")]
+                        k = parts[0]
+                        d = parts[1] if len(parts) > 1 else 6000.0
+                        maxf = parts[2] if len(parts) > 2 else None
+                        _log(f"腰部自定义 K={k:g} D={d:g}"
+                             + (f" maxForce={maxf:g}" if maxf else "")
+                             + f"（{len(waist_sel)} 个）")
+                    art.set_dof_gains(
+                        stiffnesses=np.full((1, len(waist_sel)), k, dtype=np.float32),
+                        dampings=np.full((1, len(waist_sel)), d, dtype=np.float32),
+                        dof_indices=waist_sel,
+                    )
+                    if maxf is not None:
+                        try:
+                            art.set_dof_max_efforts(
+                                np.full((1, len(waist_sel)), maxf, dtype=np.float32),
+                                dof_indices=waist_sel,
+                            )
+                        except Exception as exc2:  # noqa: BLE001
+                            _log(f"WARN 设腰部 maxForce 失败: {exc2}")
+
+            if len(arm_sel):
+                n = len(arm_sel)
+                k, d = 100000.0, 10000.0
+                art.set_dof_gains(
+                    stiffnesses=np.full((1, n), k, dtype=np.float32),
+                    dampings=np.full((1, n), d, dtype=np.float32),
+                    dof_indices=arm_sel,
+                )
+                _log(f"手臂 drive gain K={k:g} D={d:g}（{n} 个关节）")
         except Exception as exc:  # noqa: BLE001
-            _log(f"WARN 设手臂 gain 失败: {exc}")
+            _log(f"WARN 设 drive gain 失败: {exc}")
 
         # **必须让运控交出控制权**。仿真里 in-process CM 每 tick 往同一批
         # 关节写位置，会和我们的目标互相覆盖 —— 表现是动作时快时慢、关节
