@@ -120,6 +120,7 @@ def play_episode(
     left_topic: str = "/left_target",
     right_topic: str = "/right_target",
     pause_cm: bool = True,
+    home_frames: int = 60,
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -304,6 +305,31 @@ def play_episode(
             ctx["cm_done"] = True
 
         _log(f"关节驱动 {len(target_idx)} 个，帧 {n_start}..{n_end}")
+
+        # 记录**回放前**的关节位置，退出时恢复（否则运控接管时会从陌生
+        # 姿态开始规划，看起来像"运控坏了"）。
+        try:
+            q0 = np.asarray(art.get_dof_positions(), dtype=np.float32).reshape(-1)
+            ctx["initial_dof"] = q0.copy()
+            _log(f"已记录回放前姿态（{len(q0)} DOF），退出时恢复")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 记录初始姿态失败: {exc}")
+
+        # 归位：从当前姿态平滑过渡到第 0 帧，避免 drive 猛冲把物体撞飞。
+        # 实测不归位时：右手从远处瞬间追到第 0 帧，扫过试管架把它带起来。
+        try:
+            first = episode.joint_pos[n_start][source_idx]
+            if np.all(np.isfinite(first)):
+                ctx["home_target"] = first.astype(np.float32)
+                ctx["homing"] = bool(home_frames > 0)
+                if ctx["homing"]:
+                    ctx["home_task"] = True
+                    ctx["home_total"] = max(1, int(home_frames))
+                    ctx["home_step"] = 0
+                    _log(f"归位过渡 {home_frames} 帧 → 第 {n_start} 帧姿态")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 归位目标不可用: {exc}")
+            ctx["homing"] = False
 
     timeline = omni.timeline.get_timeline_interface()
     if not timeline.is_playing():
@@ -503,6 +529,25 @@ def _poll_cm(ctx: dict) -> bool:
     return True
 
 
+def _restore_initial_pose(ctx: dict) -> None:
+    """把关节送回回放前的位置（在运控重新接管之前）。
+
+    用 ``set_dof_positions``（teleport）而不是 drive：这里只要"摆回去"，
+    不需要物理过渡；drive 要几百帧才收敛，而我们已经退订了 update 回调。
+    """
+    art = ctx.get("art")
+    target_idx = ctx.get("target_idx")
+    initial = ctx.get("initial_dof")
+    if art is None or target_idx is None or initial is None:
+        return
+    try:
+        vals = np.asarray(initial, dtype=np.float32)[target_idx].reshape(1, -1)
+        art.set_dof_positions(vals, dof_indices=target_idx)
+        _log(f"已把 {len(target_idx)} 个关节恢复到回放前位置")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 恢复初始姿态失败: {exc}")
+
+
 def _resume_controllers(ctx: dict) -> None:
     """回放结束后把之前暂停的控制器恢复。
 
@@ -649,6 +694,16 @@ def _on_update(_event) -> None:
                 pass
         return
 
+    # 阶段 1：归位过渡（从当前姿态线性插值到第 0 帧）
+    if ctx.get("homing"):
+        _step_homing(ctx)
+        ctx["home_step"] = ctx.get("home_step", 0) + 1
+        if ctx["home_step"] >= ctx["home_total"]:
+            ctx["homing"] = False
+            ctx["since_frame"] = 0.0
+            _log("归位完成，开始回放")
+        return
+
     # 本回调已经推进了 app_dt 的仿真时间
     ctx["since_frame"] = ctx.get("since_frame", 0.0) + app_dt
     advance = ctx["since_frame"] >= frame_dt - app_dt * 0.5
@@ -758,6 +813,40 @@ def _ensure_app_dt(ctx: dict) -> float:
     return dt
 
 
+def _step_homing(ctx: dict) -> None:
+    """归位过渡：从记录的回放前姿态线性插值到第 0 帧姿态。
+
+    为什么不能直接跳：drive 会把"位置差"变成力矩。若当前手在远处、第 0
+    帧在试管旁，瞬间的目标差会让手臂高速扫过去 —— 实测会把试管架带起来。
+    """
+    art = ctx["art"]
+    target_idx = ctx["target_idx"]
+    start = ctx.get("initial_dof")
+    goal = ctx.get("home_target")
+    total = max(1, int(ctx.get("home_total", 60)))
+    step = min(int(ctx.get("home_step", 0)), total - 1)
+    if start is None or goal is None:
+        ctx["homing"] = False
+        return
+
+    # 只对要驱动的关节插值
+    s = np.asarray(start, dtype=np.float32)[target_idx]
+    g = np.asarray(goal, dtype=np.float32)
+    ratio = (step + 1) / total
+    # 缓入缓出，避免起止速度突变
+    ratio = 0.5 - 0.5 * np.cos(np.pi * ratio)
+    val = (s + (g - s) * ratio).astype(np.float32).reshape(1, -1)
+    art.set_dof_position_targets(val, dof_indices=target_idx)
+
+    for spec in ctx.get("grip_specs", []):
+        closed = bool(spec["closed"][min(ctx["n_start"], len(spec["closed"]) - 1)])
+        tgt = spec["close_target"] if closed else spec["open_target"]
+        art.set_dof_position_targets(
+            np.array([[tgt]], dtype=np.float32),
+            dof_indices=np.array([spec["dof"]], dtype=np.int64),
+        )
+
+
 def tl_now(ctx: dict) -> float:
     """当前仿真时间（用于日志）。"""
     try:
@@ -820,13 +909,21 @@ def _step_ee(ctx: dict, i: int) -> None:
 
 
 def _finish() -> None:
-    """收尾：恢复运控、退订、销毁 ROS 节点、打印统计。"""
+    """收尾：把关节送回回放前姿态、恢复运控、退订、打印统计。
+
+    **顺序很重要**：必须先把关节恢复到回放前的位置，再重新激活控制器。
+    否则 OCS2 会从「任务结束姿态」（比如手举在半空）开始规划，之后无论
+    怎么重启仿真都保持那个姿态 —— 用户看到的就是"运控坏了"。
+    """
     ctx = _STATE.get("ctx") or {}
     _STATE["playing"] = False
     _STATE["cancel"] = False
     _uninstall_update_hook()
 
-    # 先恢复运控（回放期间被暂停过）
+    # 1) 送回原位（在恢复运控之前）
+    _restore_initial_pose(ctx)
+
+    # 2) 恢复运控（回放期间被暂停过）
     if ctx.get("paused_controllers"):
         _resume_controllers(ctx)
 

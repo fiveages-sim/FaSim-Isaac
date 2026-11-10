@@ -530,6 +530,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "loop": args.loop,
         "robot_key": args.robot,
         "pause_cm": bool(args.pause_cm),
+        "home_frames": int(args.home_frames),
     }
     if args.drive == "ee":
         req["left_topic"] = args.left_topic
@@ -710,6 +711,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-pause-cm", dest="pause_cm", action="store_false", default=True,
         help="不回放时暂停运控控制器。默认会暂停（否则运控会覆盖关节目标，"
         "导致动作时快时慢、关节偏几厘米）",
+    )
+    lv.add_argument(
+        "--home-frames", type=int, default=60,
+        help="归位过渡帧数（从当前姿态平滑过渡到第 0 帧，默认 60；"
+        "0=不归位，直接从当前姿态跳到第 0 帧，可能把物体撞飞）",
     )
     lv.set_defaults(func=cmd_live)
 
