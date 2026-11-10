@@ -132,7 +132,7 @@ def _switch_activate(node, executor, cm: str, controllers: list[str]) -> bool:
         SwitchController,
         f"{cm}/switch_controller",
         req,
-        timeout_sec=90.0,
+        timeout_sec=120.0,
     )
     return bool(getattr(res, "ok", False))
 
@@ -188,7 +188,9 @@ def activate_controllers(controllers: Iterable[str], namespace: str = "") -> Non
         executor.add_node(node)
         cm = _cm_name(namespace)
         list_client = node.create_client(ListControllers, f"{cm}/list_controllers")
-        deadline = time.monotonic() + 30.0
+        # Cold Play often spends 30–90s recovering PhysX tensor views before CM
+        # is usable; keep waiting long enough for the first Play of a stage.
+        deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline and not list_client.service_is_ready():
             executor.spin_once(timeout_sec=0.05)
         if not list_client.service_is_ready():
@@ -199,7 +201,7 @@ def activate_controllers(controllers: Iterable[str], namespace: str = "") -> Non
         _configure_all(node, executor, cm, names)
 
         # Give physics post-step a moment to tick the CM after configure.
-        settle = time.monotonic() + 1.0
+        settle = time.monotonic() + 3.0
         while time.monotonic() < settle:
             executor.spin_once(timeout_sec=0.05)
 
