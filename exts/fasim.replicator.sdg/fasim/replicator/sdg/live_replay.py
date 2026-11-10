@@ -119,6 +119,7 @@ def play_episode(
     on_frame: Callable[[int, dict], None] | None = None,
     left_topic: str = "/left_target",
     right_topic: str = "/right_target",
+    pause_cm: bool = True,
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -199,6 +200,7 @@ def play_episode(
         "errs": [],
         "max_err": 0.0,
         "frames_done": 0,
+        "pause_cm": bool(pause_cm),
     }
 
     if drive == "ee":
@@ -288,6 +290,13 @@ def play_episode(
             _log(f"手臂 drive gain K={k:g} D={d:g}（{n} 个关节）")
         except Exception as exc:  # noqa: BLE001
             _log(f"WARN 设手臂 gain 失败: {exc}")
+
+        # **必须让运控交出控制权**。仿真里 in-process CM 每 tick 往同一批
+        # 关节写位置，会和我们的目标互相覆盖 —— 表现是动作时快时慢、关节
+        # 偏几厘米。层2 离线回放没有 CM 抢，所以只要 3 mrad。
+        if pause_cm:
+            ctx["paused_controllers"] = _pause_controllers(ctx)
+
         _log(f"关节驱动 {len(target_idx)} 个，帧 {n_start}..{n_end}")
 
     timeline = omni.timeline.get_timeline_interface()
@@ -320,6 +329,105 @@ def play_episode(
 
 
 # ---------------------------------------------------------------- update 驱动
+
+
+def _pause_controllers(ctx: dict) -> list[str]:
+    """回放关节前把运控控制器置为 inactive，避免它覆盖我们的目标。
+
+    为什么必须做
+    ============
+    仿真里 ``ROS=fiveages`` 变体起的 in-process ControllerManager 每 tick
+    都会往同一批关节写位置。我的 ``set_dof_position_targets`` 立刻被它
+    覆盖，结果是两个控制器互相拉扯：
+
+    - 动作时快时慢（OCS2 重新规划又被打断）
+    - 关节偏几厘米（最终位置是两边的折中；实测 325 mrad，而层2 离线
+      回放只要 3 mrad —— 差别就在有没有 CM 抢控制权）
+
+    返回成功停用的控制器名列表（回放结束后恢复）。
+    """
+    try:
+        import rclpy
+        from controller_manager_msgs.srv import ListControllers, SwitchController
+    except ImportError:
+        _log("WARN 没有 controller_manager_msgs，无法暂停运控 —— 回放精度会受影响")
+        return []
+
+    try:
+        if not rclpy.ok():
+            rclpy.init()
+        node = ctx.get("cm_node")
+        if node is None:
+            node = rclpy.create_node("sdg_live_pause_cm")
+            ctx["cm_node"] = node
+
+        lis = node.create_client(ListControllers, "controller_manager/list_controllers")
+        if not lis.wait_for_service(timeout_sec=2.0):
+            _log("WARN 找不到 controller_manager（运控没起？）—— 直接回放")
+            return []
+        fut = lis.call_async(ListControllers.Request())
+        rclpy.spin_until_future_complete(node, fut, timeout_sec=3.0)
+        if fut.result() is None:
+            _log("WARN list_controllers 无响应")
+            return []
+        active = [c.name for c in fut.result().controller if c.state == "active"]
+        if not active:
+            _log("运控里没有 active 控制器，直接回放")
+            return []
+
+        sw = node.create_client(SwitchController, "controller_manager/switch_controller")
+        if not sw.wait_for_service(timeout_sec=2.0):
+            _log("WARN 没有 switch_controller 服务")
+            return []
+        req = SwitchController.Request()
+        req.deactivate_controllers = active
+        req.activate_controllers = []
+        req.strictness = SwitchController.Request.BEST_EFFORT
+        req.timeout = rclpy.duration.Duration(seconds=3.0).to_msg()
+        f2 = sw.call_async(req)
+        rclpy.spin_until_future_complete(node, f2, timeout_sec=5.0)
+        ok = f2.result() is not None and f2.result().ok
+        if ok:
+            _log(f"已暂停运控控制器（{len(active)} 个）: {active}")
+            return active
+        _log(f"WARN 暂停控制器失败（返回 {f2.result()}）")
+        return []
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 暂停运控失败: {exc}")
+        return []
+
+
+def _resume_controllers(ctx: dict) -> None:
+    """回放结束后把之前暂停的控制器恢复。"""
+    names = ctx.get("paused_controllers") or []
+    if not names:
+        return
+    try:
+        import rclpy
+        from controller_manager_msgs.srv import SwitchController
+
+        node = ctx.get("cm_node")
+        if node is None:
+            return
+        sw = node.create_client(SwitchController, "controller_manager/switch_controller")
+        if not sw.wait_for_service(timeout_sec=2.0):
+            _log("WARN 恢复时找不到 switch_controller")
+            return
+        req = SwitchController.Request()
+        req.activate_controllers = names
+        req.deactivate_controllers = []
+        req.strictness = SwitchController.Request.BEST_EFFORT
+        req.timeout = rclpy.duration.Duration(seconds=3.0).to_msg()
+        fut = sw.call_async(req)
+        rclpy.spin_until_future_complete(node, fut, timeout_sec=5.0)
+        if fut.result() is not None and fut.result().ok:
+            _log(f"已恢复运控控制器: {names}")
+        else:
+            _log(f"WARN 恢复控制器失败: {fut.result()}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 恢复运控失败: {exc}")
+    finally:
+        ctx["paused_controllers"] = []
 
 
 def _make_pose_factory(Pose):
@@ -581,15 +689,24 @@ def _step_ee(ctx: dict, i: int) -> None:
 
 
 def _finish() -> None:
-    """收尾：退订、销毁 ROS 节点、打印统计。"""
+    """收尾：恢复运控、退订、销毁 ROS 节点、打印统计。"""
     ctx = _STATE.get("ctx") or {}
     _STATE["playing"] = False
     _STATE["cancel"] = False
     _uninstall_update_hook()
 
+    # 先恢复运控（回放期间被暂停过）
+    if ctx.get("paused_controllers"):
+        _resume_controllers(ctx)
+
     if ctx.get("node") is not None:
         try:
             ctx["node"].destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
+    if ctx.get("cm_node") is not None:
+        try:
+            ctx["cm_node"].destroy_node()
         except Exception:  # noqa: BLE001
             pass
 

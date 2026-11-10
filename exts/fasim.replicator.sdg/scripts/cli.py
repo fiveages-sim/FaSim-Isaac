@@ -529,6 +529,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "end": args.end,
         "loop": args.loop,
         "robot_key": args.robot,
+        "pause_cm": bool(args.pause_cm),
     }
     if args.drive == "ee":
         req["left_topic"] = args.left_topic
@@ -705,6 +706,11 @@ def main(argv: list[str] | None = None) -> int:
     lv.add_argument("--left-topic", default="/left_target")
     lv.add_argument("--right-topic", default="/right_target")
     lv.add_argument("--wait", action="store_true", help="阻塞等待回放结束")
+    lv.add_argument(
+        "--no-pause-cm", dest="pause_cm", action="store_false", default=True,
+        help="不回放时暂停运控控制器。默认会暂停（否则运控会覆盖关节目标，"
+        "导致动作时快时慢、关节偏几厘米）",
+    )
     lv.set_defaults(func=cmd_live)
 
     sub.add_parser("live-status", help="回放进度").set_defaults(func=cmd_live_status)
