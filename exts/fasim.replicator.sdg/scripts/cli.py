@@ -69,6 +69,7 @@ import argparse
 import json
 import socket
 import sys
+import time
 from pathlib import Path
 
 SDG_EXT = Path(__file__).resolve().parents[1]
@@ -512,6 +513,85 @@ def cmd_trim(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_live(args: argparse.Namespace) -> int:
+    """在同一 Isaac 实例里回放 episode（不弹新窗口）。"""
+    ep = Path(args.episode).expanduser().resolve()
+    if not ep.is_file():
+        _log(f"ERROR episode 不存在: {ep}")
+        return 1
+
+    req = {
+        "cmd": "live",
+        "episode": str(ep),
+        "drive": args.drive,
+        "speed": args.speed,
+        "start": args.start,
+        "end": args.end,
+        "loop": args.loop,
+        "robot_key": args.robot,
+    }
+    if args.drive == "ee":
+        req["left_topic"] = args.left_topic
+        req["right_topic"] = args.right_topic
+
+    resp = _request(req, timeout=30)
+    if not resp.get("ok"):
+        _log(f"ERROR {resp.get('error', '未知错误')}")
+        return 1
+    _log(f"开始回放: {resp['frames']} 帧，drive={resp['drive']}，"
+         f"驱动 {resp.get('driven_joints', 0)} 个关节")
+    if args.wait:
+        _log("等待回放结束（Ctrl+C 中断）…")
+        try:
+            while True:
+                time.sleep(0.5)
+                st = _request({"cmd": "live_status"}, timeout=5)
+                if not st.get("playing"):
+                    _log("回放已结束")
+                    break
+                print(f"  {st['frame']}/{st['total']}  t={st['t']:.2f}s", end="\r", flush=True)
+        except KeyboardInterrupt:
+            _log("请求停止…")
+            _request({"cmd": "live_stop"}, timeout=10)
+    else:
+        _log("回放已在 Isaac 里开始（不阻塞）。进度: ./scripts/sdg.sh live-status")
+    return 0
+
+
+def cmd_live_status(args: argparse.Namespace) -> int:
+    resp = _request({"cmd": "live_status"}, timeout=10)
+    if not resp.get("ok"):
+        _log(f"ERROR {resp.get('error', '未知错误')}")
+        return 1
+    if not resp.get("playing"):
+        _log("当前没有在回放")
+        return 0
+    _log(f"回放中: {resp['frame']}/{resp['total']}  t={resp['t']:.2f}s"
+         + ("  [暂停]" if resp.get("paused") else ""))
+    return 0
+
+
+def cmd_live_stop(args: argparse.Namespace) -> int:
+    resp = _request({"cmd": "live_stop"}, timeout=10)
+    if not resp.get("ok"):
+        _log(f"ERROR {resp.get('error', '未知错误')}")
+        return 1
+    _log("已请求停止")
+    return 0
+
+
+def cmd_live_pause(args: argparse.Namespace) -> int:
+    resp = _request({"cmd": "live_pause"}, timeout=10)
+    _log("已暂停" if resp.get("ok") else f"ERROR {resp.get('error')}")
+    return 0 if resp.get("ok") else 1
+
+
+def cmd_live_resume(args: argparse.Namespace) -> int:
+    resp = _request({"cmd": "live_resume"}, timeout=10)
+    _log("已继续" if resp.get("ok") else f"ERROR {resp.get('error')}")
+    return 0 if resp.get("ok") else 1
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     """自检：路径、socket、扩展是否就绪。"""
     print("=== SDG 数采环境自检 ===")
@@ -597,6 +677,26 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--write", action="store_true", help="真的写出 segment_*.npz")
     t.add_argument("--json", action="store_true", help="额外打印完整 JSON 报告")
     t.set_defaults(func=cmd_trim)
+
+    lv = sub.add_parser("live", help="在同一 Isaac 实例里回放 episode（不弹新窗口）")
+    lv.add_argument("episode")
+    lv.add_argument("--robot", default="unitree_g1d")
+    lv.add_argument("--drive", choices=("joints", "ee"), default="joints",
+                    help="joints=逐帧 drive 关节角（不需要 ROS）；"
+                    "ee=发末端位姿给运控 /left_target,/right_target")
+    lv.add_argument("--speed", type=float, default=1.0, help="倍速（ee 驱动时生效）")
+    lv.add_argument("--start", type=int, default=0)
+    lv.add_argument("--end", type=int, default=0, help="0=到末尾")
+    lv.add_argument("--loop", action="store_true", help="循环播放")
+    lv.add_argument("--left-topic", default="/left_target")
+    lv.add_argument("--right-topic", default="/right_target")
+    lv.add_argument("--wait", action="store_true", help="阻塞等待回放结束")
+    lv.set_defaults(func=cmd_live)
+
+    sub.add_parser("live-status", help="回放进度").set_defaults(func=cmd_live_status)
+    sub.add_parser("live-stop", help="停止回放").set_defaults(func=cmd_live_stop)
+    sub.add_parser("live-pause", help="暂停回放").set_defaults(func=cmd_live_pause)
+    sub.add_parser("live-resume", help="继续回放").set_defaults(func=cmd_live_resume)
 
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):

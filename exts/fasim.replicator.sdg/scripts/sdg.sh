@@ -95,7 +95,7 @@ CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
 case "$CMD" in
-    capture|status|stop|doctor|info|pack|trim)
+    capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"

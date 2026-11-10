@@ -149,8 +149,43 @@ def _dispatch(req: dict) -> dict:
                     "out": str(s["out"]) if s["out"] else "",
                     "cameras": [c["name"] for c in s["cameras"]],
                     "every": s["every"],
+                    "what": s.get("what", []),
                 }
             return {"ok": True, "armed": False}
+
+        if verb in ("live", "play"):
+            # 在同一实例里回放 episode（非阻塞，靠 update 推进）
+            from fasim.replicator.sdg import live_replay
+
+            ep = str(req.pop("episode", "") or "")
+            if not ep:
+                return {"ok": False, "error": "缺少 episode 路径"}
+            req.pop("cmd", None)
+            res = live_replay.play_episode(ep, **req)
+            return res
+
+        if verb == "live_stop":
+            from fasim.replicator.sdg import live_replay
+
+            live_replay.stop()
+            return {"ok": True}
+
+        if verb == "live_pause":
+            from fasim.replicator.sdg import live_replay
+
+            live_replay.pause()
+            return {"ok": True}
+
+        if verb == "live_resume":
+            from fasim.replicator.sdg import live_replay
+
+            live_replay.resume()
+            return {"ok": True}
+
+        if verb == "live_status":
+            from fasim.replicator.sdg import live_replay
+
+            return {"ok": True, **live_replay.status()}
 
         return {"ok": False, "error": f"未知指令 {verb!r}（支持 start/stop/status）"}
     except Exception as exc:  # noqa: BLE001

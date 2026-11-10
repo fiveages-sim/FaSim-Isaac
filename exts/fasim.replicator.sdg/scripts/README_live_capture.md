@@ -99,6 +99,27 @@ cd ~/FaSim-Isaac/exts/fasim.replicator.sdg
 | `sim_step` | — | 物理步计数（**时间轴唯一依据**）|
 | `wall_time` | — | 墙钟（仅诊断用，**不要作为时间轴**）|
 
+## 两种回放方式
+
+| | `sdg.sh live`（推荐） | `sdg.sh preview` |
+|---|---|---|
+| 用哪个 Isaac | **你已开着的那个** | 新起一个（无头/GUI） |
+| 场景 | 当前 stage，不重载 | 重新打开 scene_usda |
+| 适用 | 肉眼确认数据 | 批量出图 / CI |
+| 末端驱动 | ✅ 直接发运控话题 | ✅ 同样支持 |
+
+```bash
+# 你开着仿真时，直接在当前实例回放
+./scripts/sdg.sh live <episode.npz>                    # 逐帧驱关节
+./scripts/sdg.sh live <episode.npz> --drive ee         # 发末端给运控
+./scripts/sdg.sh live <episode.npz> --loop             # 循环
+./scripts/sdg.sh live-status                           # 进度
+./scripts/sdg.sh live-stop                             # 停止
+```
+
+**为什么不弹新窗口**：`sdg.sh live` 只是让扩展在当前 stage 上驱动关节，
+不碰 `ctx.open_stage()`，所以你正在用的仿真（含运控）不会被重置。
+
 ## 数据的时间轴可靠性
 
 采集由**物理步**驱动，与墙钟无关：

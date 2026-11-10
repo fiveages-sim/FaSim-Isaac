@@ -503,6 +503,21 @@ def render_episode(
             "episode 里没有任何一列有有效关节角 —— 数据无效，拒绝渲染。"
         )
     skipped = skipped_dof_names(dof_names)
+    # 底盘（轮子/脚轮）**必须从驱动列表里剔除**，否则：
+    #   - 轮子被当位置目标驱动，会和物理/底盘控制打架
+    #   - 脚轮是被动关节，强行驱动会产生巨大跟踪误差（实测 74 mrad）
+    if len(target_idx):
+        non_manip = set(skipped_dof_names(dof_names))
+        keep = [
+            i for i, d in enumerate(target_idx)
+            if dof_names[int(d)] not in non_manip
+        ]
+        dropped = len(target_idx) - len(keep)
+        if dropped:
+            _log(f"剔除底盘关节 {dropped} 个（不驱动）: "
+                 f"{[dof_names[int(target_idx[i])] for i in range(len(target_idx)) if i not in keep]}")
+            target_idx = target_idx[keep]
+            source_idx = source_idx[keep]
     if missing:
         _log(f"WARN episode 里有 {len(missing)} 个关节在此 articulation 中找不到: {missing}")
         _log("     这些列会被忽略；回放后的姿态可能与录制不一致。")
