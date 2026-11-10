@@ -348,7 +348,21 @@ def _uninstall_update_hook() -> None:
 
 
 def _on_update(_event) -> None:
-    """每帧推进一步。**必须极快返回**，否则拖慢整个 Kit。"""
+    """推进一步。**必须极快返回**，否则拖慢整个 Kit。
+
+    时间基准
+    ========
+    录制的帧间隔（如 50ms）往往**大于**一次 ``app.update()`` 推进的
+    仿真时间（16.67ms）。若每帧只 update 一次，回放会快 3 倍 —— 动作在
+    屏幕上"跳"，而不是连续播放。
+
+    做法：本回调**自己就是一次 update**，所以用"欠账"计数：目标是让
+    episode 的 t 轴与仿真时间对齐。每进一次回调，仿真推进 app_dt；
+    当累计推进量够一帧（frame_dt）时才切到下一帧，否则重复当前帧的
+    目标（保持不动，让物理继续走）。
+
+    **绝不能在这里 for 循环调 app.update()** —— 会重入 Kit 主循环。
+    """
     if not _STATE["playing"]:
         return
     if _STATE["cancel"]:
@@ -362,21 +376,37 @@ def _on_update(_event) -> None:
         _finish()
         return
 
+    app_dt = _ensure_app_dt(ctx)
+    frame_dt = ctx.get("frame_dt", 0.05)
+
+    # 本回调已经推进了 app_dt 的仿真时间
+    ctx["since_frame"] = ctx.get("since_frame", 0.0) + app_dt
+    advance = ctx["since_frame"] >= frame_dt - app_dt * 0.5
+
     i = _STATE["i"]
     n_end = ctx["n_end"]
     episode = ctx["episode"]
 
     try:
-        if ctx["drive"] == "ee":
-            _step_ee(ctx, i)
+        if advance:
+            ctx["since_frame"] = 0.0
+            if ctx["drive"] == "ee":
+                _step_ee(ctx, i)
+            else:
+                _step_joints(ctx, i)
         else:
-            _step_joints(ctx, i)
+            # 还没到下一帧：重发当前目标，保持姿态（不要跳帧）
+            if ctx["drive"] == "joints":
+                _hold_joints(ctx, i)
     except Exception as exc:  # noqa: BLE001
         import traceback
 
         _log(f"回放出错（第 {i} 帧）: {exc!r}")
         traceback.print_exc()
         _finish()
+        return
+
+    if not advance:
         return
 
     _STATE["frame"] = i
@@ -388,9 +418,9 @@ def _on_update(_event) -> None:
         except Exception:  # noqa: BLE001
             pass
     fd = ctx["frames_done"]
-    if fd % 100 == 0:
+    if fd % 50 == 0:
         me = ctx.get("max_err", 0.0) * 1000
-        _log(f"  {i}/{n_end}  max_err={me:.1f}mrad")
+        _log(f"  {i}/{n_end}  max_err={me:.1f}mrad  ({fd} 帧)")
 
     i += 1
     if i >= n_end:
@@ -403,18 +433,17 @@ def _on_update(_event) -> None:
     _STATE["i"] = i
 
 
-def _step_joints(ctx: dict, i: int) -> None:
+def _hold_joints(ctx: dict, i: int) -> None:
+    """重复当前帧目标（帧间隔 > 单次 update 时用，避免跳帧）。"""
     art = ctx["art"]
     source_idx = ctx["source_idx"]
     target_idx = ctx["target_idx"]
     episode = ctx["episode"]
-
     row = episode.joint_pos[i][source_idx]
-    values = None
     if np.all(np.isfinite(row)):
-        values = row.astype(np.float32).reshape(1, -1)
-        art.set_dof_position_targets(values, dof_indices=target_idx)
-
+        art.set_dof_position_targets(
+            row.astype(np.float32).reshape(1, -1), dof_indices=target_idx
+        )
     for spec in ctx.get("grip_specs", []):
         closed = bool(spec["closed"][min(i, len(spec["closed"]) - 1)])
         tgt = spec["close_target"] if closed else spec["open_target"]
@@ -423,16 +452,69 @@ def _step_joints(ctx: dict, i: int) -> None:
             dof_indices=np.array([spec["dof"]], dtype=np.int64),
         )
 
-    if values is not None:
+
+def _ensure_app_dt(ctx: dict) -> float:
+    """实测 app.update() 一次推进多少仿真秒（只测一次）。"""
+    if ctx.get("app_dt"):
+        return float(ctx["app_dt"])
+    app_dt = 0.016666
+    try:
+        import omni.kit.app
+        import omni.timeline
+
+        tl = omni.timeline.get_timeline_interface()
+        if not tl.is_playing():
+            tl.play()
+        t0 = float(tl.get_current_time())
+        omni.kit.app.get_app().update()
+        t1 = float(tl.get_current_time())
+        if t1 > t0:
+            app_dt = t1 - t0
+        _log(f"实测每次 update 推进 {app_dt*1000:.2f} ms 仿真时间")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 测 app_dt 失败（用 16.67ms）: {exc}")
+    ctx["app_dt"] = app_dt
+    return app_dt
+
+
+def _step_joints(ctx: dict, i: int) -> None:
+    art = ctx["art"]
+    source_idx = ctx["source_idx"]
+    target_idx = ctx["target_idx"]
+    episode = ctx["episode"]
+
+    # 1) 先校验**上一帧**的目标 vs 当前 actual。
+    #    不能"设完 target 立刻读 actual" —— 此时物理还没步进，读到的是
+    #    上一帧的值，会得到假误差（实测恒定 268 mrad，加 gain 完全没变化
+    #    就是因为这个）。
+    prev = ctx.get("prev_values")
+    if prev is not None:
         try:
             act = np.asarray(
                 art.get_dof_positions(dof_indices=target_idx), dtype=np.float32
             ).reshape(-1)
-            e = float(np.max(np.abs(act - values.reshape(-1))))
+            e = float(np.max(np.abs(act - prev)))
             ctx.setdefault("errs", []).append(e)
             ctx["max_err"] = max(ctx.get("max_err", 0.0), e)
         except Exception:  # noqa: BLE001
             pass
+
+    # 2) 再设当前帧目标
+    row = episode.joint_pos[i][source_idx]
+    if np.all(np.isfinite(row)):
+        values = row.astype(np.float32).reshape(1, -1)
+        art.set_dof_position_targets(values, dof_indices=target_idx)
+        ctx["prev_values"] = values.reshape(-1).copy()
+    else:
+        ctx["prev_values"] = None
+
+    for spec in ctx.get("grip_specs", []):
+        closed = bool(spec["closed"][min(i, len(spec["closed"]) - 1)])
+        tgt = spec["close_target"] if closed else spec["open_target"]
+        art.set_dof_position_targets(
+            np.array([[tgt]], dtype=np.float32),
+            dof_indices=np.array([spec["dof"]], dtype=np.int64),
+        )
 
 
 def _step_ee(ctx: dict, i: int) -> None:
