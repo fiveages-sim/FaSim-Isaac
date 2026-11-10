@@ -1,9 +1,22 @@
 """在**正在运行编排**的 Isaac Sim 会话里旁路采集 Replicator 数据。
 
-用途
+推荐用法
+========
+不要直接调本模块 —— 用交互式 CLI::
+
+    ./scripts/sdg.sh capture      # 选机器人/任务/相机/输出目录/fps
+    ./scripts/sdg.sh status       # 看进度
+    ./scripts/sdg.sh stop         # 结束
+
+CLI 通过 ``<runtime>/capture.sock`` 把指令发给随 Isaac 自动加载的扩展
+（``fasim/replicator/sdg/scripts/extension.py``），本模块负责真正的采集。
+
+也可以在 Script Editor 里直接调 ``arm_capture()``（调试用）。
+
+路线
 ====
-路线：编排当主干（闭环、高成功率），Replicator 当工具（出相机数据）。
-不额外起 ROS 通信、不接管控制——只挂在同一个 Isaac 进程里"看"。
+编排当主干（闭环、高成功率），Replicator 当工具（出相机数据）。
+不额外起 ROS 通信、不接管控制 —— 只挂在同一个 Isaac 进程里"看"。
 
 为什么能不影响编排
 ==================
@@ -11,35 +24,18 @@ ros2_control（``ROS=fiveages`` 变体）跑在 **Isaac 进程内**，和渲染�
 共享同一个 ``app.update()`` 时钟。本模块：
 
 - **不自己开循环**，挂 ``physics step`` 事件回调；
-- 回调里只做 ``annotator.get_data()``（读已有缓冲），不阻塞；
-- 渲染用 ``orchestrator.step()``，但按 ``--every`` 降采样（默认每 10 个
-  物理步才渲一次），把开销压到可控。
-
-关键：``get_data()`` 拿到的永远是**最近一次渲染**的缓冲。所以必须保证
-每次都真正渲过（``orchestrator.step``），否则会拿到重复帧。脚本会记录
-时间戳，跑完可以检查是否有重复。
-
-用法（Isaac Sim GUI 已启动、场景已加载、准备跑编排时）
-====================================================
-在 ``Window > Script Editor`` 里粘贴执行::
-
-    import sys
-    sys.path.insert(0, "/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg")
-    exec(open("/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg/scripts/live_capture.py").read())
-
-    arm_capture(out_dir="~/fasim_live", every=10, camera="head")
-    # -> 立刻返回。现在去终端跑 motion-generation。
-
-    # 编排跑完后：
-    stop_capture()
+- 回调里只 ``annotator.get_data()``（读已有缓冲） + ``np.savez``（1.3ms），
+  不阻塞；
+- 渲染由 Replicator tick 图跟着 ``app.update()`` 自动驱动。**不要调
+  ``rep.orchestrator.step()``** —— Kit 内会抛 OrchestratorError。
 
 产物::
 
-    <out_dir>/frames/frame_000123.npz    rgb / depth / 内参 / 时间戳
-    <out_dir>/session.json               相机参数、帧数、丢帧统计
+    <out>/frames/frame_000123.npz   rgb / depth / joint_pos / sim_step
+    <out>/session.json              相机参数、帧数、物理步数、错误数
 
-**不要在 Script Editor 里写 while/sleep 循环** —— 会饿死 Kit 主循环，
-物理停住、OCS2 卡死。
+注意：不要在 Script Editor 或任何回调里写 while / sleep 循环 —— 会饿死
+Kit 主循环，物理停住、OCS2 卡死。
 """
 
 from __future__ import annotations
@@ -84,7 +80,7 @@ def _camera_specs(task, camera: str | None):
 
 
 def arm_capture(
-    out_dir: str = "~/fasim_live",
+    out_dir: str = "",
     every: int = 10,
     camera: str = "head",
     robot_key: str = "unitree_g1d",
@@ -93,18 +89,21 @@ def arm_capture(
     height: int | None = None,
     record_joints: bool = True,
     depth: bool = True,
+    name: str = "",
 ) -> dict | None:
     """挂载采集器并立即返回（非阻塞）。
 
     Args:
-        out_dir: 输出根目录。
-        every: 每多少个**物理步**采一帧。物理 200Hz 时 every=10 ≈ 20fps。
-            渲染一次约 20~25ms；若发现控制明显变慢，把它调大（如 20 或 40）。
+        out_dir: 输出目录。留空 → ``<data_root>/<robot>/<task>/<时间戳>/``，
+            其中 ``data_root`` 由 ``FASIM_SDG_DATA`` 决定（默认 ``~/fasim_data``）。
+        every: 每多少个**物理步**采一帧。177Hz 下 every=10 ≈ 17.7fps。
+            渲染越频繁物理越慢；控制受影响就调大（20 / 40）。
         camera: 相机名，逗号分隔多个；空字符串=全部。
         robot_key / task_key: 选 ``configs/<robot>/`` 与 ``tasks/<task>.yaml``。
-        width/height: 覆盖分辨率；None 用配置值。**降到 320x240 可显著降开销**。
+        width/height: 覆盖分辨率；None 用配置值。**320x240 可显著降开销**。
         record_joints: 是否顺带记录关节角（作为 action 标签）。
         depth: 是否采深度。关掉能省一些渲染开销。
+        name: 会话子目录名；留空用时间戳。
 
     Returns:
         ``{"out":..., "cameras":[...], "every":...}``；已挂载则返回 None。
@@ -113,9 +112,11 @@ def arm_capture(
         _log("已挂载，先调用 stop_capture()")
         return None
 
-    SDG_EXT = Path("/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg")
-    if str(SDG_EXT) not in sys.path:
-        sys.path.insert(0, str(SDG_EXT))
+    from fasim.replicator.sdg import runtime
+
+    ext = runtime.ext_home()
+    if str(ext) not in sys.path:
+        sys.path.insert(0, str(ext))
 
     import carb
     import omni.physx
@@ -127,7 +128,10 @@ def arm_capture(
     robot = load_robot_config(robot_key)
     task = load_task_config(robot_key, task_key)
 
-    out = Path(out_dir).expanduser()
+    if str(out_dir or "").strip():
+        out = Path(str(out_dir)).expanduser().resolve()
+    else:
+        out = runtime.default_session_dir(robot_key, task_key, name)
     (out / "frames").mkdir(parents=True, exist_ok=True)
 
     specs = _camera_specs(task, camera)
