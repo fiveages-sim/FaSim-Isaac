@@ -90,6 +90,8 @@ def arm_capture(
     record_joints: bool = True,
     depth: bool = True,
     name: str = "",
+    record_ee: bool = True,
+    record_objects: bool = True,
 ) -> dict | None:
     """挂载采集器并立即返回（非阻塞）。
 
@@ -98,15 +100,17 @@ def arm_capture(
             其中 ``data_root`` 由 ``FASIM_SDG_DATA`` 决定（默认 ``~/fasim_data``）。
         every: 每多少个**物理步**采一帧。177Hz 下 every=10 ≈ 17.7fps。
             渲染越频繁物理越慢；控制受影响就调大（20 / 40）。
-        camera: 相机名，逗号分隔多个；空字符串=全部。
+        camera: 相机名，逗号分隔多个；空字符串=**不采相机**。
         robot_key / task_key: 选 ``configs/<robot>/`` 与 ``tasks/<task>.yaml``。
         width/height: 覆盖分辨率；None 用配置值。**320x240 可显著降开销**。
-        record_joints: 是否顺带记录关节角（作为 action 标签）。
-        depth: 是否采深度。关掉能省一些渲染开销。
+        record_joints: 记录关节角（action 标签）。
+        depth: 采深度图。关掉能省一半磁盘。
         name: 会话子目录名；留空用时间戳。
+        record_ee: 记录左右末端位姿（tcp，world 系），来自 robot.yaml 的 ee_prims。
+        record_objects: 记录 tracked_prims 里的物体位姿（试管/架子等）。
 
     Returns:
-        ``{"out":..., "cameras":[...], "every":...}``；已挂载则返回 None。
+        ``{"out":..., "cameras":[...], "every":..., "what":[...]}``；已挂载返回 None。
     """
     if _S["armed"]:
         _log("已挂载，先调用 stop_capture()")
@@ -134,35 +138,37 @@ def arm_capture(
         out = runtime.default_session_dir(robot_key, task_key, name)
     (out / "frames").mkdir(parents=True, exist_ok=True)
 
-    specs = _camera_specs(task, camera)
-    if not specs:
-        _log("ERROR 没有可用相机")
-        return None
-
+    # 相机：camera 为空 = 不采相机（只采状态），此时不建 render product
     cams: list[dict] = []
-    for spec in specs:
-        w = int(width or (spec.resolution[0] if spec.resolution else 640))
-        h = int(height or (spec.resolution[1] if spec.resolution else 480))
-        try:
-            rp = rep.create.render_product(spec.prim_path, (w, h))
-        except Exception as exc:  # noqa: BLE001
-            _log(f"WARN 相机 {spec.name} 创建失败 ({spec.prim_path}): {exc}")
-            continue
-        rgb = rep.annotators.get("rgb")
-        rgb.attach(rp)
-        dep = None
-        if depth:
-            dep = rep.annotators.get("distance_to_image_plane")
-            dep.attach(rp)
-        cams.append({"name": spec.name, "rp": rp, "rgb": rgb, "depth": dep,
-                     "size": (w, h), "prim": str(spec.prim_path)})
-        _log(f"相机 {spec.name}: {w}x{h} @ {spec.prim_path}")
+    if str(camera or "").strip():
+        specs = _camera_specs(task, camera)
+        if not specs:
+            _log("ERROR 指定的相机都找不到")
+            return None
+        for spec in specs:
+            w = int(width or (spec.resolution[0] if spec.resolution else 640))
+            h = int(height or (spec.resolution[1] if spec.resolution else 480))
+            try:
+                rp = rep.create.render_product(spec.prim_path, (w, h))
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN 相机 {spec.name} 创建失败 ({spec.prim_path}): {exc}")
+                continue
+            rgb = rep.annotators.get("rgb")
+            rgb.attach(rp)
+            dep = None
+            if depth:
+                dep = rep.annotators.get("distance_to_image_plane")
+                dep.attach(rp)
+            cams.append({"name": spec.name, "rp": rp, "rgb": rgb, "depth": dep,
+                         "size": (w, h), "prim": str(spec.prim_path)})
+            _log(f"相机 {spec.name}: {w}x{h} @ {spec.prim_path}")
+        if not cams:
+            _log("ERROR 所有相机都创建失败")
+            return None
+    else:
+        _log("不采相机（只采状态）")
 
-    if not cams:
-        _log("ERROR 所有相机都创建失败")
-        return None
-
-    # 关节角（作为 action 标签）。拿不到就跳过，不影响图像采集。
+    # 关节角（action 标签）。拿不到就跳过，不影响其他数据。
     art = None
     dof_names: list[str] = []
     if record_joints:
@@ -173,15 +179,64 @@ def arm_capture(
             dof_names = list(art.dof_names)
             _log(f"关节标签: {len(dof_names)} 个 DOF")
         except Exception as exc:  # noqa: BLE001
-            _log(f"WARN 关节读取不可用，只采图像: {exc}")
+            _log(f"WARN 关节读取不可用，跳过关节: {exc}")
             art = None
+
+    # 末端位姿（tcp，world 系）—— 来自 robot.yaml 的 ee_prims。
+    # 与层1 的 /left_current_pose 语义对齐：都是 tcp 的世界位姿。
+    ee_views: dict[str, Any] = {}
+    if record_ee:
+        try:
+            from isaacsim.core.experimental.prims import XformPrim
+
+            for side, prim in (getattr(robot, "ee_prims", None) or {}).items():
+                try:
+                    ee_views[side] = XformPrim(str(prim))
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"WARN 末端 {side} 不可用（{prim}）: {exc}")
+            if ee_views:
+                _log(f"末端位姿: {list(ee_views)}（world 系）")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 末端位姿不可用: {exc}")
+
+    # 交互物体位姿 —— 来自 task.yaml 的 tracked_prims
+    obj_views: dict[str, Any] = {}
+    obj_labels: list[str] = []
+    if record_objects:
+        try:
+            from isaacsim.core.experimental.prims import RigidPrim
+
+            for label, prim in (getattr(task, "tracked_prims", None) or {}).items():
+                try:
+                    obj_views[label] = RigidPrim(str(prim))
+                    obj_labels.append(label)
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"WARN 物体 {label} 不可用（{prim}）: {exc}")
+            if obj_views:
+                _log(f"物体位姿: {obj_labels}（world 系）")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 物体位姿不可用: {exc}")
+
+    what = []
+    if cams:
+        what.append("camera")
+    if art is not None:
+        what.append("joint")
+    if ee_views:
+        what.append("ee")
+    if obj_views:
+        what.append("object")
+    if not what:
+        _log("ERROR 什么都没采（相机/关节/末端/物体全部不可用）")
+        return None
 
     import time
 
     _S.update(
         armed=True, cameras=cams, out=out, every=max(1, int(every)),
         step=0, saved=0, skipped=0, t0=time.monotonic(), records=[],
-        size=cams[0]["size"],
+        size=cams[0]["size"] if cams else (0, 0),
+        ee_views=ee_views, obj_views=obj_views, what=what,
     )
 
     def _on_physics_step(dt: float) -> None:
@@ -222,6 +277,22 @@ def arm_capture(
                     q = art.get_dof_positions()
                     payload["joint_pos"] = q.numpy() if hasattr(q, "numpy") else q
                     payload["joint_names"] = dof_names
+                except Exception:  # noqa: BLE001
+                    pass
+            # 末端位姿（world）：<side>_pos / <side>_quat
+            for side, view in _S.get("ee_views", {}).items():
+                try:
+                    p, q = view.get_world_poses()
+                    payload[f"{side}_pos"] = np.asarray(p).reshape(-1)[:3]
+                    payload[f"{side}_quat"] = np.asarray(q).reshape(-1)[:4]
+                except Exception:  # noqa: BLE001
+                    pass
+            # 物体位姿（world）：obj/<label>_pos / obj/<label>_quat
+            for label, view in _S.get("obj_views", {}).items():
+                try:
+                    p, q = view.get_world_poses()
+                    payload[f"obj/{label}_pos"] = np.asarray(p).reshape(-1)[:3]
+                    payload[f"obj/{label}_quat"] = np.asarray(q).reshape(-1)[:4]
                 except Exception:  # noqa: BLE001
                     pass
             import numpy as np

@@ -163,18 +163,39 @@ def cmd_capture(args: argparse.Namespace) -> int:
         return 1
     task = args.task or _pick("任务", [(t, t) for t in tasks])
 
-    # --- 相机 ---
-    try:
-        cfg = load_task_config(robot, task, cfg_root)
-        cams = list(getattr(cfg, "cameras", None) or [])
-    except Exception as exc:  # noqa: BLE001
-        _log(f"ERROR 读任务配置失败: {exc}")
-        return 1
-    if not cams:
-        _log("ERROR 任务配置里没有相机")
-        return 1
+    # --- 采什么（camera / joint / ee / object 的任意子集）---
+    ALL_WHAT = ["camera", "joint", "ee", "object"]
+    if args.what:
+        want = [w.strip() for w in args.what.split(",") if w.strip()]
+        bad = [w for w in want if w not in ALL_WHAT]
+        if bad:
+            _log(f"ERROR 未知采集项 {bad}，可选 {ALL_WHAT}")
+            return 1
+        what = want
+    elif args.yes:
+        what = list(ALL_WHAT)
+    else:
+        print("\n采什么（逗号分隔，回车=全部）")
+        print("  camera  相机 RGB-D")
+        print("  joint   关节角（回放必需）")
+        print("  ee      末端位姿（tcp）")
+        print("  object  交互物体位姿")
+        ans = _ask("选择", ",".join(ALL_WHAT))
+        what = [w.strip() for w in ans.split(",") if w.strip()]
+        bad = [w for w in what if w not in ALL_WHAT]
+        if bad:
+            _log(f"ERROR 未知采集项 {bad}")
+            return 1
+    if "joint" not in what:
+        _log("WARN 没选 joint —— 后续不能用 sdg.sh preview 回放自检")
 
-    if args.camera:
+    # --- 相机 ---
+    cfg = load_task_config(robot, task, cfg_root)
+    cams = list(getattr(cfg, "cameras", None) or [])
+
+    if "camera" not in what:
+        camera = ""  # 不采相机
+    elif args.camera:
         camera = args.camera
     else:
         opts = [(c.name, f"{c.name:14s} {c.resolution[0]}x{c.resolution[1]}") for c in cams]
@@ -229,9 +250,10 @@ def cmd_capture(args: argparse.Namespace) -> int:
     print(" 准备开始采集")
     print(f"  机器人   : {robot}")
     print(f"  任务     : {task}")
-    print(f"  相机     : {camera or '全部'}")
+    print(f"  采集项   : {','.join(what)}")
+    print(f"  相机     : {camera or ('不采' if 'camera' not in what else '全部')}")
     print(f"  频率     : every={every}")
-    print(f"  分辨率   : {f'{width}x{height}' if width else '配置默认'}")
+    print(f"  分辨率   : {f'{width}x{height}' if width else '配置默认（仅相机）'}")
     print(f"  深度     : {'是' if depth else '否'}")
     print(f"  输出     : {out_dir}")
     print("=" * 62)
@@ -247,6 +269,9 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "every": every,
         "depth": bool(depth),
         "out_dir": out_dir,
+        "record_joints": "joint" in what,
+        "record_ee": "ee" in what,
+        "record_objects": "object" in what,
     }
     if width and height:
         req["width"], req["height"] = width, height
@@ -289,7 +314,89 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctors(_args: argparse.Namespace) -> int:
+def cmd_info(args: argparse.Namespace) -> int:
+    """看一个采集会话里有什么（不转换）。"""
+    from fasim.replicator.sdg import pack
+
+    try:
+        info = pack.summarize(args.session)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR {exc}")
+        return 1
+    print(json.dumps(info, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_pack(args: argparse.Namespace) -> int:
+    """采集会话 → episode npz（层2 能读的格式）。"""
+    from fasim.replicator.sdg import pack
+
+    try:
+        out = pack.pack_episode(
+            args.session,
+            out_path=args.out or None,
+            frame_dt=args.frame_dt or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR {exc}")
+        return 1
+    print(f"episode: {out}")
+    return 0
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    """用层2 的回放路径预览 episode —— 需要 Isaac python。
+
+    这会真的起一个 Isaac（headless 或 GUI），加载场景、锁底盘、drive 驱动
+    关节、让物理重演，并（可选）出图。用来确认「关节角是不是都录到了」。
+    """
+    from pathlib import Path as _P
+
+    ep = _P(args.episode).expanduser()
+    if not ep.is_file():
+        _log(f"ERROR episode 不存在: {ep}")
+        return 1
+
+    _log("预览需要 Isaac python 与渲染，正在启动…")
+    from fasim.replicator.sdg import renderer as R
+    from fasim.replicator.sdg.config_io import load_robot_config, load_task_config
+
+    robot = load_robot_config(args.robot)
+    task = load_task_config(args.robot, args.task)
+    out = _P(args.out).expanduser() if args.out else ep.parent / "preview"
+
+    from isaacsim import SimulationApp
+
+    app = SimulationApp(launch_config={"headless": not args.gui})
+    try:
+        res = R.render_episode(
+            episode_path=ep,
+            robot_config=robot,
+            task_config=task,
+            output_dir=out,
+            app=app,
+            start=0,
+            end=None,
+            lock_base=True,
+        )
+        _log(f"回放完成: {res.frames_written} 帧 → {out}")
+        _log(f"关节 max_err = {res.joint_max_error*1000:.2f} mrad")
+        p95 = res.extras.get("joint_error_p95")
+        if p95 is not None:
+            _log(f"关节 p95_err = {p95*1000:.2f} mrad")
+        dev = res.extras.get("object_deviation") or {}
+        for k, st in dev.items():
+            _log(f"  {k}: mean {st['mean_mm']:.1f}mm p95 {st['p95_mm']:.1f}mm")
+        _log(f"产物: {out}")
+    finally:
+        try:
+            app.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
     """自检：路径、socket、扩展是否就绪。"""
     print("=== SDG 数采环境自检 ===")
     print(f"扩展根目录 : {runtime.ext_home()}")
@@ -319,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--robot", default="")
     c.add_argument("--task", default="")
     c.add_argument("--camera", default="", help="相机名，逗号分隔；空=全部")
+    c.add_argument("--what", default="",
+                   help="采什么：camera,joint,ee,object 的逗号子集；空=全部")
     c.add_argument("--every", type=int, default=0, help="每 N 个物理步采一帧")
     c.add_argument("--width", type=int, default=0)
     c.add_argument("--height", type=int, default=0)
@@ -331,7 +440,26 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="查看采集进度").set_defaults(func=cmd_status)
     sub.add_parser("stop", help="结束采集").set_defaults(func=cmd_stop)
-    sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctors)
+    sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
+
+    i = sub.add_parser("info", help="看采集会话里有什么")
+    i.add_argument("session", help="会话目录，如 ~/fasim_data/.../20261110-1121")
+    i.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("pack", help="采集会话 → episode npz（层2 格式）")
+    p.add_argument("session")
+    p.add_argument("--out", default="", help="输出 npz；留空 <session>/episode.npz")
+    p.add_argument("--frame-dt", type=float, default=0.0,
+                   help="帧间隔（秒）；留空自动推算")
+    p.set_defaults(func=cmd_pack)
+
+    v = sub.add_parser("preview", help="用层2 回放路径预览 episode（需 Isaac python）")
+    v.add_argument("episode")
+    v.add_argument("--robot", default="unitree_g1d")
+    v.add_argument("--task", default="sinopec_test_tube")
+    v.add_argument("--out", default="")
+    v.add_argument("--gui", action="store_true", help="开窗口（默认无头）")
+    v.set_defaults(func=cmd_preview)
 
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):
