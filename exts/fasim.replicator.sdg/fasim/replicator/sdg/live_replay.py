@@ -65,12 +65,17 @@ def is_playing() -> bool:
 
 def status() -> dict:
     ep = _STATE.get("episode")
+    ctx = _STATE.get("ctx") or {}
+    idx = int(_STATE.get("frame", 0))
+    t = 0.0
+    if ep is not None and 0 <= idx < len(ep):
+        t = float(ep.t[idx])
     return {
         "playing": _STATE["playing"],
         "paused": _STATE["paused"],
-        "frame": _STATE["frame"],
-        "total": _STATE["total"],
-        "t": float(ep.t[_STATE["frame"]]) if ep is not None and _STATE["frame"] < len(ep) else 0.0,
+        "frame": idx,
+        "total": int(ctx.get("n_end") or _STATE.get("total") or 0),
+        "t": t,
     }
 
 
@@ -154,9 +159,15 @@ def play_episode(
     episode = Episode.load(episode_path)
     n_total = len(episode)
     n_start = max(0, int(start))
-    n_end = n_total if end is None else min(n_total, int(end))
+    # CLI 约定 end=0 表示"到末尾"（与 sdg.sh 的其他命令一致）。
+    # 这里必须显式处理，否则 min(n_total, 0) = 0 会得到空区间。
+    end_i = int(end or 0)
+    n_end = n_total if end_i <= 0 else min(n_total, end_i)
     if n_end <= n_start:
-        return {"ok": False, "error": f"空区间 {n_start}..{n_end}"}
+        return {
+            "ok": False,
+            "error": f"空区间 start={n_start} end={n_end}（episode 共 {n_total} 帧）",
+        }
 
     robot = load_robot_config(robot_key)
     if not st.GetPrimAtPath(robot.articulation_prim):
