@@ -532,6 +532,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "pause_cm": bool(args.pause_cm),
         "home_frames": int(args.home_frames),
         "waist_gain": str(args.waist_gain),
+        "joint_api": str(args.joint_api),
     }
     if args.drive == "ee":
         req["left_topic"] = args.left_topic
@@ -724,6 +725,12 @@ def main(argv: list[str] | None = None) -> int:
         "usd=用资产原值 60000/6000（默认，腰部和手臂物理特性不同）；"
         "same=和手臂一样用 100000/10000；"
         "或自定义 K,D[,maxForce] 如 60000,6000,5000",
+    )
+    lv.add_argument(
+        "--joint-api", choices=("target", "teleport"), default="target",
+        help="驱动关节的方式。target=set_dof_position_targets（走 drive，"
+        "物理正确但有静差）；teleport=set_dof_positions（瞬移，无静差、"
+        "逐帧精确，但破坏接触）。用它对比可判断是数据问题还是驱动跟不上",
     )
     lv.set_defaults(func=cmd_live)
 

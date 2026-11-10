@@ -122,6 +122,7 @@ def play_episode(
     pause_cm: bool = True,
     home_frames: int = 60,
     waist_gain: str = "usd",
+    joint_api: str = "target",
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -204,6 +205,7 @@ def play_episode(
         "frames_done": 0,
         "pause_cm": bool(pause_cm),
         "waist_gain": waist_gain,
+        "joint_api": str(joint_api or "target"),
         "cm_done": True,  # _pause_controllers 会改成 False（异步流程）
     }
 
@@ -301,7 +303,8 @@ def play_episode(
             _log(f"WARN 剔除 mimic 失败: {exc}")
 
         ctx.update(art=art, target_idx=target_idx, source_idx=source_idx,
-                   grip_specs=grip_specs)
+                   grip_specs=grip_specs,
+                   target_names=[dofs[int(d)] for d in target_idx])
         # 手臂 drive gain —— 与 render_episode 一致。
         # 不设的话用资产默认值（Dex1 的 gain 是给夹爪调的），手臂追不上
         # 目标，实测关节误差 268 mrad。
@@ -921,6 +924,24 @@ def tl_now(ctx: dict) -> float:
         return 0.0
 
 
+def _apply_joint_target(ctx: dict, values: np.ndarray, frame: int) -> None:
+    """按 ctx["joint_api"] 驱动关节。
+
+    ``target``（默认）: ``set_dof_position_targets`` —— 走 drive 产生力，
+        和运控/层2 一致，物理接触正确。缺点是重负载关节（腰部升降）有静差。
+    ``teleport``: ``set_dof_positions`` —— 直接设位置，无静差、逐帧精确，
+        但会破坏接触（物体不会被自然带动）。
+        用途：验证「数据本身对不对」。若 teleport 下腰部幅度正常，
+        说明数据没问题，是 drive 跟不上。
+    """
+    art = ctx["art"]
+    target_idx = ctx["target_idx"]
+    if ctx.get("joint_api") == "teleport":
+        art.set_dof_positions(values, dof_indices=target_idx)
+    else:
+        art.set_dof_position_targets(values, dof_indices=target_idx)
+
+
 def _step_joints(ctx: dict, i: int) -> None:
     art = ctx["art"]
     source_idx = ctx["source_idx"]
@@ -937,9 +958,14 @@ def _step_joints(ctx: dict, i: int) -> None:
             act = np.asarray(
                 art.get_dof_positions(dof_indices=target_idx), dtype=np.float32
             ).reshape(-1)
-            e = float(np.max(np.abs(act - prev)))
-            ctx.setdefault("errs", []).append(e)
-            ctx["max_err"] = max(ctx.get("max_err", 0.0), e)
+            e = np.abs(act - prev)
+            ctx.setdefault("errs", []).append(float(np.max(e)))
+            ctx["max_err"] = max(ctx.get("max_err", 0.0), float(np.max(e)))
+            # 按关节累计最大误差，便于定位是哪个关节跟不上
+            per = ctx.setdefault("err_per_joint", {})
+            for k, name in enumerate(ctx.get("target_names", [])):
+                if k < len(e):
+                    per[name] = max(per.get(name, 0.0), float(e[k]))
         except Exception:  # noqa: BLE001
             pass
 
@@ -947,7 +973,7 @@ def _step_joints(ctx: dict, i: int) -> None:
     row = episode.joint_pos[i][source_idx]
     if np.all(np.isfinite(row)):
         values = row.astype(np.float32).reshape(1, -1)
-        art.set_dof_position_targets(values, dof_indices=target_idx)
+        _apply_joint_target(ctx, values, i)
         ctx["prev_values"] = values.reshape(-1).copy()
     else:
         ctx["prev_values"] = None
@@ -973,12 +999,18 @@ def _step_ee(ctx: dict, i: int) -> None:
 
 
 def _finish() -> None:
-    """收尾：把关节送回回放前姿态、恢复运控、退订、打印统计。
+    """收尾：把关节送回回放前姿态、等稳定、恢复运控、退订、打印统计。
 
-    **顺序很重要**：必须先把关节恢复到回放前的位置，再重新激活控制器。
-    否则 OCS2 会从「任务结束姿态」（比如手举在半空）开始规划，之后无论
-    怎么重启仿真都保持那个姿态 —— 用户看到的就是"运控坏了"。
+    **顺序很重要**（用户实测验证过）：
+      1. 先把关节恢复到回放前的位置（用 teleport）
+      2. 等物理几帧稳定
+      3. 再激活控制器
+
+    如果直接恢复控制器，OCS2 的初始状态和当前姿态有偏差 → 关节被猛拉，
+    表现为"回放结束时突然抽动、异常转身"。这个坑之前修运控解决过。
     """
+    import time
+
     ctx = _STATE.get("ctx") or {}
     _STATE["playing"] = False
     _STATE["cancel"] = False
@@ -987,8 +1019,12 @@ def _finish() -> None:
     # 1) 送回原位（在恢复运控之前）
     _restore_initial_pose(ctx)
 
-    # 2) 恢复运控（回放期间被暂停过）
+    # 2) 等物理稳定。已退出 update 回调链，这里 sleep 是安全的
+    #   （不会重入主循环）。Isaac 自己的循环会推进物理。
     if ctx.get("paused_controllers"):
+        time.sleep(0.3)
+        _log("姿态已复位，等待物理稳定后交还运控")
+        # 3) 恢复运控
         _resume_controllers(ctx)
 
     if ctx.get("node") is not None:
@@ -1011,11 +1047,23 @@ def _finish() -> None:
             errs = ctx.get("errs") or []
             p95 = float(np.percentile(errs, 95)) * 1000 if errs else 0.0
             _log(f"回放结束: {n} 帧，关节 max_err={me:.2f} mrad p95={p95:.2f} mrad")
+            # 逐关节误差（定位是哪个跟不上，比如腰部）
+            per = ctx.get("err_per_joint") or {}
+            if per:
+                worst = sorted(per.items(), key=lambda kv: -kv[1])[:6]
+                _log("  误差最大的关节: " + "  ".join(
+                    f"{k}={v*1000:.1f}mrad" for k, v in worst
+                ))
             _STATE["last_result"] = {
                 "frames": n, "drive": "joints",
                 "max_err_mrad": round(me, 2), "p95_err_mrad": round(p95, 2),
                 "driven_joints": int(len(ctx.get("target_idx", []))),
                 "app_dt_ms": round(float(ctx.get("app_dt", 0.0)) * 1000, 2),
+                "joint_api": ctx.get("joint_api", "target"),
+                "err_per_joint_mrad": {
+                    k: round(v * 1000, 1) for k, v in
+                    sorted((per or {}).items(), key=lambda kv: -kv[1])[:10]
+                },
             }
         else:
             _log(f"回放结束: 发了 {n} 帧末端位姿")
