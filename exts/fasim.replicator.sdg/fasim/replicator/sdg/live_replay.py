@@ -76,6 +76,9 @@ def status() -> dict:
         "frame": idx,
         "total": int(ctx.get("n_end") or _STATE.get("total") or 0),
         "t": t,
+        "app_dt_ms": round(float(ctx.get("app_dt", 0.0)) * 1000, 2),
+        "frames_done": int(ctx.get("frames_done", 0)),
+        "last_result": _STATE.get("last_result"),
     }
 
 
@@ -291,9 +294,14 @@ def play_episode(
     if not timeline.is_playing():
         timeline.play()
 
+    # 记录起始仿真时间，供 _ensure_app_dt 差分（第一次回调时 last=None
+    # 会跳过一帧，这里先埋一个基准）
+    ctx["_last_sim_time"] = None
+
     _STATE.update(playing=True, paused=False, frame=n_start, total=n_end,
                   episode=episode, cancel=False, ctx=ctx, i=n_start,
-                  emit_acc=0.0)
+                  since_frame=0.0)
+    ctx["since_frame"] = 0.0
 
     if not _install_update_hook():
         _STATE.update(playing=False)
@@ -389,6 +397,18 @@ def _on_update(_event) -> None:
 
     app_dt = _ensure_app_dt(ctx)
     frame_dt = ctx.get("frame_dt", 0.05)
+    if app_dt <= 0:
+        # 首帧还不知道步长；先设第 0 帧目标，下一帧再开始累积
+        if ctx.get("since_frame", 0.0) == 0.0:
+            try:
+                if ctx["drive"] == "ee":
+                    _step_ee(ctx, _STATE["i"])
+                else:
+                    _step_joints(ctx, _STATE["i"])
+                ctx["since_frame"] = 0.001
+            except Exception:  # noqa: BLE001
+                pass
+        return
 
     # 本回调已经推进了 app_dt 的仿真时间
     ctx["since_frame"] = ctx.get("since_frame", 0.0) + app_dt
@@ -422,6 +442,11 @@ def _on_update(_event) -> None:
 
     _STATE["frame"] = i
     ctx["frames_done"] = ctx.get("frames_done", 0) + 1
+
+    # 首帧立刻打印，方便确认回放真的开始了
+    if ctx["frames_done"] == 1:
+        _log(f"回放首帧已执行: frame={i} app_dt={app_dt*1000:.2f}ms "
+             f"frame_dt={frame_dt*1000:.1f}ms")
     cb = ctx.get("on_frame")
     if cb is not None:
         try:
@@ -429,9 +454,11 @@ def _on_update(_event) -> None:
         except Exception:  # noqa: BLE001
             pass
     fd = ctx["frames_done"]
-    if fd % 50 == 0:
+    if fd % 25 == 0:
         me = ctx.get("max_err", 0.0) * 1000
-        _log(f"  {i}/{n_end}  max_err={me:.1f}mrad  ({fd} 帧)")
+        sim_t = float(tl_now(ctx))
+        _log(f"  {i}/{n_end}  sim={sim_t:.2f}s  max_err={me:.1f}mrad  "
+             f"(已播 {fd} 帧)")
 
     i += 1
     if i >= n_end:
@@ -465,27 +492,41 @@ def _hold_joints(ctx: dict, i: int) -> None:
 
 
 def _ensure_app_dt(ctx: dict) -> float:
-    """实测 app.update() 一次推进多少仿真秒（只测一次）。"""
+    """从相邻两次回调的 timeline 时间差推算 app_dt（**不主动 update**）。
+
+    之前在回调里调 ``app.update()`` 测步长 —— 那是**重入** Kit 主循环，
+    会抛异常让回放立刻结束（症状：几秒就停、机器人不动）。
+
+    改为被动测量：记录上次回调时的仿真时间，用差分算步长。
+    第一次回调时还不知道，返回 None 让调用方跳过这一帧。
+    """
+    import omni.timeline
+
+    tl = omni.timeline.get_timeline_interface()
+    now = float(tl.get_current_time())
+    last = ctx.get("_last_sim_time")
+    ctx["_last_sim_time"] = now
+
     if ctx.get("app_dt"):
         return float(ctx["app_dt"])
-    app_dt = 0.016666
+    if last is None:
+        return 0.0  # 首帧，下一次才知道步长
+    dt = now - last
+    if dt <= 0:
+        return 0.0
+    ctx["app_dt"] = dt
+    _log(f"实测每次 update 推进 {dt*1000:.2f} ms 仿真时间")
+    return dt
+
+
+def tl_now(ctx: dict) -> float:
+    """当前仿真时间（用于日志）。"""
     try:
-        import omni.kit.app
         import omni.timeline
 
-        tl = omni.timeline.get_timeline_interface()
-        if not tl.is_playing():
-            tl.play()
-        t0 = float(tl.get_current_time())
-        omni.kit.app.get_app().update()
-        t1 = float(tl.get_current_time())
-        if t1 > t0:
-            app_dt = t1 - t0
-        _log(f"实测每次 update 推进 {app_dt*1000:.2f} ms 仿真时间")
-    except Exception as exc:  # noqa: BLE001
-        _log(f"WARN 测 app_dt 失败（用 16.67ms）: {exc}")
-    ctx["app_dt"] = app_dt
-    return app_dt
+        return float(omni.timeline.get_timeline_interface().get_current_time())
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _step_joints(ctx: dict, i: int) -> None:
@@ -552,6 +593,8 @@ def _finish() -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    # 把最终统计留在 _STATE["last_result"]，让 CLI 的 live-status/--wait
+    # 也能看到（用户通常只看 CLI 终端，看不到 Isaac 的 stdout）
     if ctx:
         n = ctx.get("frames_done", 0)
         if ctx.get("drive") == "joints":
@@ -559,7 +602,14 @@ def _finish() -> None:
             errs = ctx.get("errs") or []
             p95 = float(np.percentile(errs, 95)) * 1000 if errs else 0.0
             _log(f"回放结束: {n} 帧，关节 max_err={me:.2f} mrad p95={p95:.2f} mrad")
+            _STATE["last_result"] = {
+                "frames": n, "drive": "joints",
+                "max_err_mrad": round(me, 2), "p95_err_mrad": round(p95, 2),
+                "driven_joints": int(len(ctx.get("target_idx", []))),
+                "app_dt_ms": round(float(ctx.get("app_dt", 0.0)) * 1000, 2),
+            }
         else:
             _log(f"回放结束: 发了 {n} 帧末端位姿")
+            _STATE["last_result"] = {"frames": n, "drive": "ee"}
 
     _STATE.update(episode=None, ctx=None, i=0)

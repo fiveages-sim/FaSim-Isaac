@@ -546,10 +546,24 @@ def cmd_live(args: argparse.Namespace) -> int:
             while True:
                 time.sleep(0.5)
                 st = _request({"cmd": "live_status"}, timeout=5)
-                if not st.get("playing"):
-                    _log("回放已结束")
+                if not st.get("ok"):
                     break
-                print(f"  {st['frame']}/{st['total']}  t={st['t']:.2f}s", end="\r", flush=True)
+                if not st.get("playing"):
+                    lr = st.get("last_result") or {}
+                    if lr:
+                        _log("=" * 50)
+                        _log(f"回放结果: {lr.get('frames')} 帧")
+                        if "max_err_mrad" in lr:
+                            _log(f"  关节 max_err = {lr['max_err_mrad']} mrad")
+                            _log(f"  关节 p95_err = {lr['p95_err_mrad']} mrad")
+                            _log(f"  驱动关节数  = {lr.get('driven_joints')}")
+                        _log(f"  每次 update = {lr.get('app_dt_ms', st.get('app_dt_ms'))} ms")
+                        _log("=" * 50)
+                    else:
+                        _log("回放已结束（Isaac 侧没留下统计，可能是异常退出）")
+                    break
+                print(f"  {st['frame']}/{st['total']}  t={st['t']:.2f}s  "
+                      f"({st.get('frames_done', 0)} 帧已播)", end="\r", flush=True)
         except KeyboardInterrupt:
             _log("请求停止…")
             _request({"cmd": "live_stop"}, timeout=10)
