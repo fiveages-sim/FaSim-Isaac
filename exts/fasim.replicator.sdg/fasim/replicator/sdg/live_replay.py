@@ -123,6 +123,7 @@ def play_episode(
     home_frames: int = 60,
     waist_gain: str = "usd",
     joint_api: str = "target",
+    reset_objects: bool = True,
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -206,6 +207,9 @@ def play_episode(
         "pause_cm": bool(pause_cm),
         "waist_gain": waist_gain,
         "joint_api": str(joint_api or "target"),
+        "robot_key": robot_key,
+        "task_key": task_key,
+        "reset_objects": bool(reset_objects),
         "cm_done": True,  # _pause_controllers 会改成 False（异步流程）
     }
 
@@ -381,6 +385,19 @@ def play_episode(
             _log(f"已记录回放前姿态（{len(q0)} DOF），退出时恢复")
         except Exception as exc:  # noqa: BLE001
             _log(f"WARN 记录初始姿态失败: {exc}")
+
+        # 物体复位：回放开始时物体可能停在上次跑完的位置（被撞歪/抓走），
+        # 手按关节角伸过去就抓空。放回 episode 第 0 帧的位姿后交给物理。
+        if ctx.get("reset_objects"):
+            nobj = _reset_objects(ctx)
+            if nobj:
+                _log(f"已复位 {nobj} 个交互物体")
+            else:
+                _log(
+                    "WARN 没有物体位姿可复位（episode 缺 obj/*_pos）。"
+                    "这会导致抓取错位 —— 采集时请选 object："
+                    "sdg.sh capture --what joint,ee,object"
+                )
 
         # 归位：从当前姿态平滑过渡到第 0 帧，避免 drive 猛冲把物体撞飞。
         # 实测不归位时：右手从远处瞬间追到第 0 帧，扫过试管架把它带起来。
@@ -924,6 +941,67 @@ def tl_now(ctx: dict) -> float:
         return 0.0
 
 
+def _reset_objects(ctx: dict) -> int:
+    """把交互物体复位到 episode 记录的**初始**位姿。
+
+    为什么必须做
+    ============
+    回放靠物理自然响应（不逐帧摆物体）。但回放开始时物体停在「上一次
+    跑完的位置」—— 可能被撞歪、被抓走。手按关节角伸过去自然抓空，
+    表现为「抓取错位」。
+
+    正确做法：回放前把物体放回 episode 第 0 帧的位姿（录制起点），
+    之后完全交给物理。
+
+    注意：episode 必须有 ``obj/<label>_pos/quat``（采集时选了 object）。
+    没有就跳过并提示。
+    """
+    import omni.usd
+    from pxr import UsdPhysics
+
+    from .config_io import load_task_config
+
+    episode = ctx["episode"]
+    robot_key = ctx.get("robot_key", "unitree_g1d")
+    task_key = ctx.get("task_key", "sinopec_test_tube")
+    try:
+        task = load_task_config(robot_key, task_key)
+        prim_map = dict(getattr(task, "tracked_prims", None) or {})
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 读任务配置失败，跳过物体复位: {exc}")
+        return 0
+
+    st = omni.usd.get_context().get_stage()
+    n = 0
+    for label, (pos, quat) in (episode.objects or {}).items():
+        prim_path = prim_map.get(label)
+        if not prim_path:
+            continue
+        p0 = np.asarray(pos[0], dtype=np.float64)
+        q0 = np.asarray(quat[0], dtype=np.float64)
+        if not np.all(np.isfinite(p0)) or not np.all(np.isfinite(q0)):
+            continue
+        prim = st.GetPrimAtPath(str(prim_path))
+        if not prim or not prim.IsValid():
+            _log(f"WARN 物体 {label} 的 prim 不存在: {prim_path}")
+            continue
+        try:
+            # 用 USD xform 直接写（回放还没开始，物理未接管这个刚体时最可靠）
+            from pxr import Gf, UsdGeom
+
+            xf = UsdGeom.Xformable(prim)
+            xf.ClearXformOpOrder()
+            xf.AddTranslateOp().Set(Gf.Vec3d(*[float(x) for x in p0[:3]]))
+            xf.AddOrientOp().Set(
+                Gf.Quatf(float(q0[0]), float(q0[1]), float(q0[2]), float(q0[3]))
+            )
+            _log(f"物体复位 {label} → {np.round(p0, 3)}")
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 复位物体 {label} 失败: {exc}")
+    return n
+
+
 def _apply_joint_target(ctx: dict, values: np.ndarray, frame: int) -> None:
     """按 ctx["joint_api"] 驱动关节。
 
@@ -938,6 +1016,14 @@ def _apply_joint_target(ctx: dict, values: np.ndarray, frame: int) -> None:
     target_idx = ctx["target_idx"]
     if ctx.get("joint_api") == "teleport":
         art.set_dof_positions(values, dof_indices=target_idx)
+        # **必须清速度**：瞬移会让引擎算出巨大隐含速度，下一帧物理按那个
+        # 速度外推 → 全身高频颤抖（用户实测「不停抖动」）。
+        try:
+            art.set_dof_velocities(
+                np.zeros_like(values, dtype=np.float32), dof_indices=target_idx
+            )
+        except Exception:  # noqa: BLE001
+            pass
     else:
         art.set_dof_position_targets(values, dof_indices=target_idx)
 

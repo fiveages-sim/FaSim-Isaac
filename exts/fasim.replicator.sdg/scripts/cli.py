@@ -533,6 +533,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "home_frames": int(args.home_frames),
         "waist_gain": str(args.waist_gain),
         "joint_api": str(args.joint_api),
+        "reset_objects": bool(args.reset_objects),
     }
     if args.drive == "ee":
         req["left_topic"] = args.left_topic
@@ -731,6 +732,12 @@ def main(argv: list[str] | None = None) -> int:
         help="驱动关节的方式。target=set_dof_position_targets（走 drive，"
         "物理正确但有静差）；teleport=set_dof_positions（瞬移，无静差、"
         "逐帧精确，但破坏接触）。用它对比可判断是数据问题还是驱动跟不上",
+    )
+    lv.add_argument(
+        "--no-reset-objects", dest="reset_objects", action="store_false",
+        default=True,
+        help="不回放前把交互物体复位到 episode 起点。默认会复位"
+        "（否则物体停在上次跑完的位置，手会抓空）",
     )
     lv.set_defaults(func=cmd_live)
 
