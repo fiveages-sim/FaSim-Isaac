@@ -67,6 +67,22 @@ def _log(msg: str) -> None:
     print(f"[capture] {msg}", flush=True)
 
 
+def _code_stamp() -> str:
+    """代码版本戳（文件 mtime），用来判断 Isaac 里跑的是不是最新代码。
+
+    扩展 import 后模块缓存在 sys.modules，**改文件不会热重载**。
+    如果采集结果和代码不符，先看这个时间戳是不是最新的。
+    """
+    try:
+        import os
+        import time
+
+        mt = os.path.getmtime(__file__)
+        return f"{time.strftime('%m-%d %H:%M:%S', time.localtime(mt))}"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _camera_specs(task, camera: str | None):
     """挑出要采的相机。``camera`` 为空则全部，否则按 name 过滤。"""
     specs = list(getattr(task, "cameras", None) or [])
@@ -124,6 +140,8 @@ def arm_capture(
     if _S["armed"]:
         _log("已挂载，先调用 stop_capture()")
         return None
+
+    _log(f"live_capture 代码版本: {_code_stamp()}  (文件 mtime)")
 
     from fasim.replicator.sdg import runtime
 
@@ -246,6 +264,7 @@ def arm_capture(
         step=0, saved=0, skipped=0, t0=time.monotonic(), records=[],
         size=cams[0]["size"] if cams else (0, 0),
         ee_views=ee_views, obj_views=obj_views, what=what,
+        code_stamp=_code_stamp(),
     )
 
     def _on_physics_step(dt: float) -> None:
@@ -372,6 +391,11 @@ def stop_capture() -> dict:
             {"name": c["name"], "prim": c["prim"], "size": c["size"]}
             for c in _S["cameras"]
         ],
+        # 采了什么 —— 排查「字段没写进帧」时第一眼看这里
+        "what": _S.get("what", []),
+        "ee_captured": sorted(_S.get("ee_views", {}).keys()),
+        "objects_captured": sorted(_S.get("obj_views", {}).keys()),
+        "code_stamp": _S.get("code_stamp", "unknown"),
     }
     try:
         (out / "session.json").write_text(

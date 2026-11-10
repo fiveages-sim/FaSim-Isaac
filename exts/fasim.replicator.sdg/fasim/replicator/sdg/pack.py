@@ -189,11 +189,26 @@ def pack_episode(
     ee = [
         k for k in payload
         if k.endswith("_pos") and not k.startswith("obj/") and k != "joint_pos"
+        and np.isfinite(np.asarray(payload[k])).any()
     ]
     ob = [k for k in payload if k.startswith("obj/") and k.endswith("_pos")]
     _log(f"  末端: {ee or '无'}   物体: {[k[len('obj/'):-4] for k in ob] or '无'}")
     if has_cam:
         _log(f"  相机图像仍在 {d / 'frames'}（未并入 npz）")
+    # 缺末端/物体时明确告警（否则 pack 只说「无」，看不出是采集没采还是
+    # 转换丢了）
+    if not ee:
+        _log("  WARN 没有末端位姿 —— 采集时要选 ee：sdg.sh capture --what joint,ee")
+    if not ob:
+        _log("  WARN 没有物体位姿 —— 采集时要选 object："
+             "sdg.sh capture --what joint,ee,object")
+        cap = meta.get("objects_captured")
+        if cap is not None:
+            _log(f"       但 session.json 记录采集时有 {cap} —— 说明是写帧时丢的，"
+                 "检查 Isaac 终端有没有「WARN 物体 ... 取值失败」")
+    stamp = meta.get("code_stamp")
+    if stamp:
+        _log(f"  采集时的代码版本: {stamp}")
     return out
 
 
