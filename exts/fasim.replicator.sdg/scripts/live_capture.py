@@ -196,6 +196,121 @@ def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     ])
 
 
+def _extract_camera_params(data: Any, width: int, height: int) -> dict[str, Any] | None:
+    """从 Replicator ``camera_params`` 抽内参与相机世界位姿。
+
+    实测字段（Isaac Sim 6.2，probe_camera_params.py 验证）::
+
+        cameraFocalLength   = 18.1476      （**物理**焦距，mm/场景单位）
+        cameraAperture      = [24.95, 13.936]   （视口尺寸，不是像素）
+        cameraProjection    = 16 floats    （行主序 4x4 投影矩阵）
+        cameraViewTransform = 16 floats    （**世界→相机** view matrix）
+        renderProductResolution = [640, 480]
+
+    **内参用 cameraProjection 推，不要用 focal/aperture**：本机 aperture
+    是 16:9 而渲染分辨率 640x480 是 4:3，直接按 aperture 比例算会得到
+    fx=465.5 / fy=625.1（错误）。投影矩阵里 ::
+
+        cameraProjection[0] = 2*fx/W → fx = 0.5 * P[0] * W
+        cameraProjection[5] = 2*fy/H → fy = 0.5 * P[5] * H
+
+    实测两者都等于 465.51，才是正确的。
+
+    **cameraViewTransform 是 view matrix（世界→相机），不是相机→世界**。
+    实测验证：``R_view @ t_world`` ≈ ``-t_view``。所以相机世界位姿要求逆::
+
+        R_cam_from_world = R_view.T
+        t_cam = -R_cam_from_world @ t_view
+
+    该矩阵是**行主序** 4x4 展平的（实测平移在 [3],[7],[11]）。
+
+    Args:
+        data: ``annotator.get_data()`` 的返回（dict）。
+        width/height: 渲染分辨率。
+
+    Returns:
+        ``{"K": (3,3), "fx","fy","cx","cy", "pos": (3,), "quat": (4,) wxyz}``；
+        解析失败返回 ``None``（不抛异常 —— 相机参数缺失不该让采集挂掉）。
+    """
+    if not isinstance(data, dict):
+        return None
+    try:
+        proj = np.asarray(data.get("cameraProjection"), dtype=np.float64).reshape(-1)
+        view = np.asarray(data.get("cameraViewTransform"), dtype=np.float64).reshape(-1)
+        if proj.size < 16 or view.size < 16:
+            return None
+        # 行主序 4x4
+        P = proj.reshape(4, 4)
+        V = view.reshape(4, 4)
+
+        # --- 内参：用投影矩阵反推，保证 fx/fy 与真实渲染一致 ---
+        fx = 0.5 * abs(float(P[0, 0])) * width
+        fy = 0.5 * abs(float(P[1, 1])) * height
+        # 主点（正常应为 W/2, H/2；带上非对称 aperture 偏移时也能覆盖）
+        cx = (0.5 * (1.0 + float(P[0, 2]))) * width
+        cy = (0.5 * (1.0 + float(P[1, 2]))) * height
+        if not (fx > 0 and fy > 0):
+            return None
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+
+        # --- 位姿：view matrix 求逆 ---
+        R_vw = V[:3, :3]
+        t_v = V[:3, 3]
+        R_cw = R_vw.T
+        # 视图矩阵的正交性可能因数值误差略微退化，做一次正交化
+        U, _S, Vt = np.linalg.svd(R_cw)
+        R_cw = U @ Vt
+        if np.linalg.det(R_cw) < 0:
+            U[:, -1] *= -1
+            R_cw = U @ Vt
+        pos = -R_cw @ t_v
+        quat = _rot_to_wxyz(R_cw)
+        if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat))):
+            return None
+        return {
+            "K": K,
+            "fx": float(fx), "fy": float(fy),
+            "cx": float(cx), "cy": float(cy),
+            "pos": pos, "quat": quat,
+            "model": str(data.get("cameraModel") or ""),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _rot_to_wxyz(R: np.ndarray) -> np.ndarray:
+    """旋转矩阵 → 四元数 (w,x,y,z)。"""
+    R = np.asarray(R, dtype=np.float64)
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    n = float(np.linalg.norm(q))
+    return q / n if n > 0 else np.array([1.0, 0.0, 0.0, 0.0])
+
+
 def _probe_xform_backend(prim_path: str) -> tuple[bool, str]:
     """自检：哪个后端能读到该 Xform 的动态世界位姿。
 
@@ -309,9 +424,20 @@ def arm_capture(
             if depth:
                 dep = rep.annotators.get("distance_to_image_plane")
                 dep.attach(rp)
+            # 相机参数（内参 + 位姿）—— 没有它深度图无法转点云，也无法做
+            # 视觉-状态对齐校验。字段与布局见 _extract_camera_params。
+            cp = None
+            try:
+                cp = rep.annotators.get("camera_params")
+                cp.attach(rp)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN 相机 {spec.name} 的 camera_params 不可用: {exc}")
+                cp = None
             cams.append({"name": spec.name, "rp": rp, "rgb": rgb, "depth": dep,
+                         "cparams": cp,
                          "size": (w, h), "prim": str(spec.prim_path)})
-            _log(f"相机 {spec.name}: {w}x{h} @ {spec.prim_path}")
+            _log(f"相机 {spec.name}: {w}x{h} @ {spec.prim_path}"
+                 + ("  (+内参)" if cp is not None else ""))
         if not cams:
             _log("ERROR 所有相机都创建失败")
             return None
@@ -484,6 +610,35 @@ def arm_capture(
                         payload[f"{cam['name']}_depth"] = dep
                 payload[f"{cam['name']}_size"] = cam["size"]
                 payload[f"{cam['name']}_prim"] = cam["prim"]
+                # 相机内参 + 世界位姿 —— 每帧都记：腕部相机是**随手臂动的**，
+                # 只记一次不够。头相机虽固定，统一处理避免特例。
+                cpv = cam.get("cparams")
+                if cpv is not None:
+                    try:
+                        got = _extract_camera_params(
+                            cpv.get_data(), int(cam["size"][0]), int(cam["size"][1])
+                        )
+                    except Exception:  # noqa: BLE001
+                        got = None
+                    if got is not None:
+                        name = cam["name"]
+                        payload[f"{name}_K"] = got["K"]
+                        payload[f"{name}_pos"] = got["pos"]
+                        payload[f"{name}_quat"] = got["quat"]
+                        h = _S.setdefault("cam_health", {}).setdefault(
+                            name, {"fx": got["fx"], "fy": got["fy"],
+                                   "first_pos": [round(float(x), 4) for x in got["pos"]],
+                                   "max_travel_mm": 0.0, "samples": 0}
+                        )
+                        h["max_travel_mm"] = max(
+                            h["max_travel_mm"],
+                            float(np.linalg.norm(
+                                got["pos"] - np.asarray(h["first_pos"])) * 1000.0),
+                        )
+                        h["samples"] += 1
+                    elif _S.get(f"_cp_err_{cam['name']}", 0) < 2:
+                        _S[f"_cp_err_{cam['name']}"] = 1
+                        _log(f"WARN 相机 {cam['name']} 参数解析失败（内参将缺失）")
             if art is not None:
                 try:
                     q = art.get_dof_positions()
@@ -644,6 +799,7 @@ def stop_capture() -> dict:
         "physics_dt": _S.get("physics_dt", 0.0),
         # 采集期逐帧自检（不落盘，只在内存里累计）—— 收工时一次看清
         "ee_health": _S.get("ee_health", {}),
+        "camera_health": _S.get("cam_health", {}),
         "joint_cmd_recorded": bool(_S.get("joint_cmd_ok", False)),
     }
     try:
@@ -660,11 +816,31 @@ def stop_capture() -> dict:
         _log("WARN 一帧都没存 —— 检查是否真的在跑仿真（timeline 是否 PLAY）")
 
     _log_ee_health(_S.get("ee_health") or {})
+    _log_camera_health(_S.get("cam_health") or {})
     if not info["joint_cmd_recorded"]:
         _log("WARN 没采到 joint_pos_cmd（下发目标）—— 回放只能回退实测值")
 
     _S.update(armed=False, sub=None, cameras=[], out=None, records=[])
     return info
+
+
+def _log_camera_health(health: dict) -> None:
+    """相机自检结论。判据同样看「值动了没有」+ 内参是否合理。"""
+    if not health:
+        return
+    _log("-" * 60)
+    _log("相机自检")
+    for name, h in sorted(health.items()):
+        fx, fy = h.get("fx", 0.0), h.get("fy", 0.0)
+        travel = h.get("max_travel_mm", 0.0)
+        # 腕部相机会跟着手走（百毫米级）；头相机基本固定（几十毫米内，
+        # 因为躯干会轻微晃动）。所以这里不判死值，只报告位移。
+        k_ok = fx > 0 and fy > 0 and abs(fx - fy) / max(fx, fy) < 0.02
+        _log(f"  {name:12s} fx={fx:7.2f} fy={fy:7.2f}"
+             + ("  内参一致 ✅" if k_ok else "  ⚠ fx/fy 差异大")
+             + f"  相机位移={travel:7.1f}mm  ({h.get('samples', 0)} 帧)")
+    _log("  注: 头相机位移小是正常的（躯干微动）；腕部相机应随手臂大幅移动")
+    _log("-" * 60)
 
 
 def _log_ee_health(health: dict) -> None:

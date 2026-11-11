@@ -535,6 +535,47 @@ def cmd_diag(args: argparse.Namespace) -> int:
                      f"NaN={int((~good).sum())} 帧  ✅")
                 verdicts.append((True, f"{label} travel={travel:.0f}mm"))
 
+    # ---- 7) 相机数据 ----
+    frames_dir = Path(args.episode).expanduser().resolve().parent / "frames"
+    if frames_dir.is_dir():
+        _log("\n[7] 相机数据")
+        try:
+            from importlib import util as _ilu
+
+            _sp = Path(__file__).resolve().parent / "camera_shots.py"
+            _spec = _ilu.spec_from_file_location("camera_shots", _sp)
+            if _spec is None or _spec.loader is None:
+                raise RuntimeError("无法加载 camera_shots")
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            _files = _mod.load_frame_paths(frames_dir.parent)
+            _cams = _mod.available_cameras(_files)
+            if not _cams:
+                _log("  ⚠ 帧里没有相机图像（采集时没选 camera）")
+                verdicts.append((False, "没有相机数据"))
+            for _cam in _cams:
+                rep = _mod.check_frames(_files, _cam)
+                line = (f"  {_cam:12s} {rep['frames']} 帧  "
+                        f"RGB 均值 {rep['rgb_mean']}  "
+                        f"唯一色 {rep['uniq_colors_median']}")
+                if "depth_min" in rep:
+                    line += (f"  深度 {rep['depth_min']}~{rep['depth_max']}m "
+                             f"无效 {rep['depth_invalid_frac']*100:.2f}%")
+                _log(line)
+                if rep["warnings"]:
+                    for w in rep["warnings"]:
+                        _log(f"    ✗ {w}")
+                    verdicts.append((False, f"相机 {_cam}: {w}"))
+                else:
+                    _log("    ✅ 量化检查通过")
+                    verdicts.append((True, f"相机 {_cam} 正常"))
+                # 内参（新采集才有）
+                for k in ("_K",):
+                    if f"{_cam}{k}" not in keys:
+                        _log(f"    注: 无内参（老数据）。新采集会写 {_cam}_K/_pos/_quat")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  跳过（{type(exc).__name__}: {exc}）")
+
     # ---- 总结 ----
     _log("\n" + "=" * 62)
     bad = [r for ok, r in verdicts if not ok]
