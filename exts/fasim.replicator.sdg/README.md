@@ -1,329 +1,259 @@
-# fasim.replicator.sdg
+# FaSim 合成数据采集（sdg）
 
-FaSim 机器人的**离线合成数据采集**扩展（基于 Isaac Replicator）。
+在**正在运行编排**的 Isaac Sim 会话里旁路采集训练数据：相机 RGB-D、关节角
+（实测 + 指令）、末端位姿（实测 + 指令）、交互物体位姿。
 
-## 三层架构
+采集挂在 `physics step` 回调上，与渲染/控制在同一个 `app.update()` 时钟里，
+**不接管控制、不起额外线程**，所以不会干扰运控。
 
-> **两条采集路线并存**：
-> - **层2 离线回放**（本 README 主体）：录 npz → 开环重放 → 出图。
->   快、可批量、可做数据增广；但精细操作（如放试管进小孔）做不到，
->   因为缺少闭环反馈。
-> - **层2.5 旁路采集**（`scripts/live_capture.py`）：编排正常闭环跑，
->   在同一 Isaac 进程里旁路采相机。成功率 = 编排的成功率，能做精细操作。
->   见 `scripts/README_live_capture.md`。
+---
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│ 层1  动作生成 + 录制                                           │
-│   谁做：motion-generation 编排 + OCS2 运控                     │
-│   产出：episode .npz（关节角 + 末端位姿 + 夹爪，同一时刻采样）   │
-│   工具：lerobot_ros2/.../tools/ee_traj.py                      │
-└──────────────────────────────────────────────────────────────┘
-                            ↓  episode .npz
-┌──────────────────────────────────────────────────────────────┐
-│ 层2  物理重演 + 相机渲染（本扩展）                              │
-│   输入：episode .npz                                           │
-│   做什么：逐帧 set_dof_position_targets → 物理真正步进 → 渲染    │
-│   **不启动控制器、不连 ROS2、不跑 OCS2**；物体由接触力自然跟随   │
-│   命令：./scripts/sdg.sh render                                │
-└──────────────────────────────────────────────────────────────┘
-                            ↓  frames/frame_*.npz
-┌──────────────────────────────────────────────────────────────┐
-│ 层3  质量检查 + 数据集打包                                      │
-│   工具：tools/check_quality.py                                 │
-└──────────────────────────────────────────────────────────────┘
+## 快速开始
+
+```bash
+# 1) 启动仿真（另一个终端，自动带运控）
+cd ~/FaSim-Isaac && ./run.sh
+
+# 2) 交互式采集（推荐）
+cd ~/FaSim-Isaac/exts/fasim.replicator.sdg
+./scripts/sdg.sh                # 无参数 = 主菜单
+#   → 采集 → 选采集项/相机/频率 → 跑编排 → 回主菜单选「结束采集」
+
+# 3) 转格式 + 体检
+./scripts/sdg.sh pack ~/fasim_data/run_01      # 提示缺 --robot 时补上
+./scripts/sdg.sh diag ~/fasim_data/run_01/episode.npz
+./scripts/sdg.sh shots ~/fasim_data/run_01 --segment   # 相机联络图
 ```
 
-## 为什么用 DOF 回放，而不是 link 位姿
+主菜单会记住上次的机器人/任务/参数（`~/.cache/fasim_sdg/menu_state.json`），
+下次回车即沿用。
 
-Isaac 自带的 `ArticulationRecordable`（`recorder.py` 在用）记录的是
-**47 个 link 的世界位姿**（源码注释写明 "USD-only link-pose recordable"）。
-回放时用 `set_world_poses` 把这些位姿写回去，对关节机器人是**物理非法的**：
-关节约束被破坏，夹爪（`AssemblerFixedJoint` 焊接）会被扯开。
+---
 
-层2 改用 `set_dof_position_targets`（走 drive）驱动关节，是合法的运动学重放。
-**注意用 drive 而不是 `set_dof_positions`（teleport）** —— 后者会让接触约束
-每帧失效，物体抓不住，详见下文「三条必须满足的前提」。
+## 部署
 
-**底盘不驱动**：articulation 的 32 个 DOF 里有 4 个驱动轮 + 8 个脚轮关节。
-它们不属于操作轨迹，强行驱动会把整个底座拖走。`skipped_dof_names()` 会把
-名字含 `wheel`/`caster` 的全部跳过，保持当前位置不动。
-
-## 关节名优先，不用索引
-
-运控发 `/joint_states` 里按名字的 18 个关节；Isaac 的 `ArticulationView`
-有 32 个 DOF 且**顺序不同**。只存索引必然错位。
-
-所以 episode 里同时存 `joint_names`，回放时 `build_dof_mapping()` 按名字
-建立映射。任何一个关节名对不上都会报 `missing`，而不是静默用错位置。
-
-## 时间对齐：用帧索引，不用时间戳
-
-```
-episode 有 N 帧关节角
-层2 逐帧推进：第 i 次循环 = 第 i 帧关节角 + 第 i 组图像
-→ 天然一一对应，不存在时间戳漂移
+```bash
+./init.sh          # 或按仓库既有流程注册扩展
 ```
 
-因此层2 必须**逐帧步进**（每帧至少 `app.update()` 一次），
-不能"实时播放然后按墙钟采样"。
+扩展 `fasim.replicator.sdg` 随 Isaac 启动自动加载，通过
+`<runtime>/capture.sock`（Unix domain socket）接受指令。终端侧的
+`sdg.sh` 只是在跟这个 socket 说话，**不需要 source 任何环境**
+（`fk` / `shots` 等离线命令同理，只依赖 numpy/PyYAML）。
 
-**每帧推进多少由时间累积器决定**（`--steps-per-frame` 默认 0 = 自动）：
-按 episode 的真实帧间隔累积，使仿真总时长与录制一致。这一点对接触很重要
-—— 回放速度偏离录制速度，接触力就不对。
+部署检查：
 
-不要用 fixed time stepping 去对齐：实测那样时间轴会走但 PhysX 不再被
-step（关节读回恒等于设定值、画面定格）。
+```bash
+./scripts/sdg.sh doctor
+```
 
-## 渲染阶段有物理吗？
+---
 
-**有。层2 现在是「物理重演」，不是「摆姿势拍照」** —— 这是踩了很多坑之后
-确定的唯一可行方案。
+## 配置：机器人与任务隔离
 
-| | 正常跑仿真 | 层2 渲染 |
+**本仓库的代码里不含任何具体机器人名**。所有机器人相关信息都在配置目录下：
+
+```
+configs/
+├── _default.yaml                 # 全局默认（输出目录、物理参数）
+└── <robot_key>/
+    ├── robot.yaml                # 机器人级：怎么找到它、怎么读它的位姿
+    └── tasks/
+        └── <task_key>.yaml       # 任务级：场景、相机、交互物体
+```
+
+### `robot.yaml` —— 机器人级
+
+| 字段 | 作用 | 换机器人要改吗 |
 |---|---|---|
-| timeline | PLAY | **PLAY**（物理必须真正步进） |
-| 物理求解 | 有重力/接触 | **有**（物体靠接触力自然跟随） |
-| 关节 | 控制器驱动 | `set_dof_position_targets` + drive |
-| 物体 | 受物理影响 | **受物理影响，不手动设位姿** |
-
-为什么不能「摆姿势拍照」：
-
-- 用 `set_dof_positions`（teleport）瞬移关节 → 每帧位移 5~20mm，
-  远大于接触厚度（2mm），接触约束每帧被打断，**摩擦求解不出来**，
-  物体像「完全光滑地滑过」夹爪。
-- 用 `set_world_poses` 硬写物体位姿 → 对刚体非法，要么无效（kinematic）
-  要么被物理改写（位置飞到天上）。
-
-正确做法是让物理真正运行：关节走 drive，物体由接触力自然跟随。
-
-## 三条必须满足的前提（缺一条就抓不住物）
-
-这是层2 从「看起来对」到「真的抓住」的关键，每一条都实测量化过：
-
-### 1. 底盘必须锁住
-
-层1 编排全程 **BASE_LOCK**（OCS2 主动控住底盘），所以录制时底盘纹丝不动。
-但回放的 USD 里 `base_link` 是**自由浮动刚体**，手臂一挥就把整机带着转。
-
-实测：到 t=28s 已偏航 **-12.5°**、位移 11mm，右末端偏 **76mm**，
-夹爪从试管旁擦过去。用 `PhysicsFixedJoint` 锚到世界后，漂移归零。
-
-**必须在构造 `Articulation` 之前加**，否则 physics tensor 失效（关节读写全 NaN）。
-
-### 2. 手臂必须走 drive，不能用 teleport
-
-| 驱动方式 | 关节误差 | 接触 | 结果 |
-|---|---|---|---|
-| `set_dof_positions` | <1mrad（很准） | 每帧被打断 | 物体光滑滑过 ❌ |
-| `set_dof_position_targets` + gain | 稍大 | 稳定 | 正常夹起 ✅ |
-
-实测对比（抓取帧 1050 → 抬手 1350）：
-```
-teleport: grip -0.0146→-0.0200（空合），tube_z 0.7431→0.7430  ❌
-drive:    grip -0.0143→-0.0143（一直夹着），tube_z 0.7431→0.9119 ✅
-```
-
-手臂 gain 默认 `K=100000 D=10000`。
-
-### 3. 夹爪力气要够
-
-资产默认 `maxForce=20N`，实测**临界点在 20~25N**：
-
-```
-20N → grip 停在 -0.0021（顶不住），试管掉地   ❌
-25N → grip 稳定 -0.0147，抬起 186mm，p95=13mm ✅
-40N → 抬起 187mm，p95=9mm                     ✅
-80N → 抬起 184mm，p95=17mm（过大易抖）        ✅
-```
-
-取 **25N**（只比 Dex1 额定 effort 20N 高 5N，尽量贴近现实），
-stiffness 提到 50000（决定手指跟随手的速度，太软追不上举手动作）。
-
-## 夹爪开合：开关量，不是位置回放
-
-运控用位置指令驱动夹爪。闭合时 target 继续往里压，手指碰到物体后停住，
-于是 `F = K*(target-actual)` 产生夹持力 —— 这才是能把物体提起来的原因。
-而 `/joint_states` 记录的是被接触限制后的 **actual**。
-
-若回放也用 actual 作为 target，`target==actual` ⇒ 夹持力恒为 0。
-所以回放必须还原「夹住」这个语义：
-
-- **张开** → target = 关节上限（+0.0245）
-- **闭合** → target = 关节**下限**（-0.0200，与运控的 `closed_position_` 一致），
-  手指被物体挡住停在中间（如 -0.0147），drive 持续出力
-
-判定「开/合」的阈值要注意：录制开头夹爪常停在 **0.0**（两指合拢的中间态，
-运控还没下发指令），那一段**不是抓取**。若判成闭合并压到限位，会在真正
-抓取前就把物理状态搞坏（实测 293~773 帧被误判，导致后面抓取失败）。
-判据用「距张开值超过 60% 行程」。
-
-## 夹爪关节必须纳入 joint_names
-
-`ee_traj` 的 `ARM_JOINTS` 末尾包含 `left_gripper_joint` / `right_gripper_joint`。
-它们不在运控优化集合里（运控不管夹爪），但层2 回放必须驱动，
-否则夹爪永远停在初始开合状态，手里的试管会与夹爪脱开。
-
-`check_quality.py` 会检查这一项，缺失直接判 FAIL。
-
-
-## 安装
-
-`init.sh` 的 `install_fasim_kit_extension` 会把 `exts/<name>` 链到
-`$ISAACSIM_DIR/extsUser/` 并写入常用 kit 的 `[dependencies]`。
-
-不注册也能用 —— `scripts/sdg.sh` 自带 `PYTHONPATH`，可直接跑。
-
-## 用法
-
-### 路线 A：层2 离线回放（录 npz → 重放 → 出图）
-
-```bash
-cd /home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg
-
-# 0) 看配置
-./scripts/sdg.sh list
-./scripts/sdg.sh describe --robot unitree_g1d --task sinopec_test_tube
-
-# 1) 层1：录制（仿真在跑编排时，另开终端旁听）
-cd /home/fiveages/lerobot_ros2/examples/IsaacSim/robots/Unitree/G1D/tools
-./ee_traj.sh record -o ~/fa_data/pick_01.npz
-./ee_traj.sh inspect ~/fa_data/pick_01.npz
-
-# 2) 检查 episode（不需要 Isaac）
-cd /home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg
-python3 tools/check_quality.py --episode ~/fa_data/pick_01.npz
-
-# 3) 层2：渲染相机数据（无头，不需要 ROS2）
-./scripts/sdg.sh render --robot unitree_g1d --task sinopec_test_tube \
-    --episode ~/fa_data/pick_01.npz
-
-# 4) 连同渲染产物一起检查
-python3 tools/check_quality.py --episode ~/fa_data/pick_01.npz \
-    --render-dir ~/fasim_sdg/unitree_g1d/sinopec_test_tube
-```
-
-想肉眼看回放效果，加 `--gui`：
-
-```bash
-./scripts/sdg.sh render ... --episode xxx.npz --gui
-```
-
-### 路线 B：层2.5 旁路采集（编排闭环跑，顺带采相机）
-
-不需要 npz，也不需要回放。编排正常跑，同一 Isaac 进程内旁路采。
-
-```bash
-# 1) 安装扩展（只需一次，和 ros2.nodes 一样的安装路径）
-cd /home/fiveages/FaSim-Isaac && ./init.sh    # 选 isaac_local
-
-# 2) ./run.sh 启动仿真，做好跑编排的准备
-
-# 3) 另开终端：交互式开始采集
-cd exts/fasim.replicator.sdg
-./scripts/sdg.sh capture
-
-# 4) 终端跑 motion-generation（和平时一样）
-
-# 5) 结束
-./scripts/sdg.sh stop
-```
-
-`capture` 会依次问机器人/任务/相机/频率/分辨率/深度/输出目录，全有默认值。
-另有 `./scripts/sdg.sh status` 看进度、`./scripts/sdg.sh doctor` 自检。
-
-架构、路径配置、产物格式、故障排查见
-**`scripts/README_live_capture.md`**。
-
-### 快速验证工具
-
-```bash
-# 无头抽样出图（十几秒到几分钟），出 contact_sheet.png + report.json
-/home/fiveages/isaacsim/python.sh tools/verify_replay.py \
-    --episode ~/fa_data/pick_10.npz --out /tmp/verify --samples 12
-
-# 带视窗交互回放（能直接看动作对不对），自动切第三人称机位
-/home/fiveages/isaacsim/python.sh tools/replay_gui.py \
-    --episode ~/fa_data/pick_10.npz --start 900 --end 1700 --speed 0.3
-```
-
-`replay_gui.py` 实时打印三个关键量，用来判断抓取是否成功：
-
-```
-frame=1200 t=24.0s test_tube=-0.5mm | base 漂移=0.0mm 偏航=+0.000° | 夹爪实际 [-0.0147 -0.0148]
-                    ↑ 试管偏差        ↑ 底盘必须恒为 0      ↑ 被物体挡住=夹到了
-```
-
-可调参数：`--no-lock-base`（对比漂移）、`--arm-mode teleport`（对比接触失效）、
-`--grip-maxforce`（夹持力）、`--close-target`（夹爪闭合目标）、`--no-ros`。
-
-## 输出
-
-```
-<output.dir>/<robot_key>/<task_key>/
-├── frames/frame_000000.npz       每帧 3 个相机的 rgb + depth
-└── manifest.json                 帧范围 / 相机 / 关节跟踪误差
-```
-
-`output.dir` 在 `configs/_default.yaml`（当前 `/home/fiveages/fasim_sdg`）。
-**数据不进仓库**。
-
-## 关节跟踪误差：核心质量指标
-
-层2 每帧回读 `get_dof_positions()` 与目标比对：
-
-```
-joint max error : 0.412 mrad     ← 越小越好
-joint p95 error : 0.180 mrad
-```
-
-判据：
-- `< 5 mrad` —— 相机姿态与录制姿态一致，数据可信
-- `5-50 mrad` —— 轻微偏差，检查 `--steps-per-frame`
-- `> 50 mrad` —— 回放不忠实，**这帧的图像不能用**
-
-这个数字是回答"数据质量如何"最直接的证据。
-
-## 相机（G1D，已实测）
-
-| 名称 | prim |
+| `articulation_prim` | Isaac 里 articulation 的根 prim | ✅ 必改 |
+| `base_prim` | 底盘 prim（世界→机体换算） | ✅ 必改 |
+| `ee_prims` | 名义 tcp frame（诊断对照用） | ✅ 必改 |
+| `ee_links` | **末端真值来源**：父刚体 + 固定偏移 | ✅ 必改 |
+| `planning` | **末端指令位姿来源**：运控 URDF + ee_frames | ✅ 改 `ee_frames` |
+| `gripper_joints` | 夹爪关节名 | 视情况 |
+| `expected_dof_count` | 关节总数（自检用） | 视情况 |
+
+### `tasks/<task>.yaml` —— 任务级
+
+| 字段 | 作用 |
 |---|---|
-| `head` | `/World/G1D/G1_Body/torso_link/d435_link/head_camera` |
-| `wrist_left` | `.../left_tcp/Dex1/Geometry/dex1_base_link/dex1_camera_link/dex1_camera_optical_frame/dex1_left_camera` |
-| `wrist_right` | `.../right_tcp/Dex1/.../dex1_right_camera` |
+| `scene_usda` | 场景文件（相对仓库根或绝对路径） |
+| `variant_selection` | 打开场景后要切的 variant（如 `ROS: fiveages`） |
+| `cameras` | 相机列表：`name` / `prim` / `resolution` / `depth` |
+| `tracked_prims` | 需要记录位姿的物体：`<label>: <prim_path>` |
 
-## episode 格式
+### 接入一个新机器人 / 新任务
 
-见 `fasim/replicator/sdg/episode.py` 的模块 docstring。要点：
+```bash
+mkdir -p configs/<new_robot>/tasks
+cp configs/unitree_g1d/robot.yaml configs/<new_robot>/robot.yaml
+# 改 articulation_prim / base_prim / ee_links / planning.ee_frames
+$EDITOR configs/<new_robot>/tasks/<new_task>.yaml
+```
 
-| 字段 | 形状 | 说明 |
+**不需要改代码。** 若目录下只有一个候选，`sdg.sh` 会自动选中；有多个才问。
+
+### `ee_links` 与 `planning` 为什么要分开
+
+这是本项目最容易混淆的一点，但必须分开：
+
+| | `ee_links` | `planning` |
 |---|---|---|
-| `t` | (N,) | 相对秒数，**仅日志用，不参与对齐** |
-| `joint_pos` | (N, J) | 实测关节角，列序 = `joint_names` |
-| `joint_names` | (J,) | **回放的唯一依据** |
-| `left_pos` / `left_quat` | (N,3) / (N,4) | 末端实测（world） |
-| `left_cmd_pos` / `left_cmd_quat` | | 末端指令（训练 action） |
-| `left_grip` | (N,) | 1=开 0=关 -1=未知 |
+| 给出什么 | 末端**实测**位姿 | 末端**指令**位姿 |
+| 数据来源 | `RigidPrim` 直读 PhysX | 运控 URDF + 关节指令角做 FK |
+| 训练用途 | observation | **action** |
+| 依赖 | 无 | 需要运控那份 planning URDF |
 
-## 旧内容说明
+为什么实测不能直读 tcp：tcp 是纯 Xform（fixed joint 的子 frame），而
+newton kit 关了 PhysX→USD/Fabric 同步（`updateToUsd=false` /
+`fabricUpdateTransformations=false`），所以 `XformPrim` 任何后端都读到
+**authoring 静态值**（实测 765 帧偏离 0.0mm）。必须读父刚体再叠固定偏移。
 
-| 项 | 状态 |
-|---|---|
-| `scripts/capturer.py` + `sdg.sh capture` | **legacy**：回放 HDF5 的 47 link 位姿，物理非法。仅保留给历史数据，新数据一律走 `render` |
-| `scripts/dof_replay.py` | 早期 DOF 实验脚本。功能已被 `renderer.py` 吸收，保留作参考 |
-| `scripts/gui_record.py` | GUI 内录制（Script Editor 用），仍然有效 |
-| 已删除的 `test_*.py` / `verify_*.py` | 当时的排查脚本，结论已固化进 `renderer.py` 的注释 |
+为什么指令位姿要用 FK：指令位姿只存在于运控 MPC 内部，Isaac 侧只有关节
+指令角 `joint_pos_cmd`（`get_dof_position_targets`，与实测无时间滞后）。
+用运控**自己加载的那份** planning URDF 做正解，与 `eeFrame` 同源。
 
-## 边界：接 VR 遥操
+### `planning.urdf` 的解析规则
 
-层1 只依赖 `/joint_states` 与末端位姿话题，**不 import 任何 OCS2/lerobot 模块**。
-VR 遥操、手动示教、脚本回放都能复用同一个 `record`，层2 完全共享。
+```yaml
+planning:
+  urdf: auto          # auto=从运控缓存自动找 / none=关闭 / <path>=显式
+  cache_dir: ""       # 留空 = $OCS2_PLANNING_URDF_DIR 或 /tmp
+  ee_frames:          # 对应运控 .info 里的 eeFrame / eeFrame1
+    left: left_tcp
+    right: right_tcp
+```
 
-## 扩展新机器人
+运控缓存布局（见 `robot_common_launch/common/robot_utils.py`）：
 
-1. 建 `configs/<robot_key>/robot.yaml`（articulation / base / EE / 话题）
-2. 建 `configs/<robot_key>/tasks/<task_key>.yaml`（场景 / 相机 / tracked prims）
-3. `./scripts/sdg.sh describe --robot <robot_key> --task <task_key>` 自检
-4. （可选）`python.sh scripts/probe_cameras.py` 换成新机器人验证相机
+```
+$OCS2_PLANNING_URDF_DIR (默认 /tmp) / ocs2_ros2 / <robot> / planning_urdf / <hash>.urdf
+```
 
-不改 Python 代码。
+hash 由 xacro 映射参数决定、无法复算，所以按 **mtime 取最新**（改过配置会
+生成新 hash，最新的就是当前在用的）。
+
+设 `urdf: none` 可关闭 FK —— 此时 EE 回放会退回实测位姿，精度差 7~9mm。
+
+---
+
+## 数据字段：什么是真值，什么是命令
+
+`episode.npz` 里同一个量常常有两份，混用会让训练效果变差：
+
+| 字段 | 语义 | 训练用途 |
+|---|---|---|
+| `joint_pos` | 实测关节角（PhysX） | **observation** |
+| `joint_pos_cmd` | 下发给 drive 的目标关节角 | **action** |
+| `<side>_pos` / `_quat` | 末端实测位姿（刚体读） | **observation** |
+| `<side>_cmd_pos` / `_cmd_quat` | 末端指令位姿（FK 反算） | **action** |
+| `<side>_pos_xform` / `_quat_xform` | Xform 直读的静态对照值 | **忽略**（仅诊断） |
+| `obj/<label>_pos` / `_quat` | 交互物体位姿（刚体读） | observation |
+| `<cam>_rgb` / `<cam>_depth` | 相机图像 | observation |
+| `<cam>_K` / `<cam>_pos` / `<cam>_quat` | 相机内参 + 世界位姿 | 点云/标定 |
+
+**为什么 action 必须是 cmd 不是 actual**：
+
+```
+编排:   目标 → 运控 → 实测 = 目标 − 7~9mm      ✅
+回放:   实测 → 运控 → 实测 − 7~9mm            ❌ 稳定偏下
+```
+
+实测末端比指令低 `mean 7.2mm / max 32mm`、`dz +6.4mm`（实测值）。
+用实测当 action，部署时运控会二次叠加同一个稳态误差 —— 这就是
+「抓取位置稳定偏下 2-3cm」的成因。
+
+---
+
+## 命令一览
+
+| 命令 | 作用 | 需要 Isaac |
+|---|---|---|
+| `sdg.sh` | 交互式主菜单 | 否（采集时需 Isaac 在跑） |
+| `capture` | 开始采集 | Isaac 需在跑 |
+| `status` / `stop` | 查看/结束采集 | Isaac 需在跑 |
+| `pack` | 会话 → `episode.npz`（含指令位姿反算） | 否 |
+| `diag` | 一键体检（7 项） | 否 |
+| `shots` | 相机联络图 | 否 |
+| `trim` | 切任务片段 | 否 |
+| `fk` / `fk-diag` | FK 对拍 / 回放体检 | 否 |
+| `live` | 同实例回放（joints / ee） | 是 |
+| `doctor` | 环境自检 | 否 |
+
+`fk` / `diag` / `fk-diag` 会优先找带 pinocchio 的 python
+（`SDG_FK_PYTHON` 可指定）；找不到也能跑 —— 本项目的 FK 是**纯 numpy** 实现，
+pinocchio 只用于可选的对拍自检。
+
+---
+
+## 数据体检
+
+采完先跑这三条，全绿再拿去训练：
+
+```bash
+./scripts/sdg.sh pack <session> --robot <robot>   # 看「末端指令位姿」是否写入
+./scripts/sdg.sh diag <episode.npz>               # 7 项体检，末尾给结论
+./scripts/sdg.sh shots <session> --segment        # 拼图，人眼确认画面
+```
+
+`diag` 的 7 项：
+
+1. 末端位姿是动态值还是死值
+2. 末端 vs FK 交叉验证（应 < 5mm）
+3. 关节角口径（有没有 `joint_pos_cmd`）+ drive 稳态误差
+4. 时间轴（帧间隔来源、抖动）
+5. 末端与交互物体的接近量
+6. 物体位姿（静止的不该动、被操作的要动）
+7. 相机（RGB 统计、深度范围、RGB/深度尺寸一致性）
+
+**注意**：`shots` 只做量化检查（全黑/全白/冻结/尺寸不符），画面内容仍需
+人眼看拼图 —— 看得到物体、夹爪、抓取过程才说明采到了有用的图像。
+
+---
+
+## 采集频率
+
+| `every` | 仿真时间帧率 | 说明 |
+|---|---|---|
+| 5 | 40 fps | 最细，开销最大 |
+| 10 | 20 fps | **推荐** |
+| 20 | 10 fps | 省开销 |
+
+实际墙钟速度受 RTF 限制（实测本机 3 相机时 RTF≈0.65，约 13 fps 墙钟）。
+**跨采集方式比较时用 `physics_steps / duration_sec`**（物理步/秒），
+那是与渲染开销无关的真实仿真速度。
+
+---
+
+## 目录结构
+
+```
+exts/fasim.replicator.sdg/
+├── configs/                      机器人/任务配置（唯一需要改的地方）
+├── fasim/replicator/sdg/
+│   ├── live_capture.py           ← 实际采集逻辑（由扩展调用）
+│   ├── live_replay.py            同实例回放（joints / ee）
+│   ├── fk.py                     纯 numpy FK（末端指令位姿 + 离线对拍）
+│   ├── pack.py                   会话 → episode
+│   ├── episode.py                episode 格式
+│   ├── config_io.py              配置加载
+│   ├── renderer.py               层2 离线渲染
+│   └── scripts/extension.py      随 Isaac 加载的 socket 服务
+└── scripts/
+    ├── sdg.sh                    统一入口（无参数 = 菜单）
+    ├── sdg_menu.py               交互式主菜单
+    ├── cli.py                    子命令实现
+    ├── camera_shots.py           相机联络图
+    └── probe_camera_params.py    相机参数字段探针（升级 Isaac 后自查用）
+```
+
+---
+
+## 已知限制 / 后续
+
+- **物体回放**只做了「复位到第 0 帧后交给物理」（`--no-reset-objects` 可关）。
+  逐帧强制摆放物体未实现 —— 那份给纯渲染合成数据用，需要时再加。
+- **`_xform` 字段**是诊断对照值，训练时必须忽略。
+- 相机参数依赖 `camera_params` annotator（Isaac 6.2 实测可用）。升级后跑
+  `python.sh scripts/probe_camera_params.py` 复核字段与布局。

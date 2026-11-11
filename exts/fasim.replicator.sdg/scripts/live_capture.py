@@ -351,8 +351,8 @@ def arm_capture(
     out_dir: str = "",
     every: int = 10,
     camera: str = "head",
-    robot_key: str = "unitree_g1d",
-    task_key: str = "sinopec_test_tube",
+    robot_key: str = "",
+    task_key: str = "",
     width: int | None = None,
     height: int | None = None,
     record_joints: bool = True,
@@ -385,6 +385,15 @@ def arm_capture(
         return None
 
     _log(f"live_capture 代码版本: {_code_stamp()}  (文件 mtime)")
+
+    # robot_key / task_key 必须显式给（CLI 通过 socket 传）。不猜 —— 猜错会
+    # 用别的机器人的场景/相机路径，排查起来很费劲。
+    if not str(robot_key or "").strip():
+        _log("ERROR 缺少 robot_key（configs/<robot>/robot.yaml）")
+        return None
+    if not str(task_key or "").strip():
+        _log("ERROR 缺少 task_key（configs/<robot>/tasks/<task>.yaml）")
+        return None
 
     from fasim.replicator.sdg import runtime
 

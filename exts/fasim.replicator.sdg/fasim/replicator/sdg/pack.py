@@ -269,7 +269,7 @@ def pack_episode(
                         break
             if not rk:
                 _log("  提示: 判断不出机器人配置，跳过末端指令位姿反算。"
-                     "加上 --robot <key>（如 --robot unitree_g1d）即可")
+                     "加上 --robot <key>（对应 configs/<key>/robot.yaml）即可")
             planning_cfg: dict = {}
             if rk:
                 try:

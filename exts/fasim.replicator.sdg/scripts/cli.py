@@ -1,4 +1,4 @@
-"""``sdg.sh capture/status/stop`` 的实现 —— 与随 Isaac 自动加载的扩展通信。
+"""``sdg.sh <子命令>`` 的实现 —— 与随 Isaac 自动加载的扩展通信。
 
 为什么单独一个进程
 ==================
@@ -8,58 +8,72 @@
 
 这样用户永远不用碰 Script Editor，也不用 ``echo > control.txt``。
 
-交互流程（对齐 ./run.sh / motion-generation 的风格）
-====================================================
-::
+两种用法
+========
+**日常用交互菜单**（推荐，会记住上次选择）::
+
+    ./scripts/sdg.sh            # 无参数 = 主菜单
+
+**脚本/CI 用子命令**（本篇实现的就是这些）::
+
+    ./scripts/sdg.sh capture --robot <robot> --task <task> --what joint,ee,object
+    ./scripts/sdg.sh pack <session> --robot <robot>
+    ./scripts/sdg.sh live <episode.npz> --drive joints --wait
+
+机器人与任务的隔离
+==================
+本文件**不含任何具体机器人的名字**。所有机器人/任务信息来自::
+
+    configs/<robot>/robot.yaml             机器人级（articulation/ee_links/planning…）
+    configs/<robot>/tasks/<task>.yaml      任务级（场景/相机/tracked_prims…）
+
+接入新机器人 = 新建一个 ``configs/<new_robot>/`` 目录，不改代码。
+只有一个候选时自动选中；多个候选时才交互问。
+
+交互流程示例（旧版 ``capture`` 的子命令入口）::
 
     $ ./scripts/sdg.sh capture
     机器人
-      1) unitree_g1d  (默认)
+      1) <robot_a>  /World/...
+      2) <robot_b>  /World/...
     选择 [1]: 1
 
     任务
-      1) sinopec_test_tube  (默认)
+      1) <task_x>  (默认)
     选择 [1]: 1
+
+    采什么（逗号分隔，回车=全部）
+      camera  相机 RGB-D
+      joint   关节角（回放必需）
+      ee      末端位姿（tcp）
+      object  交互物体位姿
+    选择 [camera,joint,ee,object]:
 
     相机
-      1) head             640x480
-      2) wrist_left      640x480
-      3) wrist_right     640x480
-      4) 全部
-    选择 [1]: 4
+      1) <cam_a>   640x480
+      2) 全部相机（2 个，开销最大）
+    选择 [2]: 2
 
     采集频率（每 N 个物理步采一帧）
-      1) 10  ≈ 17fps  (推荐)
-      2) 20  ≈  9fps  (省开销)
-      3) 40  ≈  4fps  (最省)
-      4) 自定义
-    选择 [1]: 1
-
-    分辨率
-      1) 640x480  (配置默认)
-      2) 320x240  (省开销)
-    选择 [1]: 2
-
-    深度图
-      1) 要 (默认)   2) 不要
+      1) 10  ≈ 20fps 仿真时间  (推荐)
+      2) 20  ≈ 10fps 仿真时间  (省开销)
     选择 [1]: 1
 
     输出目录
-      <空格> = /home/xxx/fasim_data/unitree_g1d/sinopec_test_tube/20261110-1030
+      <空格> = <data_root>/<robot>/<task>/run_01
     输入:
 
     ============================================================
      准备开始采集
-      机器人   : unitree_g1d
-      任务     : sinopec_test_tube
-      相机     : head,wrist_left,wrist_right
+      机器人   : <robot>
+      任务     : <task>
+      采集项   : camera,joint,ee,object
+      相机     : 全部（2 个）
       频率     : every=10
-      分辨率   : 320x240
-      深度     : 是
-      输出     : /home/xxx/fasim_data/...
+      输出     : <data_root>/...
     ============================================================
     确认开始？ [Y/n]:
-    [sdg] 已开始采集（3 相机，every=10）
+    [sdg] 已开始采集（2 相机，every=10）
     [sdg] 现在去跑 motion-generation；结束后执行 ./scripts/sdg.sh stop
 """
 
@@ -153,7 +167,10 @@ def cmd_capture(args: argparse.Namespace) -> int:
     robots = sorted(
         p.name for p in (cfg_root).iterdir()
         if p.is_dir() and (p / "robot.yaml").is_file()
-    ) or ["unitree_g1d"]
+    )
+    if not robots:
+        _log(f"ERROR {cfg_root} 下没有机器人配置（需要 <robot>/robot.yaml）")
+        return 1
     robot = args.robot or _pick("机器人", [(r, r) for r in robots])
 
     # --- 任务 ---
@@ -493,14 +510,26 @@ def cmd_diag(args: argparse.Namespace) -> int:
         ok = jitter < 1.0
         verdicts.append((ok, f"时间轴抖动 {jitter:.1f}ms"))
 
-    # ---- 5) 末端与试管的关系（若有） ----
-    # 判据不能用绝对距离：tcp 是**法兰**，实际夹持点在指尖前方几厘米，所以
-    # 抓到试管时法兰离试管中心仍有 10-15cm 是正常的。看「接近量」更可靠 ——
-    # 手有没有真的伸过去。
-    tube = "obj/test_tube_pos"
-    if tube in keys:
-        _log("\n[5] 末端与试管")
-        tp = np.asarray(z[tube], dtype=np.float64)
+    # ---- 5) 末端与交互物体的接近关系（若有物体位姿） ----
+    # 判据不能用绝对距离：tcp 通常是**法兰**，实际夹持点在指尖前方几厘米，
+    # 所以真抓到物体时法兰离物体中心仍有 10-15cm 属正常。看「接近量」
+    # （起始距离 − 最小距离）更可靠 —— 手有没有真的伸过去。
+    #
+    # 用**第一个被移动的物体**作为参照，不写死具体物体名（任务无关）。
+    objs_all = sorted(k for k in keys if k.startswith("obj/") and k.endswith("_pos"))
+    ref_obj = None
+    ref_travel = 0.0
+    for k in objs_all:
+        p = np.asarray(z[k], dtype=np.float64)
+        g = np.isfinite(p).all(axis=1)
+        if g.sum() > 1:
+            tv = float(np.linalg.norm(p[g] - p[g][0], axis=1).max() * 1000)
+            if tv > ref_travel:
+                ref_travel, ref_obj = tv, k
+    if ref_obj is not None and ref_travel > 30.0:
+        label = ref_obj[len("obj/"):-len("_pos")]
+        _log(f"\n[5] 末端与交互物体（参照: {label}，移动 {ref_travel:.0f}mm）")
+        tp = np.asarray(z[ref_obj], dtype=np.float64)
         for side in ("left", "right"):
             rk = f"{side}_pos"
             if rk not in keys:
@@ -516,9 +545,9 @@ def cmd_diag(args: argparse.Namespace) -> int:
             _log(f"  {side}: 起始 {d[0]*1000:.0f}mm → 最近 {d.min()*1000:.0f}mm"
                  f" @f{i}  接近量 {approach:.0f}mm"
                  + ("   ✅" if ok else "   ⚠ 没明显接近"))
-            verdicts.append((ok, f"{side} 接近试管 {approach:.0f}mm"))
-        _log("  注: tcp 是法兰，实际夹持点在指尖前方几厘米，"
-             "抓到试管时法兰距中心 10-15cm 属正常")
+            verdicts.append((ok, f"{side} 接近 {label} {approach:.0f}mm"))
+        _log("  注: tcp 通常是法兰，实际夹持点在指尖前方，"
+             "真抓到物体时距中心 10-15cm 属正常")
 
     # ---- 6) 物体位姿（rigid 读取的健全性） ----
     objs = sorted(k for k in keys if k.startswith("obj/") and k.endswith("_pos"))
@@ -996,6 +1025,33 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _default_robot() -> str:
+    """默认机器人：只有一个配置目录时就用它，否则空串（强制显式指定）。
+
+    **不写死具体机器人** —— 换场景/换机器人时不该改代码。
+    """
+    try:
+        from fasim.replicator.sdg.config_io import CONFIG_ROOT
+
+        rs = sorted(p.name for p in CONFIG_ROOT.iterdir()
+                    if p.is_dir() and (p / "robot.yaml").is_file())
+        return rs[0] if len(rs) == 1 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _default_task(robot: str) -> str:
+    """默认任务：该机器人下只有一个任务时用它。"""
+    try:
+        from fasim.replicator.sdg.config_io import CONFIG_ROOT
+
+        d = CONFIG_ROOT / (robot or "") / "tasks"
+        ts = sorted(p.stem for p in d.glob("*.yaml")) if d.is_dir() else []
+        return ts[0] if len(ts) == 1 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="sdg.sh",
@@ -1041,8 +1097,8 @@ def main(argv: list[str] | None = None) -> int:
 
     v = sub.add_parser("preview", help="用层2 回放路径预览 episode（需 Isaac python）")
     v.add_argument("episode")
-    v.add_argument("--robot", default="unitree_g1d")
-    v.add_argument("--task", default="sinopec_test_tube")
+    v.add_argument("--robot", default=_default_robot())
+    v.add_argument("--task", default=_default_task(_default_robot()))
     v.add_argument("--out", default="")
     v.add_argument("--gui", action="store_true", help="开窗口（默认无头）")
     v.add_argument(
@@ -1070,8 +1126,8 @@ def main(argv: list[str] | None = None) -> int:
 
     lv = sub.add_parser("live", help="在同一 Isaac 实例里回放 episode（不弹新窗口）")
     lv.add_argument("episode")
-    lv.add_argument("--robot", default="unitree_g1d")
-    lv.add_argument("--task", default="sinopec_test_tube",
+    lv.add_argument("--robot", default=_default_robot())
+    lv.add_argument("--task", default=_default_task(_default_robot()),
                     help="任务配置 key（用于找 tracked_prims 复位物体）")
     lv.add_argument("--drive", choices=("joints", "ee"), default="joints",
                     help="joints=逐帧 drive 关节角（不需要 ROS）；"

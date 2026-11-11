@@ -30,10 +30,19 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 
 usage() {
     cat <<'EOF'
-用法: ./sdg.sh <命令> [选项]
+用法: ./sdg.sh [命令] [选项]
 
+  ./sdg.sh              ← 交互式主菜单（推荐日常使用，会记住上次选择）
+  ./sdg.sh <命令> ...   ← 参数化调用（适合脚本/CI）
+
+主菜单功能:
+  采集 / 查看进度 / 结束采集 / 数据工具 / 回放 / 自检 / 切换机器人任务
+
+子命令（参数化）:
 采集控制（不需要 Isaac python，直接跟运行中的仿真对话）:
-  capture     交互式开始采集（选机器人/任务/采集项/相机/频率/输出目录）
+  capture     开始采集（不指定参数则交互）
+              --robot <key> --task <key> --what camera,joint,ee,object
+              --camera all|<name,...> --every 10 --out <dir>
   status      查看采集进度（帧数、物理步、错误数）
   stop        结束采集并写 session.json
   doctor      环境自检（路径/socket/扩展是否就绪）
@@ -41,19 +50,21 @@ usage() {
 数据检查与转换（不需要 Isaac python）:
   info        看采集会话里有什么（帧数、相机、关节数、体积）
   pack        采集会话 → episode npz（层2 能读的格式）
+              pack <session> [--robot <key>]   反算末端指令位姿需要 robot
   trim        切成任务片段，剔除待机段（ACT 训练必需）
   fk          用 FK 算末端真值（需要 pinocchio）
-              fk <episode.npz>                     体检采集：末端是不是真采到了
-              fk <*.replay_fN.npz> --source <ep>   体检回放：手偏了几毫米、偏哪
-  diag        一键体检 episode（末端真伪/关节口径/时间轴/FK 交叉验证）
-  fk-diag     体检回放（回放手到的地方 vs 编排手到的地方，mm 级 + 方向）
-  shots       相机联络图：把会话的相机帧拼成一张图，人工检查 RGB 是否正常
+              fk <episode.npz>                     体检采集
+              fk <*.replay_fN.npz> --source <ep>   体检回放
+  diag        一键体检 episode（末端/关节/时间轴/物体/相机）
+  fk-diag     体检回放（回放 vs 编排，mm 级 + 方向）
+  shots       相机联络图：把会话的相机帧拼成一张图，人工检查 RGB
               shots <session> [--segment] [--camera head] [--cols 8 --rows 6]
 
-回放自检（需要 Isaac python，preview 的 --drive ee 还需要运控在跑）:
-  preview     回放 episode 验证采集是否忠实
-              --drive joints  逐帧驱关节（默认，不需 ROS）
-              --drive ee      末端位姿发 /left_target,/right_target，OCS2 闭环
+回放自检（需要 Isaac python）:
+  live        在同一 Isaac 实例里回放 episode
+              --drive joints|ee  --joint-src cmd|actual  --wait
+  preview     层2 离线预览（弹窗口）
+  live-status / live-stop / live-pause / live-resume
 
 配置与离线渲染（需要 Isaac python）:
   list        列出可用的机器人/任务
@@ -61,20 +72,22 @@ usage() {
   record      层2 录制
   render      层2 离线渲染（由 episode npz 出图）
 
+配置隔离:
+  所有机器人与任务信息都在 configs/<robot>/ 下，本脚本不含任何具体机器人名。
+    新增机器人 → 新建 configs/<robot>/robot.yaml + tasks/<task>.yaml，不改代码
+
 示例:
-  # 1) 启动仿真（另一个终端）
-  cd ~/FaSim-Isaac && ./run.sh
+  # 交互式（最常用）
+  ./scripts/sdg.sh
 
-  # 2) 开始采集（可只采关节/末端，不采相机）
-  ./scripts/sdg.sh capture
-  ./scripts/sdg.sh capture --what joint,ee --out ~/fasim_data/calib
+  # 参数化采集（脚本/CI）
+  ./scripts/sdg.sh capture --robot <robot_key> --task <task_key> \
+      --what camera,joint,ee,object --camera all --every 10 --out ~/fasim_data/run_01
 
-  # 3) 跑编排（另一个终端），然后结束
-  ./scripts/sdg.sh stop
-
-  # 4) 转成 episode 并回放自检
-  ./scripts/sdg.sh pack ~/fasim_data/.../20261110-1121
-  ./scripts/sdg.sh preview ~/fasim_data/.../20261110-1121/episode.npz --gui
+  # 转格式 + 体检 + 拼图
+  ./scripts/sdg.sh pack ~/fasim_data/run_01 --robot <robot_key>
+  ./scripts/sdg.sh diag ~/fasim_data/run_01/episode.npz
+  ./scripts/sdg.sh shots ~/fasim_data/run_01 --segment
 EOF
 }
 
@@ -129,6 +142,11 @@ case "$CMD" in
         PY="$(pick_python)" || die "找不到带 numpy 的 python3（设 SDG_PYTHON）"
         exec "$PY" "${SCRIPT_DIR}/camera_shots.py" "$@"
         ;;
+    menu)
+        PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
+        export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+        exec "$PY" "${SCRIPT_DIR}/sdg_menu.py" "$@"
+        ;;
     capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -139,7 +157,11 @@ case "$CMD" in
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$ISAAC_PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"
         ;;
-    ""|-h|--help|help)
+    "")
+        # 无参数 = 交互式主菜单（推荐日常使用）
+        exec "$0" menu
+        ;;
+    -h|--help|help)
         usage; exit 0
         ;;
     *)

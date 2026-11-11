@@ -49,8 +49,8 @@ def _log(msg: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="交互式回放（带视窗）")
     ap.add_argument("--episode", required=True)
-    ap.add_argument("--robot", default="unitree_g1d")
-    ap.add_argument("--task", default="sinopec_test_tube")
+    ap.add_argument("--robot", default="", help="机器人 key（留空=自动选唯一配置）")
+    ap.add_argument("--task", default="", help="任务 key（留空=自动选唯一配置）")
     ap.add_argument("--out", default="/tmp/replay_gui")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=0, help="0 = 到末尾")

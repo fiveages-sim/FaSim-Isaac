@@ -150,7 +150,7 @@ def _resolve_views(robot_cfg) -> tuple[Any, dict, dict]:
 
 def play_episode(
     episode_path: str | Path,
-    robot_key: str = "unitree_g1d",
+    robot_key: str = "",
     drive: str = "joints",
     speed: float = 1.0,
     start: int = 0,
@@ -164,7 +164,7 @@ def play_episode(
     waist_gain: str = "usd",
     joint_api: str = "target",
     reset_objects: bool = True,
-    task_key: str = "sinopec_test_tube",
+    task_key: str = "",
     joint_src: str = "cmd",
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
@@ -223,7 +223,16 @@ def play_episode(
             "error": f"空区间 start={n_start} end={n_end}（episode 共 {n_total} 帧）",
         }
 
-    robot = load_robot_config(robot_key)
+    if not str(robot_key or "").strip():
+        return {
+            "ok": False,
+            "error": "缺少 robot_key —— 回放要知道用哪个机器人的配置"
+                     "（configs/<robot>/robot.yaml）",
+        }
+    try:
+        robot = load_robot_config(robot_key)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"读机器人配置失败（{robot_key}）: {exc}"}
     if not st.GetPrimAtPath(robot.articulation_prim):
         return {
             "ok": False,
@@ -1151,8 +1160,11 @@ def _reset_objects(ctx: dict) -> int:
     from .config_io import load_task_config
 
     episode = ctx["episode"]
-    robot_key = ctx.get("robot_key", "unitree_g1d")
-    task_key = ctx.get("task_key", "sinopec_test_tube")
+    robot_key = ctx.get("robot_key", "")
+    task_key = ctx.get("task_key", "")
+    if not task_key:
+        _log("WARN 没有 task_key，跳过物体复位（无法查 tracked_prims）")
+        return 0
     try:
         task = load_task_config(robot_key, task_key)
         prim_map = dict(getattr(task, "tracked_prims", None) or {})
