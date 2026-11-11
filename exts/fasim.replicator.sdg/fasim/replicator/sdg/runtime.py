@@ -157,6 +157,8 @@ def list_sessions(
             "duration": float(meta.get("duration_sec", 0) or 0),
             "cameras": [c.get("name") for c in (meta.get("cameras") or [])],
             "has_episode": ep.is_file(),
+            # capturing = 采集未正常结束（Isaac 崩溃 / 忘了 stop）
+            "incomplete": str(meta.get("status") or "") == "capturing",
             "mtime": sj.stat().st_mtime,
         })
 

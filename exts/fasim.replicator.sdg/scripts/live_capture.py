@@ -750,6 +750,11 @@ def arm_capture(
             if idx % 20 == 0:
                 _log(f"frame {idx} step {_S['step']} "
                      f"({_S['saved']} 帧已存, {_S['skipped']} 步跳过)")
+                # 刷新 session.json 的进度 —— 崩溃后能看出采到第几帧
+                try:
+                    _S["_flush_progress"]()
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as exc:  # noqa: BLE001
             # 回调里绝不能抛异常，否则会打断物理步进 / 控制循环。
             # 但也不能静默 —— 首次失败必须把完整 traceback 打到 stdout，
@@ -767,10 +772,63 @@ def arm_capture(
     sub = omni.physx.get_physx_interface().subscribe_physics_step_events(_on_physics_step)
     _S["sub"] = sub
 
+    # **立即写一份 session.json**，而不是只在 stop 时写。
+    #
+    # 为什么：Isaac 随时可能崩（实测采集中崩过一次，留下 0 帧的空目录）。
+    # 若元信息只在 stop 时落盘，崩溃后 frames/ 里已有几百帧数据，但 pack
+    # 拿不到 physics_dt/every，只能退回假设 5ms —— 时间轴可能错，数据价值
+    # 大打折扣。先写一份「进行中」的快照，stop 时再覆盖成完整版。
+    try:
+        (out / "session.json").write_text(
+            json.dumps({
+                "out": str(out),
+                "robot_key": str(robot_key),
+                "task_key": str(task_key),
+                "status": "capturing",       # stop 时改为 written
+                "physics_dt": physics_dt,
+                "every": max(1, int(every)),
+                "cameras": [
+                    {"name": c["name"], "prim": c["prim"], "size": c["size"]}
+                    for c in cams
+                ],
+                "what": what,
+                "ee_offsets": {
+                    s: [round(float(x), 6) for x in v]
+                    for s, v in ee_offsets.items()
+                },
+                "code_stamp": _code_stamp(),
+                "note": "采集进行中的快照；正常 stop 会覆盖为完整版。"
+                        "若看到 status=capturing 且帧数固定不变，说明采集中断（可能 Isaac 崩溃）。",
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 写初始 session.json 失败（崩溃后将缺少元信息）: {exc}")
+
+    # 周期性刷新帧数 —— 崩溃后能看出采到第几帧、大概多久
+    def _flush_progress() -> None:
+        try:
+            sj = out / "session.json"
+            cur = json.loads(sj.read_text(encoding="utf-8"))
+            if cur.get("status") != "capturing":
+                return
+            cur["frames_saved"] = _S["saved"]
+            cur["physics_steps"] = _S["step"]
+            cur["duration_sec"] = (
+                time.monotonic() - _S["t0"] if _S["t0"] is not None else 0.0
+            )
+            sj.write_text(json.dumps(cur, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+
+    _S["_flush_progress"] = _flush_progress
+
     _log("=" * 60)
     _log(f"已挂载 —— 输出 {out}")
     _log(f"相机: {[c['name'] for c in _S['cameras']]}  每 {_S['every']} 个物理步采 1 帧")
-    _log("现在去终端跑 motion-generation；结束后回来执行 stop_capture()")
+    _log("下一步: 运行【轨迹生成 / 任务编排工具】让机器人跑一遍任务")
+    _log("跑完: 回到本终端执行 ./scripts/sdg.sh stop（或菜单里选「结束采集」）")
     _log("=" * 60)
     return {"out": str(out), "cameras": [c["name"] for c in _S["cameras"]], "every": _S["every"]}
 
@@ -825,6 +883,8 @@ def stop_capture() -> dict:
         "ee_health": _S.get("ee_health", {}),
         "camera_health": _S.get("cam_health", {}),
         "joint_cmd_recorded": bool(_S.get("joint_cmd_ok", False)),
+        # 正常结束时改为 written；看到 capturing 说明是采集被中断（崩溃）
+        "status": "written",
     }
     try:
         (out / "session.json").write_text(

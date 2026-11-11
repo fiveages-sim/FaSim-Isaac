@@ -225,6 +225,8 @@ def pick_session(
         bits.append("有episode" if s["has_episode"] else "未pack")
         if s["cameras"]:
             bits.append(f"{len(s['cameras'])}相机")
+        if s.get("incomplete"):
+            bits.append(_c("⚠中断", YELLOW))
         bits.append(_fmt_age(s["mtime"]))
         return "  ".join(bits)
 
@@ -569,11 +571,65 @@ FUNCS = [
 ]
 
 
+def check_env() -> dict:
+    """检查 Isaac / socket 状态，供主菜单顶部提示。
+
+    崩溃是常态（实测采集中崩过），菜单不该假装一切正常 —— 启动时就说清
+    现在是什么状态，比等用户点了采集才报错好。
+    """
+    import socket as _sock
+
+    info: dict = {"isaac": False, "socket": False, "pids": []}
+    try:
+        import subprocess
+
+        r = subprocess.run(["pgrep", "-f", "isaacsim/kit|isaac-sim.sh"],
+                           capture_output=True, text=True, timeout=5)
+        pids = [int(x) for x in r.stdout.split() if x.isdigit()]
+        info["pids"] = pids
+        info["isaac"] = bool(pids)
+    except Exception:  # noqa: BLE001
+        pass
+    sp = runtime.socket_path()
+    if sp.exists():
+        s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+        s.settimeout(1.0)
+        try:
+            s.connect(str(sp))
+            info["socket"] = True
+        except Exception:  # noqa: BLE001
+            info["socket"] = False
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return info
+
+
+def print_env_banner() -> dict:
+    """打印环境状态条。返回 check_env() 结果，供主菜单决定是否提示。"""
+    st = check_env()
+    if st["isaac"] and st["socket"]:
+        print(f"{DIM}  环境: Isaac 运行中（pid {st['pids'][0]}），采集扩展就绪{NC}")
+    elif st["isaac"] and not st["socket"]:
+        print(f"{YELLOW}  环境: Isaac 在跑但扩展未就绪"
+              f"（等几秒；或查 Isaac 终端 [sdg] 日志）{NC}")
+    elif not st["isaac"] and st["socket"]:
+        print(f"{RED}  环境: Isaac 未运行，但残留了 socket 文件 —— "
+              f"仿真可能崩溃过{NC}")
+        print(f"{DIM}        重启 ./run.sh 即可；残留文件会被自动覆盖{NC}")
+    else:
+        print(f"{DIM}  环境: Isaac 未运行（采集/回放前先 cd ~/FaSim-Isaac && ./run.sh）{NC}")
+    return st
+
+
 def main() -> int:
     state = load_state()
     print(_c("\n" + "=" * 62, CYAN))
     print(_c("  FaSim 合成数据采集 (sdg)", BOLD))
     print(_c("=" * 62, CYAN))
+    env = print_env_banner()
 
     robot = state.get("robot")
     task = state.get("task")
@@ -608,10 +664,16 @@ def main() -> int:
             show_context(robot, task)
             continue
         if choice == "status":
-            run([str(SDG_SH), "status"])
+            r = run([str(SDG_SH), "status"])
+            if r != 0:
+                print(f"{YELLOW}  （Isaac 可能未运行或已崩溃；"
+                      f"选 6 自检可看详细状态）{NC}")
             continue
         if choice == "stop":
-            run([str(SDG_SH), "stop"])
+            r = run([str(SDG_SH), "stop"])
+            if r != 0:
+                print(f"{YELLOW}  （连不上 Isaac —— 若它已崩，数据仍在 frames/ 里，"
+                      f"可以直接 pack 抢救）{NC}")
             continue
         fn = next((f for k, _l, f in FUNCS if k == choice), None)
         if fn is None:

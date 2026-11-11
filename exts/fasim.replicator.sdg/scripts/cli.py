@@ -119,18 +119,72 @@ def _pick(title: str, options: list[tuple[str, str]], default: int = 1) -> str:
         _log(f"无效选择 {ans!r}")
 
 
+def _isaac_pids() -> list[int]:
+    """找出正在跑的 Isaac Sim 进程（Kit 主进程）。
+
+    用于在 socket 连不上时区分两种完全不同的情况::
+
+        Isaac 活着但扩展没加载  → 等几秒 / 看 [sdg] 日志
+        Isaac 已经崩了（残留 socket 文件）→ 重启仿真
+
+    没有这一步时，两种都会报 "连接失败: [Errno 111]"，用户难以判断。
+    """
+    pids: list[int] = []
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["pgrep", "-f", "isaacsim/kit|isaac-sim.sh"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    except Exception:  # noqa: BLE001
+        pass
+    return pids
+
+
+def _stale_socket_hint(path: Path) -> str:
+    """socket 连不上时给出可操作的说明（附带自动清理建议）。"""
+    pids = _isaac_pids()
+    if not pids:
+        return (
+            f"socket 残留但 Isaac 已不在运行（{path}）\n"
+            "        → 仿真可能崩溃了。重新 ./run.sh 启动即可；\n"
+            "          残留的 socket 会被下次启动自动覆盖，也可以手动删：\n"
+            f"          rm -f {path}"
+        )
+    return (
+        f"socket 存在但连不上（Isaac 进程在跑，pid={pids[:3]}）\n"
+        "        → 扩展可能还没加载完（等几秒重试），或加载失败。\n"
+        "          查 Isaac 终端里有没有 [sdg] 开头的日志。"
+    )
+
+
 def _request(payload: dict, timeout: float = 30.0) -> dict:
-    """向扩展发一条指令，返回它的 JSON 响应。"""
+    """向扩展发一条指令，返回它的 JSON 响应。
+
+    对 Isaac 崩溃/卡死做了区分：socket 连不上时会探测 Isaac 进程是否还在，
+    给出「重启仿真」还是「等扩展加载」的明确指引 —— 两者原来都只是
+    ``Errno 111``，用户无法判断。
+    """
     path = runtime.socket_path()
     if not path.exists():
-        return {
-            "ok": False,
-            "error": (
+        pids = _isaac_pids()
+        if pids:
+            err = (
                 f"socket 不存在: {path}\n"
-                "        仿真启动了吗？扩展会随 Isaac 自动加载。\n"
-                "        若刚启动，等几秒；仍不行就查 Isaac 终端有没有 [sdg] 开头的日志。"
-            ),
-        }
+                f"        Isaac 在跑（pid={pids[:3]}）但扩展还没就绪 —— 等几秒重试；\n"
+                "        仍不行就查 Isaac 终端有没有 [sdg] 开头的日志。"
+            )
+        else:
+            err = (
+                "Isaac 没有在运行，也没有可用的采集扩展。\n"
+                "        先启动仿真：cd ~/FaSim-Isaac && ./run.sh"
+            )
+        return {"ok": False, "error": err, "kind": "no_socket"}
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -143,12 +197,25 @@ def _request(payload: dict, timeout: float = 30.0) -> dict:
                 break
             buf += chunk
         if not buf.strip():
-            return {"ok": False, "error": "扩展没有返回（采集可能崩了，看 Isaac 终端）"}
+            return {
+                "ok": False,
+                "kind": "empty_reply",
+                "error": "扩展没有返回（采集/仿真可能崩了，看 Isaac 终端）",
+            }
         return json.loads(buf.split(b"\n", 1)[0].decode("utf-8", "replace"))
     except socket.timeout:
-        return {"ok": False, "error": "扩展响应超时（Isaac 可能卡住或未响应）"}
+        return {
+            "ok": False,
+            "kind": "timeout",
+            "error": "扩展响应超时（Isaac 可能卡住/主循环被阻塞）。\n"
+                     "        若长时间无响应，看 Isaac 终端是否已崩溃，必要时重启。",
+        }
     except OSError as exc:
-        return {"ok": False, "error": f"连接失败: {exc}"}
+        return {
+            "ok": False,
+            "kind": "refused",
+            "error": f"连接失败: {exc}\n        " + _stale_socket_hint(path),
+        }
     finally:
         try:
             s.close()
@@ -308,8 +375,36 @@ def cmd_capture(args: argparse.Namespace) -> int:
         return 1
     _log(f"已开始采集 → {resp['out']}")
     _log(f"  相机 {resp['cameras']}  every={resp['every']}")
-    _log("现在去跑 motion-generation；结束后执行 ./scripts/sdg.sh stop")
+    _print_next_step(resp.get("out", ""))
     return 0
+
+
+def _print_next_step(out: str) -> None:
+    """采集启动后的醒目提示。
+
+    为什么单独抽出来：这一屏是用户**唯一**会盯着看的地方，但原来只是一行
+    ``[sdg] 现在去跑 motion-generation`` —— 混在前面几行日志里，第一次用的
+    人容易以为"没反应"。所以：
+
+    - 加大分隔线 + 序号，形成明确的"下一步"区块
+    - 不绑定具体工具名（motion-generation 只是当前实现，可能是别的编排器）
+    - 给出结束采集的做法，避免忘记 stop 导致一直采
+    """
+    bar = "=" * 62
+    print()
+    print(bar)
+    print("  ✅  采集已启动，正在后台记录")
+    print()
+    print("  ▶  下一步：去运行你的【轨迹生成 / 任务编排工具】")
+    print("     （让机器人把任务跑一遍，采集中会自动记录）")
+    print()
+    print("  ■  跑完回来：执行 ./scripts/sdg.sh stop")
+    print("     （或在本交互菜单里选「结束采集」）")
+    if out:
+        print()
+        print(f"     数据正在写入: {out}")
+    print(bar)
+    print()
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1036,6 +1131,17 @@ def cmd_live(args: argparse.Namespace) -> int:
                 time.sleep(0.5)
                 st = _request({"cmd": "live_status"}, timeout=5)
                 if not st.get("ok"):
+                    kind = st.get("kind", "")
+                    if kind in ("refused", "no_socket", "empty_reply", "timeout"):
+                        _log("")
+                        _log("!" * 62)
+                        _log("回放中断：与 Isaac 的连接已断开")
+                        _log(f"  {st.get('error', '')}")
+                        _log("  回放没有正常结束。检查 Isaac 是否崩溃；"
+                             "已写入磁盘的关节记录仍可用。")
+                        _log("!" * 62)
+                    else:
+                        _log(f"WARN 回放状态查询失败: {st.get('error')}")
                     break
                 if not st.get("playing"):
                     lr = st.get("last_result") or {}
@@ -1105,20 +1211,62 @@ def cmd_live_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(_args: argparse.Namespace) -> int:
-    """自检：路径、socket、扩展是否就绪。"""
+    """自检：路径、socket、扩展、崩溃残留。"""
     print("=== SDG 数采环境自检 ===")
     print(f"扩展根目录 : {runtime.ext_home()}")
     print(f"  存在      : {(runtime.ext_home() / 'config' / 'extension.toml').is_file()}")
     print(f"数据根目录 : {runtime.data_root()}")
+
+    pids = _isaac_pids()
+    print(f"Isaac 进程 : {pids or '未运行'}")
+
     print(f"运行时目录 : {runtime.runtime_dir()}")
     sock = runtime.socket_path()
     print(f"指令 socket: {sock}")
     print(f"  存在      : {sock.exists()}")
     if sock.exists():
         resp = _request({"cmd": "status"}, timeout=5)
-        print(f"  响应      : {resp}")
+        if resp.get("ok"):
+            print(f"  响应      : {resp}")
+        else:
+            print(f"  异常: {resp.get('error')}")
+    elif pids:
+        print("  → Isaac 在跑但扩展未就绪：等几秒；或查 Isaac 终端 [sdg] 日志")
     else:
-        print("  → 仿真没启动，或扩展没加载（跑 ./init.sh 选 isaac_local 安装扩展）")
+        print("  → 仿真没启动（cd ~/FaSim-Isaac && ./run.sh）")
+
+    # --- 崩溃残留检查 ---
+    print("-" * 40)
+    print("崩溃残留检查")
+    stale = sock.exists() and not pids
+    if stale:
+        print(f"  ⚠ socket 残留但 Isaac 未运行 —— 上次可能崩溃了")
+        print(f"    rm -f {sock}   （重启仿真也会自动覆盖）")
+    broken = [s for s in runtime.list_sessions(limit=200) if s.get("incomplete")]
+    # 空会话目录：有 frames/ 但一帧都没有（采集中断在开头）。这类目录没有
+    # session.json 老版本根本发现不了，所以单独扫 frames/。
+    empty: list[Path] = []
+    root = runtime.data_root()
+    if root.is_dir():
+        try:
+            for fd in root.rglob("frames"):
+                if any(p.startswith(".") for p in fd.relative_to(root).parts):
+                    continue
+                if not any(fd.glob("frame_*.npz")):
+                    empty.append(fd.parent)
+        except Exception:  # noqa: BLE001
+            pass
+    if broken:
+        print(f"  ⚠ 有 {len(broken)} 个会话采集未正常结束（status=capturing）:")
+        for s in broken[:5]:
+            print(f"      {s['name']}  {s['frames']} 帧 —— 可直接 pack 抢救")
+    if empty:
+        print(f"  ⚠ 有 {len(empty)} 个空会话目录（0 帧，可删）:")
+        for p in empty[:5]:
+            print(f"      {p}")
+        print(f"      删除: rm -rf {' '.join(str(p) for p in empty[:5])}")
+    if not (stale or broken or empty):
+        print("  ✅ 无异常")
     print("=" * 30)
     return 0
 

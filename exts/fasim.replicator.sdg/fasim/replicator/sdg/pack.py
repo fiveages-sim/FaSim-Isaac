@@ -41,7 +41,13 @@ def _log(msg: str) -> None:
 
 
 def load_session(session_dir: str | Path) -> tuple[list[dict], dict, Path]:
-    """读一个采集会话目录 → (帧元数据列表, session.json, 目录)。"""
+    """读一个采集会话目录 → (帧元数据列表, session.json, 目录)。
+
+    对**采集中断**（Isaac 崩溃）的情况做兼容：
+    - session.json 可能缺失（老版本只在 stop 时写）→ 用帧内容反推
+    - status 可能仍是 ``capturing`` → 提示这是不完整会话，但**照样处理**
+      （已经落盘的帧是有价值的，不该因为没 stop 就丢掉）
+    """
     d = Path(session_dir).expanduser().resolve()
     if not d.is_dir():
         raise FileNotFoundError(d)
@@ -59,8 +65,65 @@ def load_session(session_dir: str | Path) -> tuple[list[dict], dict, Path]:
 
     files = sorted(frames_dir.glob("frame_*.npz"))
     if not files:
-        raise ValueError(f"没有帧文件: {frames_dir}")
+        raise ValueError(
+            f"没有帧文件: {frames_dir}\n"
+            "  可能采集刚启动就中断了（Isaac 崩溃 / timeline 未播放）。"
+        )
+
+    if not meta:
+        _log("WARN 没有 session.json（采集中断？）—— 从帧内容反推元信息")
+        meta = _infer_meta_from_frames(files)
+    else:
+        status = str(meta.get("status") or "")
+        if status == "capturing":
+            n_saved = int(meta.get("frames_saved", 0) or 0)
+            _log("=" * 56)
+            _log(f"⚠ 该会话 status=capturing —— 采集未正常结束")
+            _log(f"  最后记录: {n_saved} 帧 / {meta.get('physics_steps', 0)} 物理步"
+                 f" / {meta.get('duration_sec', 0):.1f}s")
+            _log(f"  磁盘实际: {len(files)} 帧")
+            _log("  （Isaac 崩溃或未执行 stop；已落盘的数据仍然可用）")
+            _log("=" * 56)
+
     return [{"path": f} for f in files], meta, d
+
+
+def _infer_meta_from_frames(files: list[Path]) -> dict:
+    """从帧文件反推元信息 —— session.json 缺失时的兜底。
+
+    能可靠拿到的：physics_dt（若帧里存了 sim_step 与 wall_time 且知道 every）。
+    拿不到 every 时用相邻帧 sim_step 差值（那就是 every 本身）。
+    """
+    import numpy as np
+
+    meta: dict = {"status": "inferred", "note": "由帧内容反推"}
+    try:
+        with np.load(files[0], allow_pickle=False) as z:
+            keys = set(z.files)
+            if "joint_names" in keys:
+                meta["joints"] = int(np.asarray(z["joint_names"]).size)
+            cams = sorted({k[:-4] for k in keys if k.endswith("_rgb")})
+            meta["cameras"] = [{"name": c} for c in cams]
+        # every = 相邻帧 sim_step 差值
+        steps: list[int] = []
+        for f in files[: min(50, len(files))]:
+            try:
+                with np.load(f, allow_pickle=False) as z:
+                    if "sim_step" in z.files:
+                        steps.append(int(z["sim_step"]))
+            except Exception:  # noqa: BLE001
+                pass
+        if len(steps) >= 2:
+            d = np.diff(np.asarray(steps))
+            d = d[d > 0]
+            if d.size:
+                meta["every"] = int(np.median(d))
+        # physics_dt 拿不到就留空，pack 会退回默认 5ms 并告警
+        meta.setdefault("physics_dt", 0.0)
+        meta["frames_saved"] = len(files)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 反推元信息部分失败: {exc}")
+    return meta
 
 
 def pack_episode(
