@@ -226,18 +226,55 @@ def pack_episode(
         elif (k.endswith("_pos_xform") or k.endswith("_quat_xform")) and len(v) == n:
             payload[k] = np.stack(v).astype(np.float64)
 
-    # 末端**指令**位姿：暂不计算。
+    # 末端**指令**位姿 —— EE 回放用（见 fk.compute_cmd_poses 的说明）。
     #
-    # 为什么不在这里用 FK 反算（虽然可行）：
-    #   1) 会让 pack 依赖运动学解算（项目原则：不引入外部工具）
-    #   2) 目前还在验证 EE 回放能不能直接发**真值**给运控 —— 运控是闭环、
-    #      两端 frame 都是 world，理论上它能自己收敛过去，误差不会被放大两次
-    #      （这一点和关节回放不同：关节是直接 drive 位置，运控闭环有反馈）。
+    # 为什么必须有：``left_pos``/``right_pos`` 是**实测**（含运控没跟到位的
+    # 那部分）。EE 回放若直接把它当目标发出去，运控执行一次又掉同样的量：
+    #     编排:   目标 → 运控 → 实测 = 目标 − 8.7mm     ✅
+    #     EE回放: 实测 → 运控 → 实测 − 8.7mm           ❌ 又低一次
+    # 实测 act01：指令比实测高 mean 8.7mm / max 34.7mm，平均 dz=+8.4mm
+    # —— 正是"右手抓试管偏下"的量化来源。
     #
-    # 若实测发现 EE 回放偏下，再回来在这里补 <side>_cmd_pos。
-    # 相关讨论见 fk.compute_cmd_poses 的文档。
+    # 采集端拿不到运控 MPC 内部的指令位姿，但 ``joint_pos_cmd``（下发目标
+    # 关节角）是准的（Isaac 直读 drive，不经同步管道）。所以用 FK 反算 ——
+    # 用的是 OCS2 实际加载的 planning URDF，与 eeFrame 同源。
     if joint_pos_cmd is not None:
-        _log("  末端指令位姿: 未计算（EE 回放先发真值试效果）")
+        try:
+            from .fk import TcpFK
+
+            fk = TcpFK()
+            names = joint_names or [f"j{i}" for i in range(joint_pos.shape[1])]
+            rest: dict[str, np.ndarray] = {}
+            restq: dict[str, np.ndarray] = {}
+            for side in fk.ee_frames:
+                pv = payload.get(f"{side}_pos")
+                qv = payload.get(f"{side}_quat")
+                if pv is not None and np.isfinite(np.asarray(pv)).any():
+                    rest[side] = np.asarray(pv)[0]
+                    if qv is not None:
+                        restq[side] = np.asarray(qv)[0]
+            if rest:
+                fk.solve_base_from_rest(rest, restq or None)
+            cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
+            for side, (pos, quat) in cmd_poses.items():
+                payload[f"{side}_cmd_pos"] = pos
+                payload[f"{side}_cmd_quat"] = quat
+            _log("  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算并写入"
+                 "（EE 回放用这个，不会多偏一次）")
+            for side in fk.ee_frames:
+                pv = payload.get(f"{side}_pos")
+                if pv is None:
+                    continue
+                cmd_err = np.linalg.norm(
+                    np.asarray(pv) - payload[f"{side}_cmd_pos"], axis=1
+                ) * 1000
+                if np.isfinite(cmd_err).any():
+                    dv = (payload[f"{side}_cmd_pos"] - np.asarray(pv))
+                    _log(f"    {side}: 实测比指令低 mean={np.nanmean(cmd_err):.1f}mm "
+                         f"max={np.nanmax(cmd_err):.1f}mm "
+                         f"dz={np.nanmean(dv[:, 2])*1000:+.1f}mm（物理稳态误差）")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  WARN 反算末端指令位姿失败（EE 回放会偏下）: {exc}")
 
     # 下发目标关节角 —— 回放用它。
     if joint_pos_cmd is not None:

@@ -267,28 +267,58 @@ def play_episode(
                 "error": "episode 没有末端位姿（left_pos/right_pos 含 NaN）。"
                          "采集要选 ee：sdg.sh capture --what joint,ee",
             }
-        # 目标位姿 = **实测真值**（left_pos/right_pos）。
+        # 目标位姿优先用**指令位姿**（*_cmd_pos），不是实测。
         #
-        # 为什么这里可以直接发真值（和关节回放不同）：
-        # 关节回放是往 drive 写位置目标 —— 物理跟不到位就少走一段，没有任何
-        # 东西来纠正，所以「目标已经含误差」会导致误差叠加两次。
+        # 实测位姿含运控没跟到位的量（act01 实测 mean 8.7mm / max 34.7mm，
+        # 平均低 8.4mm）。直接发实测 = 让运控再偏一次，就是"抓试管偏下"。
+        # 编排能成功是因为它发的是自己的指令目标。
         #
-        # 而 EE 回放是发给 OCS2 的**闭环**控制器：它拿 world 系目标做
-        # IK/MPC，跟踪不上会持续纠偏，不会把误差当新目标再偏一次。
-        # 两端 frame 都是 world，语义直接对齐。
-        #
-        # 先这样试 —— 若实测仍然稳定偏下，再改用「指令位姿」为目标
-        # （需从 joint_pos_cmd 做正解，见 fk.compute_cmd_poses）。
-        ee_pos = {
-            "left": np.asarray(episode.left_pos, dtype=np.float64),
-            "right": np.asarray(episode.right_pos, dtype=np.float64),
-        }
-        ee_quat = {
-            "left": np.asarray(episode.left_quat, dtype=np.float64),
-            "right": np.asarray(episode.right_quat, dtype=np.float64),
-        }
-        _log("末端目标来源: episode 实测真值（left_pos/right_pos，world 系）")
-        _log("  运控是闭环，会把误差纠回来；先这样试效果")
+        # 来源优先级：
+        #   1) episode 的 *_cmd_pos（pack 已用 FK 从 joint_pos_cmd 反算好）
+        #   2) 现场 FK 反算（老数据没有 *_cmd_pos 时）
+        #   3) 实测（最后兜底，会明显偏下）
+        ee_pos: dict[str, np.ndarray] = {}
+        ee_quat: dict[str, np.ndarray] = {}
+        for side in ("left", "right"):
+            cp = getattr(episode, f"{side}_cmd_pos", None)
+            cq = getattr(episode, f"{side}_cmd_quat", None)
+            if cp is not None and cq is not None and np.isfinite(np.asarray(cp)).all():
+                ee_pos[side] = np.asarray(cp, dtype=np.float64)
+                ee_quat[side] = np.asarray(cq, dtype=np.float64)
+                src = "episode *_cmd_pos（指令位姿）"
+            else:
+                ee_pos[side] = np.asarray(getattr(episode, f"{side}_pos"), dtype=np.float64)
+                ee_quat[side] = np.asarray(getattr(episode, f"{side}_quat"), dtype=np.float64)
+                src = "实测位姿（会偏下！重新 pack 可获得指令位姿）"
+            _log(f"  末端 {side} 目标: {src}")
+        if any(
+            getattr(episode, f"{s}_cmd_pos", None) is None for s in ("left", "right")
+        ):
+            # 老数据兜底：现场算
+            try:
+                from .fk import TcpFK
+
+                jpc = getattr(episode, "joint_pos_cmd", None)
+                if jpc is not None:
+                    fk = TcpFK()
+                    rest = {
+                        s: np.asarray(getattr(episode, f"{s}_pos"))[0]
+                        for s in fk.ee_frames
+                    }
+                    restq = {
+                        s: np.asarray(getattr(episode, f"{s}_quat"))[0]
+                        for s in fk.ee_frames
+                    }
+                    fk.solve_base_from_rest(rest, restq)
+                    got = fk.tcp_poses(np.asarray(jpc), episode.joint_names, to_world=True)
+                    for s, (p, q) in got.items():
+                        ee_pos[s], ee_quat[s] = p, q
+                    _log("  已现场用 FK 反算指令位姿（覆盖实测目标）")
+                else:
+                    _log("WARN episode 没有 joint_pos_cmd —— 无法反算指令位姿，"
+                         "EE 回放会明显偏下")
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN 现场反算指令位姿失败: {exc}")
 
         try:
             import rclpy
@@ -298,6 +328,32 @@ def play_episode(
         if not rclpy.ok():
             rclpy.init()
         node = rclpy.create_node("sdg_live_ee")
+
+        # 夹爪：EE 模式下**不能**直接 drive 夹爪关节（那是运控的活），
+        # 要发夹爪命令话题，和编排一致。
+        grip_pubs: dict[str, Any] = {}
+        grip_specs: list[dict] = []
+        grip_msg_cls = None
+        try:
+            from std_msgs.msg import Float64
+
+            grip_msg_cls = Float64
+            grip_specs = _build_ee_gripper_specs(episode)
+            for side in ("left", "right"):
+                grip_pubs[side] = node.create_publisher(
+                    Float64, f"/{side}_gripper_controller/target_percent", 1
+                )
+            if grip_specs:
+                sides = [g["side"] for g in grip_specs]
+                _log(f"夹爪命令 → target_percent（{sides}）")
+                for g in grip_specs:
+                    _log(f"  {g['side']}: 开合 {g['open']} 次切换，"
+                         f"帧 {g['frames'][:6]}{'…' if len(g['frames']) > 6 else ''}")
+            else:
+                _log("WARN episode 里没有夹爪关节列，夹爪不会动")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 夹爪命令不可用: {exc}")
+
         ctx.update(
             node=node,
             rclpy=rclpy,
@@ -307,8 +363,15 @@ def play_episode(
             last_emit=0.0,
             ee_pos=ee_pos,
             ee_quat=ee_quat,
+            grip_pubs=grip_pubs,
+            grip_specs=grip_specs,
+            grip_msg_cls=grip_msg_cls,
+            grip_sent={},
         )
         _log(f"末端驱动 → {left_topic} / {right_topic}，{1/(frame_dt/speed):.1f} Hz")
+
+        # 锁底盘 + 确保 FSM 在 OCS2 —— 与编排对齐，否则运控会挪底盘。
+        _prepare_ee_session(ctx)
     else:
         from isaacsim.core.experimental.prims import Articulation
 
@@ -908,6 +971,20 @@ def _on_update(_event) -> None:
     n_end = ctx["n_end"]
     episode = ctx["episode"]
 
+    # 诊断：EE 回放靠"发目标 + 等运控追"，一旦 timeline 不走就会把上千帧
+    # 在一个 update 里全发完（症状：秒结束、机器人不动）。首次和前几帧
+    # 把真实时间打出来，避免再靠猜。
+    cds = ctx.setdefault("_diag_n", 0)
+    if cds < 5:
+        ctx["_diag_n"] = cds + 1
+        _log(f"[时序] frame={i} tl_now={now:.4f}s base={ctx['t_base']:.4f}s "
+             f"elapsed={elapsed*1000:.1f}ms want={want*1000:.1f}ms "
+             f"advance={advance}")
+    if elapsed > 60.0:
+        _log("WARN timeline 时间异常（elapsed 超过 60s）——回放中止")
+        _finish()
+        return
+
     try:
         if advance:
             if ctx["drive"] == "ee":
@@ -1192,11 +1269,238 @@ def _step_joints(ctx: dict, i: int) -> None:
     _apply_grip_specs(art, ctx.get("grip_specs", []), i)
 
 
+def _build_ee_gripper_specs(episode: Any) -> list[dict]:
+    """从 episode 的 ``joint_pos_cmd`` 提取夹爪命令时序（EE 回放用）。
+
+    为什么用 ``joint_pos_cmd``：那是**运控下发给夹爪的目标**，正是编排当时
+    执行的量。``joint_pos``（实测）会受夹持反力影响，不适合当命令。
+
+    Dex1 行程语义（详见 ``renderer._build_gripper_switches``）——
+    注意 ``0`` 是**闭合点**，正负两侧都是张开::
+
+        j = +0.0245 (上限) → 两指间距 49mm   ← 命令里的"开"
+        j =  0.0000        →  0mm           ← 闭合点
+        j = -0.0200 (下限) → 40mm           ← 反向张开
+
+    实测 act01 的命令只有 3 个离散值 ``{-0.02, 0, +0.0245}``，含义是：
+    ``+0.0245`` 张开 / ``0`` 闭合 / ``-0.02`` 也是张开（另一侧限位）。
+
+    这里用**原始命令值**换算 ``target_percent``，不做二值化 —— 二值化会把
+    ``-0.02`` 和 ``0`` 混成一个状态，丢失真正的闭合动作。
+
+    Returns:
+        ``[{"side", "dof_col", "frames", "percents", ...}]``
+        —— ``frames`` 是命令值变化的帧号，``percents`` 是对应百分数。
+    """
+    jn = [str(n) for n in getattr(episode, "joint_names", []) or []]
+    q = getattr(episode, "joint_pos_cmd", None)
+    if q is None:
+        q = getattr(episode, "joint_pos", None)
+    if q is None or not jn:
+        return []
+    q = np.asarray(q, dtype=np.float64)
+
+    out: list[dict] = []
+    for side in ("left", "right"):
+        col = None
+        for cand in (f"{side}_gripper_joint", f"{side}_hand_finger_joint"):
+            if cand in jn:
+                col = jn.index(cand)
+                break
+        if col is None:
+            continue
+        seq = q[:, col]
+        finite = seq[np.isfinite(seq)]
+        if not len(finite):
+            continue
+        lo, hi = float(finite.min()), float(finite.max())
+        span = hi - lo
+        if span < 1e-6:
+            continue
+
+        # 只在命令值发生可见变化时记录。用原始值换算 percent，
+        # 位置沿 [lo, hi] 线性映射到 [0, 1]（闭合点未必在端点，
+        # 但运控的 target_percent 也是按 min/max 行程线性插值的，
+        # 见 ros2_robot_interface/handler/gripper_handler.py）。
+        frames: list[int] = []
+        percents: list[float] = []
+        prev = None
+        for i, v in enumerate(seq):
+            if not np.isfinite(v):
+                continue
+            pct = float(np.clip((v - lo) / span, 0.0, 1.0))
+            if prev is None or abs(pct - prev) > 1e-3:
+                frames.append(i)
+                percents.append(round(pct, 3))
+                prev = pct
+        if not frames:
+            continue
+        out.append({
+            "side": side,
+            "dof_col": col,
+            "frames": frames,
+            "percents": percents,
+            "raw_min": lo,
+            "raw_max": hi,
+        })
+    return out
+
+
+def _grip_percent_at(spec: dict, frame: int) -> float | None:
+    """给定帧，返回该夹爪的 ``target_percent``（按最后一次变化取值）。"""
+    frames = spec.get("frames") or []
+    percents = spec.get("percents") or []
+    if not frames:
+        return None
+    val = percents[0]
+    for k, f in enumerate(frames):
+        if frame >= f:
+            val = percents[k]
+        else:
+            break
+    return float(val)
+
+
+def _prepare_ee_session(ctx: dict) -> None:
+    """EE 回放前的准备：锁底盘 + 确保 FSM 在 OCS2。
+
+    对齐编排 ``pick_tube_full.yaml`` 的第 0 步::
+
+        - skill: robot.send_mode_command
+          params:
+            commands: [BASE_LOCK]
+
+    为什么必须锁底盘：EE 回放把目标交给运控做全身控制，若不锁，WBC 会为了
+    够到目标而挪底盘 —— 末端轨迹就不再是 world 绝对系，和采集时的轨迹对不上，
+    也无法判断"到底是数据问题还是底盘漂了"。编排全程锁底盘正是这个原因。
+
+    FSM 必须处于 OCS2 才接受 EE 目标（见 Ocs2ArmController::
+    syncPoseTargetAcceptance）。转换有硬约束::
+
+        MOVEJ ──(2)──> HOLD        ← MOVEJ 只能回 HOLD
+        HOLD  ──(3)──> OCS2        ← 必须经 HOLD
+
+    所以统一走 2 → 3（若已在 OCS2，发 2 会退回 HOLD，故先查状态）。
+    状态码是**话题值**不是 C++ 枚举值：HOME=1 HOLD=2 OCS2=3 MOVEJ=4。
+    """
+    import time
+
+    rclpy = ctx.get("rclpy")
+    node = ctx.get("node")
+    if rclpy is None or node is None:
+        return
+
+    try:
+        from std_msgs.msg import Int32, String
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 无法导入 std_msgs，跳过 FSM/底盘准备: {exc}")
+        return
+
+    mode_pub = node.create_publisher(String, "/mode_command", 1)
+    fsm_pub = node.create_publisher(Int32, "/fsm_command", 1)
+    ctx["_mode_pub"] = mode_pub
+    ctx["_fsm_pub"] = fsm_pub
+
+    # --- 锁底盘 ---
+    try:
+        m = String()
+        m.data = "BASE_LOCK"
+        mode_pub.publish(m)
+        _log("已发 BASE_LOCK（与编排第 0 步一致，末端轨迹才是 world 绝对系）")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN BASE_LOCK 发送失败: {exc}")
+
+    # --- FSM 切到 OCS2 ---
+    try:
+        cur: list[int] = []
+
+        def _on_fsm(msg) -> None:
+            cur.append(int(msg.data))
+
+        sub = node.create_subscription(Int32, "/fsm_state", _on_fsm, 1)
+        # 给 DDS 一点时间拿一帧
+        for _ in range(20):
+            rclpy.spin_once(node, timeout_sec=0.05)
+            if cur:
+                break
+        state = cur[0] if cur else None
+        try:
+            node.destroy_subscription(sub)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if state == 3:
+            _log("FSM 已在 OCS2")
+        elif state is None:
+            _log("WARN 读不到 /fsm_state（zenoh 环境没 source？）——"
+                 "直接发 OCS2，若不动请手动确认状态")
+            _send_fsm(ctx, 3)
+        else:
+            name = {1: "HOME", 2: "HOLD", 3: "OCS2", 4: "MOVEJ"}.get(state, str(state))
+            _log(f"FSM={state}({name})，切到 OCS2（经 HOLD）")
+            # MOVEJ 只能回 HOLD；HOLD 才能进 OCS2
+            if state != 2:
+                _send_fsm(ctx, 2)
+                time.sleep(0.8)
+            _send_fsm(ctx, 3)
+            time.sleep(0.5)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN FSM 切换失败: {exc}")
+
+
+def _send_fsm(ctx: dict, code: int) -> None:
+    pub = ctx.get("_fsm_pub")
+    rclpy = ctx.get("rclpy")
+    node = ctx.get("node")
+    if pub is None:
+        return
+    try:
+        from std_msgs.msg import Int32
+
+        m = Int32()
+        m.data = int(code)
+        pub.publish(m)
+        if rclpy is not None and node is not None:
+            rclpy.spin_once(node, timeout_sec=0.05)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 发 fsm_command={code} 失败: {exc}")
+
+
+def _apply_ee_grippers(ctx: dict, frame: int) -> None:
+    """EE 回放时发夹爪命令（只在状态切换时发，避免每帧刷屏）。"""
+    pubs = ctx.get("grip_pubs") or {}
+    specs = ctx.get("grip_specs") or []
+    if not pubs or not specs:
+        return
+    sent = ctx.setdefault("grip_sent", {})
+    msg_cls = ctx.get("grip_msg_cls")
+    if msg_cls is None:
+        return
+    for spec in specs:
+        side = spec["side"]
+        pub = pubs.get(side)
+        if pub is None:
+            continue
+        pct = _grip_percent_at(spec, frame)
+        if pct is None:
+            continue
+        if sent.get(side) == pct:
+            continue
+        try:
+            msg = msg_cls()
+            msg.data = float(pct)
+            pub.publish(msg)
+            sent[side] = pct
+            _log(f"  夹爪 {side}: {'张开' if pct >= 0.5 else '闭合'} @frame {frame}")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 夹爪 {side} 发送失败: {exc}")
+
+
 def _step_ee(ctx: dict, i: int) -> None:
-    """发**指令位姿**给运控（不是实测位姿）。
+    """发**指令位姿**给运控 + 夹爪命令。
 
     ctx["ee_pos"] / ctx["ee_quat"] 在 play_episode 里已选好来源：
-    episode 的 *_cmd_pos、或由 joint_pos_cmd 经 FK 反算。
+    优先 episode 的 *_cmd_pos（指令位姿），其次 FK 反算，最后才是实测。
     """
     mk = ctx["mk_pose"]
     pos = ctx.get("ee_pos") or {}
@@ -1207,6 +1511,7 @@ def _step_ee(ctx: dict, i: int) -> None:
         if p is None or q is None or i >= len(p):
             continue
         pub.publish(mk(p[i], q[i]))
+    _apply_ee_grippers(ctx, i)
     try:
         ctx["rclpy"].spin_once(ctx["node"], timeout_sec=0.0)
     except Exception:  # noqa: BLE001
@@ -1320,6 +1625,9 @@ def _finish() -> None:
             }
         else:
             _log(f"回放结束: 发了 {n} 帧末端位姿")
-            _STATE["last_result"] = {"frames": n, "drive": "ee"}
+            _STATE["last_result"] = {
+                "frames": n, "drive": "ee",
+                "app_dt_ms": round(float(ctx.get("app_dt", 0.0)) * 1000, 2),
+            }
 
     _STATE.update(episode=None, ctx=None, i=0)
