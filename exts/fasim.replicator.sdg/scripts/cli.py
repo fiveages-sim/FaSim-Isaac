@@ -486,19 +486,31 @@ def cmd_diag(args: argparse.Namespace) -> int:
         verdicts.append((ok, f"时间轴抖动 {jitter:.1f}ms"))
 
     # ---- 5) 末端与试管的关系（若有） ----
+    # 判据不能用绝对距离：tcp 是**法兰**，实际夹持点在指尖前方几厘米，所以
+    # 抓到试管时法兰离试管中心仍有 10-15cm 是正常的。看「接近量」更可靠 ——
+    # 手有没有真的伸过去。
     tube = "obj/test_tube_pos"
-    if tube in keys and "right_pos" in keys:
-        _log("\n[5] 右手与试管")
+    if tube in keys:
+        _log("\n[5] 末端与试管")
         tp = np.asarray(z[tube], dtype=np.float64)
-        rp = np.asarray(z["right_pos"], dtype=np.float64)
-        good = np.isfinite(tp).all(axis=1) & np.isfinite(rp).all(axis=1)
-        if good.any():
+        for side in ("left", "right"):
+            rk = f"{side}_pos"
+            if rk not in keys:
+                continue
+            rp = np.asarray(z[rk], dtype=np.float64)
+            good = np.isfinite(tp).all(axis=1) & np.isfinite(rp).all(axis=1)
+            if not good.any():
+                continue
             d = np.linalg.norm(rp[good] - tp[good], axis=1)
             i = int(np.argmin(d))
-            _log(f"  最近距离 {d.min()*1000:.1f}mm @frame {i}")
-            if d.min() * 1000 > 150:
-                _log("  ⚠ 末端始终没接近试管（>150mm）—— 可能是末端坐标系没对齐")
-                verdicts.append((False, "末端未接近试管"))
+            approach = float(d[0] - d.min()) * 1000
+            ok = approach > 50.0
+            _log(f"  {side}: 起始 {d[0]*1000:.0f}mm → 最近 {d.min()*1000:.0f}mm"
+                 f" @f{i}  接近量 {approach:.0f}mm"
+                 + ("   ✅" if ok else "   ⚠ 没明显接近"))
+            verdicts.append((ok, f"{side} 接近试管 {approach:.0f}mm"))
+        _log("  注: tcp 是法兰，实际夹持点在指尖前方几厘米，"
+             "抓到试管时法兰距中心 10-15cm 属正常")
 
     # ---- 总结 ----
     _log("\n" + "=" * 62)

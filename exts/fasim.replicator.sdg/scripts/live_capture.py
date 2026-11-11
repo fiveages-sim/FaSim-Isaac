@@ -614,6 +614,7 @@ def stop_capture() -> dict:
 
     out = _S["out"]
     info = {
+        "out": str(out),
         "frames_saved": _S["saved"],
         "physics_steps": _S["step"],
         "steps_skipped": _S["skipped"],

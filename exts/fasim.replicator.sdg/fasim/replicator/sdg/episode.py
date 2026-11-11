@@ -110,6 +110,9 @@ class Episode:
     objects: dict[str, tuple[np.ndarray, np.ndarray]] | None = None
     frame_id: str = "world"
     meta: dict[str, Any] = field(default_factory=dict)
+    #: 加载来源路径（``load()`` 时填）。回放导出诊断文件时用它定位同目录，
+    #: 否则会落到 /tmp 找不到原 episode。
+    path: Path | None = None
 
     def __len__(self) -> int:
         return int(self.t.shape[0])
@@ -264,6 +267,7 @@ class Episode:
                 objects=objects or None,
                 frame_id=z["frame_id"].item() if "frame_id" in files else "world",
                 meta=json.loads(str(meta_raw)),
+                path=p,
             )
 
     # ---------------------------------------------------------------- 摘要

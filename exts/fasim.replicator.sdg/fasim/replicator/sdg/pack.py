@@ -133,15 +133,21 @@ def pack_episode(
 
     # --- 时间轴 ---
     #
-    # 帧间隔必须用**真实**物理步长换算。假设 5ms（200Hz）会偏 —— 实测
-    # 这台机器物理步长 5.876ms（177Hz），按 5ms 算会让回放快 15%，
-    # 手到得早、抓取位置偏。
+    # 帧间隔 = 每帧物理步数 × **仿真**物理步长。
     #
-    # 优先级：
+    # 关键：``physics_dt`` 是**仿真时间**步长（配置的 5ms），不是墙钟耗时。
+    # 本机墙钟约 6.5ms/步，那是渲染/计算开销导致 RTF<1，跟时间轴无关。
+    #
+    # 曾经用「墙钟 / 步数」反推，得到 5.876ms 并当成真值，commit 5c75702
+    # 据此"修正"了 5ms 硬编码 —— 那是错的：按 5.876ms 算会让回放**慢** 15%，
+    # 手到得晚。fix01 用 5ms 回放与编排完全一致（且插拔任务成功），这是
+    # 直接反证。
+    #
+    # 所以顺序改成：
     #   1) 调用方显式给 frame_dt
-    #   2) session.json 的 physics_dt（采集时用 SimulationManager 读的真值）
-    #   3) 墙钟反推：duration_sec / physics_steps
-    #   4) 兜底 5ms（并明确告警）
+    #   2) session.json 的 physics_dt（采集时 SimulationManager 读的**仿真**步长）
+    #   3) 兜底 5ms（G1D 默认配置；明确提示用 --frame-dt 覆盖）
+    # **不再用墙钟反推** —— 它量的是性能，不是时间轴。
     dt = frame_dt
     if dt is None:
         every = int(meta.get("every", 0) or 0)
@@ -149,21 +155,23 @@ def pack_episode(
         med = float(np.median(dsteps)) if dsteps.size else float(every or 10)
 
         phys_dt = float(meta.get("physics_dt", 0) or 0)
-        src = "session.json physics_dt"
-        if phys_dt <= 0:
-            n_phys = float(meta.get("physics_steps", 0) or 0)
-            dur = float(meta.get("duration_sec", 0) or 0)
-            if n_phys > 0 and dur > 0:
-                phys_dt = dur / n_phys
-                src = f"墙钟反推 ({phys_dt*1000:.3f}ms)"
+        src = "session.json physics_dt（仿真步长）"
         if phys_dt <= 0:
             phys_dt = 0.005
-            src = "兜底假设 5ms（可能不准！）"
-            _log("WARN session.json 没有 physics_dt，退回假设 5ms —— "
+            src = "兜底 5ms（老会话没记 physics_dt）"
+            _log("WARN session.json 没有 physics_dt，用默认 5ms。"
                  "若回放速度不对，用 --frame-dt 手动指定")
         dt = med * phys_dt
         _log(f"帧间隔推算: {med:g} 物理步 × {phys_dt*1000:.3f}ms "
              f"= {dt*1000:.2f}ms   来源: {src}")
+        # 顺带提示 RTF —— 只影响采集合规性（够不够 30fps），不影响时间轴
+        n_phys = float(meta.get("physics_steps", 0) or 0)
+        dur = float(meta.get("duration_sec", 0) or 0)
+        if n_phys > 0 and dur > 0:
+            rtf = (n_phys * phys_dt) / dur
+            if rtf < 0.95:
+                _log(f"  注: 实时率 RTF≈{rtf:.2f}（墙钟 {dur/n_phys*1000:.2f}ms/步），"
+                     "仿真比实时慢是正常的，不影响时间轴")
     dt = float(dt)
     n = len(cols["joint_pos"])
     t = np.arange(n, dtype=np.float64) * dt

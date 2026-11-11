@@ -1248,8 +1248,11 @@ def _finish() -> None:
                 try:
                     from pathlib import Path as _P
 
+                    # Episode.load 会填 .path（新增）。拿不到时退到 cwd，
+                    # 免得落到 /tmp 里找不到原 episode。
                     ep_path = getattr(ctx.get("episode"), "path", None)
-                    base = _P(str(ep_path)).with_suffix("") if ep_path else _P("/tmp/replay")
+                    base = (_P(str(ep_path)).with_suffix("")
+                            if ep_path else _P.cwd() / "replay")
                     traj_out = _P(str(base) + f".replay_f{ctx.get('n_start', 0)}.npz")
                     np.savez_compressed(
                         traj_out,
