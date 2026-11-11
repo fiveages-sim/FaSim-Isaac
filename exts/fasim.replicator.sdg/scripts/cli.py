@@ -201,9 +201,11 @@ def cmd_capture(args: argparse.Namespace) -> int:
     else:
         opts = [(c.name, f"{c.name:14s} {c.resolution[0]}x{c.resolution[1]}") for c in cams]
         if len(cams) > 1:
-            opts.append(("all", "全部相机（开销最大）"))
+            opts.append(("all", f"全部相机（{len(cams)} 个，开销最大）"))
         sel = _pick("相机", opts)
-        camera = "" if sel == "all" else sel
+        # **必须传 "all" 而不是 ""** —— arm_capture 里 "" 表示"不采"，
+        # 传空会让"选全部"变成"一个都不采"（cam02 踩过这个坑）。
+        camera = "all" if sel == "all" else sel
 
     # --- 频率 ---
     if args.every:
@@ -252,7 +254,13 @@ def cmd_capture(args: argparse.Namespace) -> int:
     print(f"  机器人   : {robot}")
     print(f"  任务     : {task}")
     print(f"  采集项   : {','.join(what)}")
-    print(f"  相机     : {camera or ('不采' if 'camera' not in what else '全部')}")
+    if "camera" not in what:
+        cam_desc = "不采"
+    elif str(camera).strip().lower() == "all":
+        cam_desc = f"全部（{len(cams)} 个）"
+    else:
+        cam_desc = str(camera)
+    print(f"  相机     : {cam_desc}")
     print(f"  频率     : every={every}")
     print(f"  分辨率   : {f'{width}x{height}' if width else '配置默认（仅相机）'}")
     print(f"  深度     : {'是' if depth else '否'}")

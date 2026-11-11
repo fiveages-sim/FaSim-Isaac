@@ -84,13 +84,18 @@ def _code_stamp() -> str:
 
 
 def _camera_specs(task, camera: str | None):
-    """挑出要采的相机。``camera`` 为空则全部，否则按 name 过滤。"""
+    """按名字挑相机。
+
+    **注意**：这里 ``camera`` 为空或 ``"all"`` 都表示"全部"（本函数的约定）。
+    但 ``arm_capture`` 里空表示"不采" —— 由那里先判定，只在确定要采时才调
+    本函数。不要直接拿用户输入调本函数。
+    """
     specs = list(getattr(task, "cameras", None) or [])
     if not specs:
         return []
-    if not camera:
+    if not camera or str(camera).strip().lower() == "all":
         return specs
-    want = {c.strip() for c in camera.split(",") if c.strip()}
+    want = {c.strip() for c in str(camera).split(",") if c.strip()}
     picked = [s for s in specs if s.name in want]
     if not picked:
         _log(f"WARN 找不到相机 {want}，可选: {[s.name for s in specs]}")
@@ -403,10 +408,18 @@ def arm_capture(
         out = runtime.default_session_dir(robot_key, task_key, name)
     (out / "frames").mkdir(parents=True, exist_ok=True)
 
-    # 相机：camera 为空 = 不采相机（只采状态），此时不建 render product
+    # 相机：``camera`` 的语义（务必与 CLI 保持一致，否则会静默不采）
+    #   None / ""      → **不采相机**（只采状态），不建 render product
+    #   "all"          → 采 task.yaml 里配的全部相机
+    #   "head,left"    → 按名字过滤
+    #
+    # 注意历史坑：``_camera_specs`` 内部把 "" 当"全部"，而这里是""当"不采"，
+    # 同一空串两种含义导致「选全部相机」被当成「不采」。现在由本处统一判定，
+    # 只有非空才往下走，并把 "all" 映射成空串再交给 _camera_specs。
     cams: list[dict] = []
-    if str(camera or "").strip():
-        specs = _camera_specs(task, camera)
+    cam_sel = str(camera if camera is not None else "").strip()
+    if cam_sel:
+        specs = _camera_specs(task, "" if cam_sel.lower() == "all" else cam_sel)
         if not specs:
             _log("ERROR 指定的相机都找不到")
             return None
@@ -442,7 +455,9 @@ def arm_capture(
             _log("ERROR 所有相机都创建失败")
             return None
     else:
-        _log("不采相机（只采状态）")
+        # 明确说清"为什么没采"—— cam02 就是选了全部相机却因空串语义丢成
+        # 不采，事后才从帧里发现没图像。这里把判定依据打出来。
+        _log(f"不采相机（camera={camera!r}；只采状态）")
 
     # 关节角（action 标签）。拿不到就跳过，不影响其他数据。
     art = None
