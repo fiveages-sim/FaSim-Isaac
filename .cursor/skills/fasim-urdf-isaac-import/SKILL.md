@@ -184,7 +184,7 @@ Numbers: [reference.md](reference.md) §F. If one side of a two-sided LED is dar
 2. Wrist D405 lives on the **gripper** `Sensor=d405` at `jaw_camera_link`, not on the body. Payload whole `robots/sensors/realsense/d405.usd` (Y-up: `rotateX:unitsResolve=90` + **Ry=-90** so the lens faces the link); optical Camera is a **sibling**, look −Z.
 3. EE child under `tcp`. Gripper: identity, child `gripper_base` (importer does not rename it to `base_link`), `Sensor=d405`, `Side=left|right`, `Robot=none`, FixedJoint to `gripper_base`. Revo quats/translates: [reference.md](reference.md).
 4. Gripper Side renames importer `Physics/gripper_joint` → `left_gripper_joint` / `right_gripper_joint`. Mimic is prismatic Y: `PhysxMimicJointAPI:transY`, gearing `-1`.
-5. ROS `targetPrim` / `chassisPrim` = `/Robot/base_link` (flat link, not `/Robot/Geometry/base_link`). Publish `/isaac/joint_states`, `/isaac/joint_command`, clock. TF **only** `world → odom → base_footprint → base_link`, all three `staticPublisher=0`. Wheeled: **official** `ROS_Differential_Controller` (Tracer V2 / Woosh Ai2 topology) — not a ScriptNode. Measure `wheelRadius` / `wheelDistance`; `jointNames` = `[left, right]`; identity +Y both drives → same-sign cmds (do not negate right). Casters: **no** `PhysicsDriveAPI`. See [reference.md](reference.md) §D.
+5. ROS `targetPrim` / `chassisPrim` = `/Robot/base_link` (flat link, not `/Robot/Geometry/base_link`). Publish `/isaac/joint_states`, `/isaac/joint_command`, clock. TF **only** `world → odom → base_footprint → base_link`, all three `staticPublisher=0`. Semantics: `odom→*` = `IsaacComputeOdometry` **relative** from Play; `world→odom` = **Play latch** of chassis world pose minus footprint→base z (so `lookup(world, base_link)` matches stage at start — do **not** publish identity `world→odom`, and do **not** write every-frame current base into `world→odom` or it double-counts). Wheeled: **official** `ROS_Differential_Controller` (Tracer V2 / Woosh Ai2 topology) — not a ScriptNode. Measure `wheelRadius` / `wheelDistance`; `jointNames` = `[left, right]`; identity +Y both drives → same-sign cmds (do not negate right). Casters: **no** `PhysicsDriveAPI`. See [reference.md](reference.md) §D. G1D fiveages example: `ComputeWorldChassis` → ArrayIndex → `LatchWorld2Odom` ScriptNode → `TFWorld2Odom`.
 
 ---
 
@@ -196,7 +196,7 @@ Numbers: [reference.md](reference.md) §F. If one side of a two-sided LED is dar
 | Structure | Each rigid has `visuals/` + `collisions/`; no `base_link_1` sibling |
 | EE none | `tcp` empty except sites (`*_eef`) |
 | Sensor none | 0 Camera; sensors: expected library cameras |
-| TF | Only odom chain; `staticPublisher=0` |
+| TF | Only odom chain; `staticPublisher=0`; `world→odom` latched spawn (minus footprint z), `odom→*` relative |
 | Emissive | LED factor × strength > 0; both sides face outward |
 
 ---

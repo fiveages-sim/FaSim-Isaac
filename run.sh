@@ -1,13 +1,15 @@
 #!/bin/bash
 
-# FaSim-Isaac 启动脚本
-# 配置见 config/fa_sim.conf（本机覆盖：config/fa_sim.local.conf）
+# FaSim-Isaac 启动脚本（普通 GUI）
+# Headless：./run_headless.sh
+# 配置：config/fa_sim.conf + config/fa_sim.local.conf（交互选项会写回 local）
 
 set -u
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -17,6 +19,77 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FA_SIM_CONFIG="${SCRIPT_DIR}/config/fa_sim.conf"
 FA_SIM_LOCAL_CONFIG="${SCRIPT_DIR}/config/fa_sim.local.conf"
+
+HEADLESS=0
+CLI_PHYSICS=""
+CLI_CPU=""
+CLI_ROS_WS=""
+CLI_INSTANCE=""
+CLI_KIT_PROFILE=""
+CLI_ASSET_REGION=""
+LIST_KIT_PROFILES=0
+NONINTERACTIVE=0
+
+usage() {
+    cat <<'EOF'
+用法:
+  ./run.sh              # 普通 GUI 启动（交互选配置）
+  ./run_headless.sh     # Headless Streaming（交互选配置）
+
+选项（可跳过交互）:
+  --headless            Headless Streaming
+  --physics physx|newton
+  --cpu 0|1|auto        CPU performance（0=跳过）
+  --ros-ws PATH         默认加载的 ROS2 工作空间（含 install/setup.bash）
+  --instance N          Headless 实例序号（端口 / ROS_DOMAIN_ID）
+  --kit-profile NAME    Kit settings 预设档位（默认 none）
+  --asset-region none|us|china
+                        Isaac 资产区：none=不改环境变量；china=国内镜像；
+                        us=切回主站（会 unset ISAACSIM_ASSET_ROOT）
+  --list-kit-profiles   列出可用档位后退出
+  -y, --yes             非交互：全部用配置/默认值
+  -h, --help
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --headless) HEADLESS=1; shift ;;
+        --physics)
+            CLI_PHYSICS="${2:-}"; shift 2
+            ;;
+        --cpu)
+            CLI_CPU="${2:-}"; shift 2
+            ;;
+        --ros-ws)
+            CLI_ROS_WS="${2:-}"; shift 2
+            ;;
+        --instance)
+            CLI_INSTANCE="${2:-}"; shift 2
+            ;;
+        --kit-profile)
+            CLI_KIT_PROFILE="${2:-}"; shift 2
+            ;;
+        --asset-region)
+            CLI_ASSET_REGION="${2:-}"; shift 2
+            ;;
+        --list-kit-profiles)
+            LIST_KIT_PROFILES=1; shift
+            ;;
+        -y|--yes) NONINTERACTIVE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*)
+            print_error "未知选项: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            print_error "多余参数: $1（旧版数字模式已弃用，请用 ./run_headless.sh --instance N）"
+            usage
+            exit 1
+            ;;
+    esac
+done
 
 if [ ! -f "$FA_SIM_CONFIG" ]; then
     print_error "找不到配置文件: $FA_SIM_CONFIG"
@@ -30,8 +103,29 @@ if [ -f "$FA_SIM_LOCAL_CONFIG" ]; then
     print_info "已加载本机覆盖: config/fa_sim.local.conf"
 fi
 
-# 设置 CPU 性能模式
-# RUN_SET_CPU_PERFORMANCE: 1=强制 / 0=跳过 / auto=尽力设置（容器内不 apt 安装）
+if [ "${LIST_KIT_PROFILES:-0}" = "1" ]; then
+    echo "可用 kit 预设档位（--kit-profile NAME）:"
+    printf '  %-22s %-7s %s\n' "none" "-" "不追加任何 settings 覆盖"
+    for _p in $(printf '%s\n' "${!ISAAC_KIT_PROFILE_DESC[@]}" | sort); do
+        case "$_p" in
+            newton-*) _tag="newton" ;;
+            physx-*)  _tag="physx" ;;
+            *)        _tag="-" ;;
+        esac
+        printf '  %-22s %-7s %s\n' "$_p" "$_tag" "${ISAAC_KIT_PROFILE_DESC[$_p]}"
+    done
+    echo "  （newton-* 仅用于 --physics newton，physx-* 仅用于 --physics physx）"
+    exit 0
+fi
+
+# 交互默认值（local.conf / 环境变量可覆盖）
+RUN_PHYSICS_BACKEND="${RUN_PHYSICS_BACKEND:-physx}"
+RUN_SET_CPU_PERFORMANCE="${RUN_SET_CPU_PERFORMANCE:-auto}"
+RUN_ROS2_WS="${RUN_ROS2_WS:-${HOME}/ros2_ws}"
+RUN_ISAAC_ROS_WS="${RUN_ISAAC_ROS_WS:-${SCRIPT_DIR}/${ISAAC_JAZZY_WS_NAME:-isaac_jazzy_ws}}"
+RUN_ASSET_REGION_PROFILE="${RUN_ASSET_REGION_PROFILE:-none}"
+RUN_SAVE_LOCAL="${RUN_SAVE_LOCAL:-1}"
+
 is_container_env() {
     [ -f /.dockerenv ] && return 0
     [ -f /run/.containerenv ] && return 0
@@ -88,7 +182,6 @@ set_cpu_performance() {
         return 0
     fi
 
-    # 强制模式且非容器：尝试安装工具；容器内内核多为宿主机，apt 装 linux-tools 通常无效
     if [ "$mode" = "1" ] && [ "$in_container" -eq 0 ]; then
         print_warn "未找到 cpupower，尝试安装 linux-tools..."
         if sudo apt install -y linux-tools-common linux-tools-"$(uname -r)" 2>/dev/null \
@@ -105,13 +198,430 @@ set_cpu_performance() {
         print_warn "当前在容器/distrobox 中，CPU 调频由宿主机控制，已跳过"
         print_warn "如需开启 performance，请在宿主机执行："
         echo -e "  ${GREEN}sudo cpupower frequency-set -g performance${NC}"
-        print_warn "或在 config/fa_sim.local.conf 设置 RUN_SET_CPU_PERFORMANCE=0 以静默跳过"
     else
         print_warn "无法设置 CPU performance（无 sysfs 写权限且无 cpupower），已跳过"
     fi
 }
 
-set_cpu_performance
+is_nonneg_int() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+prompt_choice() {
+    # $1=prompt $2=default → writes answer to REPLY
+    local prompt="$1"
+    local default="$2"
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        REPLY="$default"
+        return 0
+    fi
+    read -r -p "${prompt} [${default}]: " REPLY
+    if [ -z "${REPLY}" ]; then
+        REPLY="$default"
+    fi
+}
+
+normalize_physics() {
+    case "${1,,}" in
+        1|physx|normal|p) echo physx ;;
+        2|newton|n) echo newton ;;
+        *) echo "" ;;
+    esac
+}
+
+normalize_cpu() {
+    case "${1,,}" in
+        0|false|no|off|n) echo 0 ;;
+        1|true|yes|on|y) echo 1 ;;
+        auto|a) echo auto ;;
+        *) echo "" ;;
+    esac
+}
+
+resolve_ros_ws_setup() {
+    local root="$1"
+    if [ -z "$root" ] || [ "$root" = "none" ] || [ "$root" = "-" ]; then
+        echo ""
+        return 0
+    fi
+    if [ -f "${root}/install/setup.bash" ]; then
+        echo "${root}/install/setup.bash"
+        return 0
+    fi
+    if [ -f "${root}/setup.bash" ]; then
+        echo "${root}/setup.bash"
+        return 0
+    fi
+    echo ""
+}
+
+save_local_conf() {
+    [ "${RUN_SAVE_LOCAL}" = "1" ] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    {
+        echo "# 本机覆盖（由 ./run.sh 交互写入；可手改）"
+        echo "# 生成时间: $(date -Iseconds 2>/dev/null || date)"
+        echo
+        if [ -n "${ISAACSIM_DIR:-}" ]; then
+            echo "ISAACSIM_DIR=\"${ISAACSIM_DIR}\""
+        fi
+        echo "RUN_PHYSICS_BACKEND=\"${RUN_PHYSICS_BACKEND}\""
+        echo "RUN_KIT_PROFILE=\"${RUN_KIT_PROFILE:-none}\""
+        echo "RUN_SET_CPU_PERFORMANCE=\"${RUN_SET_CPU_PERFORMANCE}\""
+        echo "RUN_ROS2_WS=\"${RUN_ROS2_WS}\""
+        echo "RUN_ISAAC_ROS_WS=\"${RUN_ISAAC_ROS_WS}\""
+        echo "RUN_ASSET_REGION_PROFILE=\"${RUN_ASSET_REGION_PROFILE:-none}\""
+        if [ -f "$FA_SIM_LOCAL_CONFIG" ]; then
+            # 保留用户其它键（非本次管理的）；丢掉会破坏 ROS/Kit 的 PYTHONPATH 清场行
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    ''|\#*) continue ;;
+                    ISAACSIM_DIR=*|RUN_PHYSICS_BACKEND=*|RUN_KIT_PROFILE=*|RUN_SET_CPU_PERFORMANCE=*|RUN_ROS2_WS=*|RUN_ISAAC_ROS_WS=*|RUN_ASSET_REGION_PROFILE=*|RUN_SAVE_LOCAL=*)
+                        continue
+                        ;;
+                    unset\ PYTHONPATH*|unset\ PYTHONPATH|PYTHONPATH=*)
+                        continue
+                        ;;
+                esac
+                echo "$line"
+            done <"$FA_SIM_LOCAL_CONFIG"
+        fi
+
+    } >"$tmp"
+    mv "$tmp" "$FA_SIM_LOCAL_CONFIG"
+    print_info "已保存本机默认到 config/fa_sim.local.conf"
+}
+
+normalize_asset_region() {
+    case "${1,,}" in
+        ""|none|off|0|default) echo "none" ;;
+        us|usa|primary) echo "us" ;;
+        cn|china|zh|prc) echo "china" ;;
+        *) echo "" ;;
+    esac
+}
+
+print_config_summary() {
+    local title="${1:-已保存的默认配置}"
+    echo -e "${CYAN}${title}:${NC}"
+    echo "  物理:     ${RUN_PHYSICS_BACKEND}"
+    echo "  CPU:      ${RUN_SET_CPU_PERFORMANCE}"
+    echo "  ROS2 WS:  ${RUN_ROS2_WS}"
+    echo "  Kit预设:  ${RUN_KIT_PROFILE:-none}"
+    echo "  资产区:   ${RUN_ASSET_REGION_PROFILE:-none}"
+    if [ "$HEADLESS" -eq 1 ]; then
+        echo "  Instance: ${FA_SIM_INSTANCE:-0}"
+    fi
+}
+
+apply_cli_overrides() {
+    local ans
+    if [ -n "$CLI_PHYSICS" ]; then
+        ans="$(normalize_physics "$CLI_PHYSICS")"
+        if [ -z "$ans" ]; then
+            print_error "无效 --physics: $CLI_PHYSICS（用 physx|newton）"
+            exit 1
+        fi
+        RUN_PHYSICS_BACKEND="$ans"
+    fi
+    if [ -n "$CLI_CPU" ]; then
+        ans="$(normalize_cpu "$CLI_CPU")"
+        if [ -z "$ans" ]; then
+            print_error "无效 --cpu: $CLI_CPU（用 0|1|auto）"
+            exit 1
+        fi
+        RUN_SET_CPU_PERFORMANCE="$ans"
+    fi
+    if [ -n "$CLI_ROS_WS" ]; then
+        RUN_ROS2_WS="$CLI_ROS_WS"
+    fi
+    if [ -n "$CLI_KIT_PROFILE" ]; then
+        RUN_KIT_PROFILE="$CLI_KIT_PROFILE"
+    fi
+    if [ -n "$CLI_ASSET_REGION" ]; then
+        ans="$(normalize_asset_region "$CLI_ASSET_REGION")"
+        if [ -z "$ans" ]; then
+            print_error "无效 --asset-region: $CLI_ASSET_REGION（用 none|us|china）"
+            exit 1
+        fi
+        RUN_ASSET_REGION_PROFILE="$ans"
+    fi
+    if [ -n "${CLI_INSTANCE}" ]; then
+        if ! is_nonneg_int "${CLI_INSTANCE}"; then
+            print_error "实例序号必须是非负整数，当前: ${CLI_INSTANCE}"
+            exit 1
+        fi
+        FA_SIM_INSTANCE="${CLI_INSTANCE}"
+    fi
+}
+
+kit_profile_candidates() {
+    # 按物理后端列出适用的档位（none + 前缀匹配），供菜单/校验使用
+    local backend="${1:-}" name
+    echo "none"
+    for name in $(printf '%s\n' "${!ISAAC_KIT_PROFILE_DESC[@]}" | sort); do
+        case "$name" in
+            newton-*)
+                if [ -z "$backend" ] || [ "$backend" = "newton" ]; then echo "$name"; fi
+                ;;
+            physx-*)
+                if [ -z "$backend" ] || [ "$backend" = "physx" ]; then echo "$name"; fi
+                ;;
+            *)
+                echo "$name"
+                ;;
+        esac
+    done
+}
+
+normalize_kit_profile() {
+    # 档位与物理后端不匹配时回退 none（比如从 newton 切到 physx）
+    local backend="${1:-}" profile="${RUN_KIT_PROFILE:-none}"
+    [ -n "$profile" ] || profile="none"
+    if [ "$profile" = "none" ]; then
+        RUN_KIT_PROFILE="none"
+        return 0
+    fi
+    if ! kit_profile_candidates "$backend" | grep -qx -- "$profile"; then
+        print_warn "Kit 档位 ${profile} 不适用于 --physics ${backend}，已重置为 none"
+        RUN_KIT_PROFILE="none"
+    fi
+}
+
+prompt_reselect_config() {
+    local phys_default cpu_default ros_default ans instance
+
+    # --- Physics ---
+    phys_default="${RUN_PHYSICS_BACKEND}"
+    echo "物理引擎:"
+    echo "  1) PhysX（普通）"
+    echo "  2) Newton"
+    prompt_choice "选择 [1/2]" "$( [ "$phys_default" = newton ] && echo 2 || echo 1 )"
+    ans="$(normalize_physics "$REPLY")"
+    if [ -z "$ans" ]; then
+        print_error "无效选项: $REPLY"
+        exit 1
+    fi
+    RUN_PHYSICS_BACKEND="$ans"
+
+    # --- CPU ---
+    cpu_default="${RUN_SET_CPU_PERFORMANCE}"
+    echo ""
+    echo "CPU performance 调频:"
+    echo "  1) 开启（强制 1）"
+    echo "  2) 自动 auto（推荐；容器内跳过 apt）"
+    echo "  3) 关闭（0）"
+    case "$cpu_default" in
+        1) prompt_choice "选择 [1/2/3]" "1" ;;
+        0) prompt_choice "选择 [1/2/3]" "3" ;;
+        *) prompt_choice "选择 [1/2/3]" "2" ;;
+    esac
+    case "$REPLY" in
+        1) RUN_SET_CPU_PERFORMANCE=1 ;;
+        3) RUN_SET_CPU_PERFORMANCE=0 ;;
+        2|*) RUN_SET_CPU_PERFORMANCE=auto ;;
+    esac
+
+    # --- ROS2 workspace ---
+    ros_default="${RUN_ROS2_WS}"
+    echo ""
+    echo "默认加载的 ROS2 工作空间（robot_common_launch / *_description 所在）:"
+    echo "  1) ${HOME}/ros2_ws"
+    echo "  2) ${SCRIPT_DIR}/isaac_jazzy_ws（仅 Isaac 官方 jazzy 包）"
+    echo "  3) 自定义路径"
+    echo "  4) 不 source（none）"
+    echo "  当前默认: ${ros_default}"
+    case "$ros_default" in
+        "${HOME}/ros2_ws"|"$HOME/ros2_ws") prompt_choice "选择 [1-4]" "1" ;;
+        *isaac_jazzy_ws*) prompt_choice "选择 [1-4]" "2" ;;
+        none|-|"") prompt_choice "选择 [1-4]" "4" ;;
+        *) prompt_choice "选择 [1-4]" "3" ;;
+    esac
+    case "$REPLY" in
+        1) RUN_ROS2_WS="${HOME}/ros2_ws" ;;
+        2) RUN_ROS2_WS="${SCRIPT_DIR}/isaac_jazzy_ws" ;;
+        3)
+            prompt_choice "输入工作空间根目录" "$ros_default"
+            RUN_ROS2_WS="$REPLY"
+            ;;
+        4) RUN_ROS2_WS="none" ;;
+        *)
+            print_error "无效选项: $REPLY"
+            exit 1
+            ;;
+    esac
+
+    # --- Kit 预设档位（按当前物理后端过滤）---
+    normalize_kit_profile "$RUN_PHYSICS_BACKEND"
+    echo ""
+    echo "Kit 设置预设（当前物理: ${RUN_PHYSICS_BACKEND}，none=不追加）:"
+    local kit_i=0 kit_p kit_default=1
+    local -a kit_menu=()
+    while IFS= read -r kit_p; do
+        kit_menu+=("$kit_p")
+        kit_i=$((kit_i + 1))
+        if [ "$kit_p" = "none" ]; then
+            printf '  %d) %-22s %s\n' "$kit_i" "$kit_p" "不追加任何 settings 覆盖"
+        else
+            printf '  %d) %-22s %s\n' "$kit_i" "$kit_p" "${ISAAC_KIT_PROFILE_DESC[$kit_p]}"
+        fi
+        [ "$kit_p" = "${RUN_KIT_PROFILE:-none}" ] && kit_default="$kit_i"
+    done < <(kit_profile_candidates "$RUN_PHYSICS_BACKEND")
+    prompt_choice "选择序号或名称" "$kit_default"
+    ans="$REPLY"
+    if [[ "$ans" =~ ^[0-9]+$ ]]; then
+        if [ "$ans" -ge 1 ] && [ "$ans" -le "${#kit_menu[@]}" ]; then
+            RUN_KIT_PROFILE="${kit_menu[$((ans - 1))]}"
+        else
+            print_error "序号超出范围: $ans（有效 1-${#kit_menu[@]}）"
+            exit 1
+        fi
+    else
+        RUN_KIT_PROFILE="$ans"
+    fi
+
+    # --- Isaac 资产区（Asset Region Profile）---
+    echo ""
+    echo "Isaac 资产区（ISAACSIM_ASSET_REGION_PROFILE）:"
+    echo "  1) none   — 不改环境变量（沿用 Kit persistent 当前值）"
+    echo "  2) china  — 国内镜像（simready.cn / 上海 OSS）"
+    echo "  3) us     — 切回美西主站"
+    case "${RUN_ASSET_REGION_PROFILE:-none}" in
+        china) prompt_choice "选择 [1/2/3]" "2" ;;
+        us)    prompt_choice "选择 [1/2/3]" "3" ;;
+        *)     prompt_choice "选择 [1/2/3]" "1" ;;
+    esac
+    case "$REPLY" in
+        1) RUN_ASSET_REGION_PROFILE=none ;;
+        2) RUN_ASSET_REGION_PROFILE=china ;;
+        3) RUN_ASSET_REGION_PROFILE=us ;;
+        *)
+            ans="$(normalize_asset_region "$REPLY")"
+            if [ -z "$ans" ]; then
+                print_error "无效选项: $REPLY"
+                exit 1
+            fi
+            RUN_ASSET_REGION_PROFILE="$ans"
+            ;;
+    esac
+
+    if [ "$HEADLESS" -eq 1 ]; then
+        instance="${FA_SIM_INSTANCE:-0}"
+        echo ""
+        prompt_choice "Headless 实例序号 FA_SIM_INSTANCE" "$instance"
+        instance="$REPLY"
+        if ! is_nonneg_int "${instance}"; then
+            print_error "实例序号必须是非负整数，当前: ${instance}"
+            exit 1
+        fi
+        FA_SIM_INSTANCE="${instance}"
+    fi
+}
+
+interactive_config() {
+    local ans reselect=0
+
+    # 规范化已加载默认
+    ans="$(normalize_physics "${RUN_PHYSICS_BACKEND}")"
+    RUN_PHYSICS_BACKEND="${ans:-physx}"
+    ans="$(normalize_cpu "${RUN_SET_CPU_PERFORMANCE}")"
+    RUN_SET_CPU_PERFORMANCE="${ans:-auto}"
+    ans="$(normalize_asset_region "${RUN_ASSET_REGION_PROFILE:-none}")"
+    RUN_ASSET_REGION_PROFILE="${ans:-none}"
+    FA_SIM_INSTANCE="${FA_SIM_INSTANCE:-0}"
+
+    apply_cli_overrides
+    # 物理后端确定后，再校验档位是否适用（--physics physx 时自动丢弃 newton-* 档位）
+    normalize_kit_profile "$RUN_PHYSICS_BACKEND"
+
+    echo ""
+    echo -e "${CYAN}══ FaSim-Isaac 启动配置 ══${NC}"
+    if [ "$HEADLESS" -eq 1 ]; then
+        echo -e "  模式: ${GREEN}Headless Streaming${NC}"
+    else
+        echo -e "  模式: ${GREEN}普通 GUI${NC}"
+    fi
+    echo ""
+    print_config_summary "已保存的默认配置"
+    if [ -f "$FA_SIM_LOCAL_CONFIG" ]; then
+        echo -e "  ${YELLOW}(来自 config/fa_sim.local.conf)${NC}"
+    else
+        echo -e "  ${YELLOW}(来自 config/fa_sim.conf；尚未保存本机默认)${NC}"
+    fi
+    echo ""
+
+    if [ "$NONINTERACTIVE" -eq 1 ]; then
+        reselect=0
+    elif [ -n "$CLI_PHYSICS$CLI_CPU$CLI_ROS_WS$CLI_INSTANCE$CLI_KIT_PROFILE$CLI_ASSET_REGION" ]; then
+        # 命令行已指定部分项：不再进菜单，直接用（默认 + 覆盖）
+        reselect=0
+    else
+        echo "  1) 使用已选默认配置（直接启动）"
+        echo "  2) 重新选择"
+        prompt_choice "选择 [1/2]" "1"
+        case "$REPLY" in
+            1|"") reselect=0 ;;
+            2) reselect=1 ;;
+            *)
+                print_error "无效选项: $REPLY"
+                exit 1
+                ;;
+        esac
+    fi
+
+    if [ "$reselect" -eq 1 ]; then
+        echo ""
+        prompt_reselect_config
+        echo ""
+        print_config_summary "将使用的配置"
+        echo ""
+        prompt_choice "写入 config/fa_sim.local.conf 作为下次默认？ [Y/n]" "Y"
+        case "${REPLY,,}" in
+            n|no|0) RUN_SAVE_LOCAL=0 ;;
+            *) RUN_SAVE_LOCAL=1 ;;
+        esac
+        save_local_conf
+    else
+        if [ "$HEADLESS" -eq 1 ] && ! is_nonneg_int "${FA_SIM_INSTANCE}"; then
+            print_error "实例序号必须是非负整数，当前: ${FA_SIM_INSTANCE}"
+            exit 1
+        fi
+        print_info "使用已选默认配置启动"
+    fi
+}
+
+source_ros_workspaces() {
+    local setup underlay_setup
+    # Underlay: Isaac jazzy ws（若存在且不是用户主选）
+    underlay_setup="$(resolve_ros_ws_setup "${RUN_ISAAC_ROS_WS}")"
+    if [ -n "$underlay_setup" ] && [ "${RUN_ROS2_WS}" != "${RUN_ISAAC_ROS_WS}" ]; then
+        print_info "source Isaac ROS underlay: ${underlay_setup}"
+        set +u
+        # shellcheck disable=SC1090
+        source "$underlay_setup"
+        set -u
+    fi
+
+    setup="$(resolve_ros_ws_setup "${RUN_ROS2_WS}")"
+    if [ -z "$setup" ]; then
+        if [ "${RUN_ROS2_WS}" = "none" ] || [ -z "${RUN_ROS2_WS}" ]; then
+            print_warn "未 source ROS2 工作空间；ROS2ControlLaunch 可能找不到 *_description"
+        else
+            print_error "找不到 setup.bash: ${RUN_ROS2_WS}/install/setup.bash"
+            print_info "请先 colcon build，或改选正确路径"
+            exit 1
+        fi
+        return 0
+    fi
+    print_info "source ROS2 工作空间: ${setup}"
+    set +u
+    # shellcheck disable=SC1090
+    source "$setup"
+    set -u
+    print_info "AMENT_PREFIX_PATH 首项: ${AMENT_PREFIX_PATH%%:*}"
+    print_info "ROS_DISTRO=${ROS_DISTRO:-?}  RMW=${RMW_IMPLEMENTATION:-?}"
+}
 
 cleanup_zenoh() {
     if [ -n "${ZENOH_PID:-}" ]; then
@@ -124,6 +634,166 @@ cleanup_zenoh() {
     fi
 }
 
+apply_streaming_isolation() {
+    local signal_port stream_port domain_id
+    signal_port=$((STREAM_SIGNAL_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
+    stream_port=$((STREAM_STREAM_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
+    domain_id=$((ROS_DOMAIN_ID_BASE + FA_SIM_INSTANCE))
+
+    if [ "${domain_id}" -gt 232 ]; then
+        print_error "ROS_DOMAIN_ID=${domain_id} 超出有效范围 0–232"
+        exit 1
+    fi
+
+    export ROS_DOMAIN_ID="${domain_id}"
+    STREAM_SIGNAL_PORT="${signal_port}"
+    STREAM_STREAM_PORT="${stream_port}"
+
+    print_info "Headless 多实例隔离:"
+    print_info "  FA_SIM_INSTANCE=${FA_SIM_INSTANCE}"
+    print_info "  livestream signalPort(TCP)=${STREAM_SIGNAL_PORT}"
+    print_info "  livestream streamPort(UDP)=${STREAM_STREAM_PORT}"
+    print_info "  ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
+}
+
+build_isaac_excluded_ext_args() {
+    # Carb: --/app/extensions/excluded/N=id  （覆盖 kit 内 excluded 数组）
+    ISAAC_KIT_EXTRA_ARGS=()
+    local i=0 ext
+    for ext in "${ISAAC_EXCLUDED_EXTS[@]:-}"; do
+        [ -n "$ext" ] || continue
+        ISAAC_KIT_EXTRA_ARGS+=("--/app/extensions/excluded/${i}=${ext}")
+        i=$((i + 1))
+    done
+}
+
+resolve_kit_profile() {
+    # 把 RUN_KIT_PROFILE 对应的预设数组展开到 ISAAC_KIT_PROFILE_SETTINGS
+    local name="${RUN_KIT_PROFILE:-none}"
+    ISAAC_KIT_PROFILE_SETTINGS=()
+    case "$name" in
+        ""|none) return 0 ;;
+    esac
+
+    local var
+    var="ISAAC_KIT_PROFILE_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    if ! declare -p "$var" >/dev/null 2>&1; then
+        print_error "未知 kit 预设档位: ${name}"
+        echo "可用档位:"
+        printf '  %-22s %s\n' "none" "不追加任何 settings 覆盖"
+        local p
+        for p in $(printf '%s\n' "${!ISAAC_KIT_PROFILE_DESC[@]}" | sort); do
+            printf '  %-22s %s\n' "$p" "${ISAAC_KIT_PROFILE_DESC[$p]}"
+        done
+        exit 1
+    fi
+    local -n _profile_ref="$var"
+    ISAAC_KIT_PROFILE_SETTINGS=("${_profile_ref[@]}")
+
+    case "$name" in
+        physx-*)
+            [ "${RUN_PHYSICS_BACKEND}" = "physx" ] || \
+                print_warn "档位 ${name} 面向 --physics physx，当前物理=${RUN_PHYSICS_BACKEND}"
+            ;;
+        newton-*)
+            [ "${RUN_PHYSICS_BACKEND}" = "newton" ] || \
+                print_warn "档位 ${name} 面向 --physics newton，当前物理=${RUN_PHYSICS_BACKEND}"
+            ;;
+    esac
+}
+
+build_isaac_setting_args() {
+    # 先展开预设档位，再追加用户手工覆盖（config/fa_sim.conf: ISAAC_KIT_SETTINGS）
+    resolve_kit_profile
+    local s
+    for s in "${ISAAC_KIT_PROFILE_SETTINGS[@]:-}"; do
+        [ -n "$s" ] || continue
+        ISAAC_KIT_EXTRA_ARGS+=("$s")
+    done
+    for s in "${ISAAC_KIT_SETTINGS[@]:-}"; do
+        [ -n "$s" ] || continue
+        ISAAC_KIT_EXTRA_ARGS+=("$s")
+    done
+}
+
+enable_crash_debug() {
+    [ "${RUN_CRASH_DEBUG:-1}" = "1" ] || return 0
+    if ulimit -c unlimited 2>/dev/null; then
+        print_info "崩溃调试：ulimit -c = $(ulimit -c)"
+    else
+        print_warn "崩溃调试：无法开启 core dump（受 hard limit 限制）"
+    fi
+    local plugins_dir="${ISAACSIM_DIR}/kit/kernel/plugins"
+    if [ -d "$plugins_dir" ]; then
+        export PATH="${plugins_dir}:${PATH}"
+        print_info "崩溃调试：crashreport.gui 已加入 PATH"
+    fi
+    local pattern
+    pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo unknown)
+    if [[ "$pattern" == *apport* ]]; then
+        print_info "崩溃调试：core 由 apport 收集，崩溃后看 /var/crash/_*isaacsim_kit_kit*"
+    elif [[ "$pattern" == core* ]]; then
+        print_info "崩溃调试：core 将写入运行目录（${pattern}）"
+    else
+        print_warn "崩溃调试：core_pattern=${pattern} 非文件模式，core 可能不落盘"
+    fi
+}
+
+sanitize_host_ros_paths_for_isaac() {
+    # Full host ROS for OCS2 / ros2_control: keep /opt/ros on LD+AMENT, strip
+    # only PYTHONPATH, disable pink (see ISAAC_EXCLUDED_EXTS). Vanilla
+    # isaac-sim.sh still uses the aggressive strip (no FASIM_FULL_HOST_ROS).
+    if [ ! -f "${SCRIPT_DIR}/tools/isaac_env_guard.sh" ]; then
+        print_warn "缺少 tools/isaac_env_guard.sh，跳过 ROS 环境整理"
+        return 0
+    fi
+    export ISAACSIM_DIR="${ISAACSIM_DIR}"
+    export FASIM_FULL_HOST_ROS=1
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/tools/isaac_env_guard.sh"
+    print_info "完整 host ROS2（FASIM_FULL_HOST_ROS=1）：保留 /opt/ros LD+AMENT，仅清 PYTHONPATH"
+    print_info "AMENT 首项: ${AMENT_PREFIX_PATH%%:*}"
+    if [[ ":${LD_LIBRARY_PATH:-}:" != *":/opt/ros/"* ]]; then
+        print_warn "LD_LIBRARY_PATH 中未见 /opt/ros；ocs2 可能缺 libtracetools.so"
+    fi
+    if [[ "${AMENT_PREFIX_PATH:-}" != *"/ros2_ws/"* ]] && [[ "${RUN_ROS2_WS:-}" == *ros2_ws* ]]; then
+        print_warn "AMENT 中未见 ros2_ws；请确认已 source ${RUN_ROS2_WS}/install/setup.bash"
+    fi
+}
+
+apply_asset_region_profile() {
+    # Isaac Sim: ISAACSIM_ASSET_ROOT 优先于 region profile；切区时必须清掉。
+    # none：不改环境变量（沿用 Kit persistent.isaac.asset_root）。
+    local profile
+    profile="$(normalize_asset_region "${RUN_ASSET_REGION_PROFILE:-none}")"
+    RUN_ASSET_REGION_PROFILE="${profile:-none}"
+    case "$RUN_ASSET_REGION_PROFILE" in
+        none)
+            print_info "资产区: none（不设置 ISAACSIM_ASSET_REGION_PROFILE）"
+            if [ -n "${ISAACSIM_ASSET_ROOT:-}" ]; then
+                print_info "  当前 ISAACSIM_ASSET_ROOT=${ISAACSIM_ASSET_ROOT}"
+            fi
+            ;;
+        us|china)
+            if [ -n "${ISAACSIM_ASSET_ROOT:-}" ]; then
+                print_warn "清除 ISAACSIM_ASSET_ROOT（否则会盖过 region profile）: ${ISAACSIM_ASSET_ROOT}"
+                unset ISAACSIM_ASSET_ROOT
+            fi
+            export ISAACSIM_ASSET_REGION_PROFILE="$RUN_ASSET_REGION_PROFILE"
+            print_info "资产区: ISAACSIM_ASSET_REGION_PROFILE=${ISAACSIM_ASSET_REGION_PROFILE}"
+            ;;
+        *)
+            print_error "内部错误: 未知资产区 ${RUN_ASSET_REGION_PROFILE}"
+            exit 1
+            ;;
+    esac
+}
+
+# --- main ---
+interactive_config
+set_cpu_performance
+source_ros_workspaces
+
 if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then
     print_info "检测到 RMW_IMPLEMENTATION=rmw_zenoh_cpp，启动 Zenoh router..."
     setsid ros2 run rmw_zenoh_cpp rmw_zenohd &
@@ -133,123 +803,73 @@ if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then
     sleep 1
 else
     print_warn "当前未使用 rmw_zenoh_cpp（RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-未设置}）"
-    print_warn "如需使用 Zenoh，请先设置环境变量："
-    echo -e "  ${GREEN}export RMW_IMPLEMENTATION=rmw_zenoh_cpp${NC}"
 fi
 
 if [ ! -d "${ISAACSIM_DIR}" ]; then
-    print_error "未找到目录: ${ISAACSIM_DIR}，请确认 Isaac Sim 安装路径。"
-    print_info "可在 config/fa_sim.local.conf 中设置 ISAACSIM_DIR，或："
-    print_info "  ISAACSIM_DIR=/path/to/isaacsim ./run.sh"
+    print_error "未找到目录: ${ISAACSIM_DIR}"
+    print_info "可在 config/fa_sim.local.conf 设置 ISAACSIM_DIR"
     exit 1
 fi
 
-# 用法: ./run.sh [模式] [实例序号]
-#   模式: 1=PhysX  2=Newton  3=Headless Streaming  q=退出
-#   实例序号仅对 Headless 生效；也可用 FA_SIM_INSTANCE=N
-CLI_MODE="${1:-}"
-CLI_INSTANCE="${2:-}"
-
-is_nonneg_int() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]]
-}
-
-resolve_streaming_instance() {
-    local instance="${FA_SIM_INSTANCE:-0}"
-    if [ -n "${CLI_INSTANCE}" ]; then
-        instance="${CLI_INSTANCE}"
-    elif [ -z "${CLI_MODE}" ]; then
-        read -r -p "Headless 实例序号 FA_SIM_INSTANCE [${instance}]: " instance_input
-        if [ -n "${instance_input}" ]; then
-            instance="${instance_input}"
-        fi
-    fi
-    if ! is_nonneg_int "${instance}"; then
-        print_error "实例序号必须是非负整数，当前: ${instance}"
-        exit 1
-    fi
-    FA_SIM_INSTANCE="${instance}"
-}
-
-apply_streaming_isolation() {
-    local signal_port stream_port domain_id
-    signal_port=$((STREAM_SIGNAL_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
-    stream_port=$((STREAM_STREAM_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
-    domain_id=$((ROS_DOMAIN_ID_BASE + FA_SIM_INSTANCE))
-
-    if [ "${domain_id}" -gt 232 ]; then
-        print_error "ROS_DOMAIN_ID=${domain_id} 超出有效范围 0–232（BASE=${ROS_DOMAIN_ID_BASE}, INSTANCE=${FA_SIM_INSTANCE}）"
-        exit 1
-    fi
-
-    export ROS_DOMAIN_ID="${domain_id}"
-    STREAM_SIGNAL_PORT="${signal_port}"
-    STREAM_STREAM_PORT="${stream_port}"
-
-    print_info "Headless 多实例隔离已应用:"
-    print_info "  FA_SIM_INSTANCE=${FA_SIM_INSTANCE}"
-    print_info "  livestream signalPort(TCP)=${STREAM_SIGNAL_PORT}"
-    print_info "  livestream streamPort(UDP)=${STREAM_STREAM_PORT}"
-    print_info "  ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"
-}
-
-if [ -z "${CLI_MODE}" ]; then
-    echo ""
-    echo "请选择 Isaac Sim 启动模式"
-    echo
-    echo "  [启动]"
-    echo "    1) 正常启动 PhysX (${ISAACSIM_LAUNCH_NORMAL})"
-    echo "    2) Newton 物理引擎 (${ISAACSIM_LAUNCH_NEWTON})"
-    echo "    3) Headless Streaming (${ISAACSIM_LAUNCH_STREAMING}，仅仿真，不启动控制)"
-    echo "       多实例: 端口/ROS_DOMAIN_ID 按 FA_SIM_INSTANCE 累加"
-    echo
-    echo "  [其他]"
-    echo "    q) 退出"
-    echo
-    read -r -p "输入选项 [1-3/q]: " isaac_mode
-else
-    isaac_mode="${CLI_MODE}"
+_ros_distro="${ROS_DISTRO:-jazzy}"
+_isaac_ros2_lib="${ISAACSIM_DIR}/exts/isaacsim.ros2.core/${_ros_distro}/lib"
+if [ -d "${_isaac_ros2_lib}" ]; then
+    export LD_LIBRARY_PATH="${_isaac_ros2_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    print_info "已加入 Isaac ROS2 lib: ${_isaac_ros2_lib}"
 fi
+
+sanitize_host_ros_paths_for_isaac
+apply_asset_region_profile
+build_isaac_excluded_ext_args
+if [ "${#ISAAC_EXCLUDED_EXTS[@]}" -gt 0 ]; then
+    print_info "禁用冲突扩展: ${ISAAC_EXCLUDED_EXTS[*]}"
+fi
+build_isaac_setting_args
+if [ "${#ISAAC_KIT_PROFILE_SETTINGS[@]}" -gt 0 ]; then
+    print_info "Kit 预设档位: ${RUN_KIT_PROFILE} -> ${ISAAC_KIT_PROFILE_SETTINGS[*]}"
+fi
+if [ "${#ISAAC_KIT_SETTINGS[@]}" -gt 0 ]; then
+    print_info "Kit 手工覆盖: ${ISAAC_KIT_SETTINGS[*]}"
+fi
+enable_crash_debug
+print_info "kit 额外参数: ${ISAAC_KIT_EXTRA_ARGS[*]:-无}"
 
 cd "${ISAACSIM_DIR}" || { print_error "无法进入目录: ${ISAACSIM_DIR}"; exit 1; }
 
-case "${isaac_mode:-1}" in
-    1)
-        if [ ! -x "./${ISAACSIM_LAUNCH_NORMAL}" ]; then
-            print_error "未找到可执行文件 ${ISAACSIM_DIR}/${ISAACSIM_LAUNCH_NORMAL}"
-            exit 1
+if [ "$HEADLESS" -eq 1 ]; then
+    if [ "${RUN_PHYSICS_BACKEND}" = "newton" ]; then
+        launch_bin="${ISAACSIM_LAUNCH_NEWTON_STREAMING:-isaac-sim.newton.streaming.sh}"
+        launch_label="Headless Streaming / Newton"
+    else
+        launch_bin="${ISAACSIM_LAUNCH_STREAMING}"
+        launch_label="Headless Streaming / PhysX"
+    fi
+    if [ ! -x "./${launch_bin}" ]; then
+        print_error "未找到 ${ISAACSIM_DIR}/${launch_bin}"
+        if [ "${RUN_PHYSICS_BACKEND}" = "newton" ]; then
+            print_info "Newton headless 通常随 Isaac Sim 6.x 提供（isaac-sim.newton.streaming.sh）"
         fi
-        print_info "启动 Isaac Sim（正常 / PhysX）..."
-        "./${ISAACSIM_LAUNCH_NORMAL}"
-        ;;
-    2)
-        if [ ! -x "./${ISAACSIM_LAUNCH_NEWTON}" ]; then
-            print_error "未找到可执行文件 ${ISAACSIM_DIR}/${ISAACSIM_LAUNCH_NEWTON}"
-            print_info "Newton 启动脚本通常随 Isaac Sim 6.0+ 提供，请确认安装版本。"
-            exit 1
-        fi
-        print_info "启动 Isaac Sim（Newton 物理引擎）..."
-        "./${ISAACSIM_LAUNCH_NEWTON}"
-        ;;
-    3)
-        if [ ! -x "./${ISAACSIM_LAUNCH_STREAMING}" ]; then
-            print_error "未找到可执行文件 ${ISAACSIM_DIR}/${ISAACSIM_LAUNCH_STREAMING}，请确认脚本存在且有执行权限。"
-            exit 1
-        fi
-        resolve_streaming_instance
-        apply_streaming_isolation
-        print_info "启动 Isaac Sim（Headless Streaming 模式）..."
-        "./${ISAACSIM_LAUNCH_STREAMING}" \
-            --/exts/omni.kit.livestream.app/primaryStream/signalPort="${STREAM_SIGNAL_PORT}" \
-            --/exts/omni.kit.livestream.app/primaryStream/streamPort="${STREAM_STREAM_PORT}"
-        ;;
-    q|Q)
-        echo "已退出。"
-        exit 0
-        ;;
-    *)
-        print_error "无效选项: ${isaac_mode}"
-        print_info "用法: ./run.sh [1|2|3|q] [FA_SIM_INSTANCE]"
         exit 1
-        ;;
-esac
+    fi
+    apply_streaming_isolation
+    print_info "启动 Isaac Sim（${launch_label}）..."
+    "./${launch_bin}" \
+        --/exts/omni.kit.livestream.app/primaryStream/signalPort="${STREAM_SIGNAL_PORT}" \
+        --/exts/omni.kit.livestream.app/primaryStream/streamPort="${STREAM_STREAM_PORT}" \
+        "${ISAAC_KIT_EXTRA_ARGS[@]}"
+elif [ "${RUN_PHYSICS_BACKEND}" = "newton" ]; then
+    if [ ! -x "./${ISAACSIM_LAUNCH_NEWTON}" ]; then
+        print_error "未找到 ${ISAACSIM_DIR}/${ISAACSIM_LAUNCH_NEWTON}"
+        print_info "Newton 通常随 Isaac Sim 6.0+ 提供"
+        exit 1
+    fi
+    print_info "启动 Isaac Sim（Newton）..."
+    "./${ISAACSIM_LAUNCH_NEWTON}" "${ISAAC_KIT_EXTRA_ARGS[@]}"
+else
+    if [ ! -x "./${ISAACSIM_LAUNCH_NORMAL}" ]; then
+        print_error "未找到 ${ISAACSIM_DIR}/${ISAACSIM_LAUNCH_NORMAL}"
+        exit 1
+    fi
+    print_info "启动 Isaac Sim（PhysX / 普通）..."
+    "./${ISAACSIM_LAUNCH_NORMAL}" "${ISAAC_KIT_EXTRA_ARGS[@]}"
+fi

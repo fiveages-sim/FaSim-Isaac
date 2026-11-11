@@ -1,0 +1,22 @@
+[package]
+version = "0.1.1"
+category = "Simulation"
+title = "FaSim ROS 2 Control / Navigation Launch"
+description = "OmniGraph nodes that bring up Isaac's in-process ControllerManager (ROS2ControlLaunch) and host Nav2 (NavigationLaunch)."
+authors = ["FiveAges"]
+keywords = ["isaac", "omnigraph", "ros2", "ros2_control"]
+
+[dependencies]
+"omni.graph" = {}
+"omni.graph.core" = {}
+"omni.graph.tools" = {}
+"omni.timeline" = {}
+"isaacsim.ros2.core" = {}
+"isaacsim.ros2.control" = {}
+
+[[python.module]]
+name = "fasim.ros2.nodes"
+
+[fswatcher.patterns]
+include = ["*.ogn", "*.py"]
+exclude = ["Ogn*Database.py"]

@@ -99,6 +99,46 @@ Error: `failed to find internal joint object for PhysxMimicJointAPI`
 - Do not change EE / load gripper while Play is running after Assembler has merged articulations.
 - Finish assembly with EE selected (or stop → set EE → Play).
 
+### EE ArtRoot + Mimic merge (Dex1 / AG2F90)
+
+PhysX schema: `UsdPhysics: Nested articulation roots are not allowed.`
+FaSim CM: `contains N ArticulationRootAPI prims; … one ROS2ControlManager node per articulation root.`
+
+**Asset (preferred):**
+
+```usda
+def PhysicsFixedJoint "root_joint" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI", "NewtonArticulationRootAPI"]
+) { /* body0=EE xform, body1=gripper_base */ }
+
+over "gripper_base" (  /* or dex1_base_link */
+    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]  /* no ArtRoot here */
+) { }
+```
+
+**Mount:**
+
+```usda
+over "root_joint" ( active = false ) {}
+def PhysicsFixedJoint "AssemblerFixedJoint" {
+    rel physics:body0 = </Robot/.../wrist_or_linkN>   /* must be RigidBody */
+    rel physics:body1 = </Robot/.../tcp/EE/gripper_base>
+    point3f physics:localPos0 = /* tcp translate in body0 frame */
+}
+```
+
+| Wrong | Symptom |
+|-------|---------|
+| ArtRoot on `*_base_link`, kept under robot | Nested ArtRoot / CM multi-root |
+| ArtRoot deleted on base, no merge / `body0=tcp` | Mimic not in articulation → tensors invalidate → arm scatter |
+| `delete apiSchemas` ArtRoot on `root_joint` | Child joints vanish / CreateJoint no bodies |
+| `localPos0` ≠ mount TF | disjointed snap → cascade invalidate |
+| EE variant change on Play | finger prim deleted while in tensor view |
+
+Refs: `grippers/Unitree/Dex1/payloads/Physics/physics.usda`,
+`grippers/ChangingTek/AG2F90/…`, G1D `payloads/EE_*/dex1.usda`,
+`fasim-ros2-control-launch` §2.1.
+
 ---
 
 ## VariantSwitcher skip / sticky Physics
@@ -124,7 +164,7 @@ After renaming variant **options**, update env selections or components never lo
 |------|-------------------|
 | One root | Parent `PhysicsArticulationRootAPI` (chassis `base_link` or composite root) |
 | Chassis child root | Delete ArticulationRoot on the prim that **has** it (SteerChassis `base_link`; Tracer child root). Galaxea: `PhysicsArticulationRootAPI` only |
-| Arm / EE child root | `root_joint` `active = false` **only** — do not delete ArticulationRoot APIs |
+| Arm / EE child root | ArtRoot on `root_joint` (not base link); mount `active = false` **only** — do not delete ArtRoot APIs on `root_joint` |
 | `robotJoints` | Includes chassis + arms + **active** gripper joints under merged tree |
 | Controller target | Nested chassis `ArticulationController.targetPrim` → **parent root** (merged DOFs) |
 | Odometry | Nested `ComputeOdometry.chassisPrim` → parent `base_footprint` / `base_link` |
@@ -293,7 +333,7 @@ Do not copy Revo2 identity onto Revo1 (stays palm-down). Flange visual is a **tc
 ```python
 from pxr import Usd, Sdf
 assert Sdf.Layer.FindOrOpen(".../payloads/Chassis/tracer_v1.usda")
-stage = Usd.Stage.Open(".../env/empty.usda")
+stage = Usd.Stage.Open(".../scene/empty.usda")
 root = stage.GetPrimAtPath("/World/ARX_LIFT2S")
 root.GetVariantSets().GetVariantSet("Physics").SetVariantSelection("physx")
 # Assert nested AC_One_Base / Arm_* / Gripper_* / omnia_150 Physics == "physx"

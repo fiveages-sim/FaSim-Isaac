@@ -10,3 +10,6 @@
 [submodule "environment/artvip-usd"]
 	path = environment/artvip-usd
 	url = git@github.com:fiveages-sim/artvip-usd.git
+[submodule "environment/labutopia-usd"]
+	path = environment/labutopia-usd
+	url = git@github.com:fiveages-sim/labutopia-usd.git

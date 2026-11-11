@@ -1,0 +1,123 @@
+{
+    "fasim.ros2.nodes.NavigationLaunch": {
+        "version": 1,
+        "language": "python",
+        "scheduling": ["compute-on-request"],
+        "description": "Starts Nav2 as a host `ros2 launch` on Play. The map (and optional Nav2 params) are USD asset paths, so each fa-project-usd project keeps its own map next to its USD files.",
+        "uiName": "FaSim Navigation Launch",
+        "inputs": {
+            "execIn": {
+                "type": "execution",
+                "description": "Playback tick. Launch runs once after Play."
+            },
+            "enabled": {
+                "type": "bool",
+                "default": false,
+                "description": "Scene opt-in. false = no Nav2 (default for scenes that do not navigate)."
+            },
+            "targetPrim": {
+                "type": "target",
+                "description": "Robot root prim (used to read the Robot variant when `robot` is empty). Optional: set `robot` explicitly to skip."
+            },
+            "map": {
+                "type": "string",
+                "default": "",
+                "description": "map_server YAML or a map directory. Relative paths resolve against the opened env layer, e.g. ../../maps/german_poc/map.yaml. Empty: the launch file's default map."
+            },
+            "paramsFile": {
+                "type": "string",
+                "default": "",
+                "description": "Optional project-level Nav2 parameter YAML (highest priority). Relative paths resolve against the opened env layer. Empty: use nav2Profile."
+            },
+            "nav2Profile": {
+                "type": "token",
+                "default": "map_only",
+                "description": "robot_common_launch Nav2 preset when paramsFile is empty.",
+                "metadata": {
+                    "allowedTokens": ["default", "map_only"]
+                }
+            },
+            "robot": {
+                "type": "string",
+                "default": "",
+                "description": "Robot name without _description (e.g. fiveages_w2). Empty: read the Robot variant from targetPrim ancestors."
+            },
+            "scanTopic": {
+                "type": "string",
+                "default": "/scan",
+                "description": "Laser scan topic published by Isaac."
+            },
+            "odomTopic": {
+                "type": "string",
+                "default": "/odom",
+                "description": "Odometry topic (Isaac ground truth)."
+            },
+            "useSimTime": {
+                "type": "bool",
+                "default": true,
+                "description": "Nav2 use_sim_time. Requires /clock (ROS=fiveages publishes it)."
+            },
+            "useRviz": {
+                "type": "bool",
+                "default": false,
+                "description": "Launch nav2_rviz2. Keep off for headless / background Nav2."
+            },
+            "publishMapWorldTf": {
+                "type": "bool",
+                "default": true,
+                "description": "Static identity map->world TF. Requires the map to be drawn in USD world coordinates."
+            },
+            "publishMapOdomTf": {
+                "type": "bool",
+                "default": false,
+                "description": "Static identity map->odom TF. Off by default: odom comes from Isaac GT."
+            },
+            "launchPackage": {
+                "type": "string",
+                "default": "robot_common_launch",
+                "description": "Launch package name."
+            },
+            "launchFile": {
+                "type": "string",
+                "default": "navigation_isaac_gt.launch.py",
+                "description": "Launch file name."
+            },
+            "rosSetup": {
+                "type": "string",
+                "default": "",
+                "description": "Path to ros2_ws install/setup.bash. Empty: derived from AMENT_PREFIX_PATH (first non-/opt/ros install)."
+            },
+            "logFile": {
+                "type": "string",
+                "default": "",
+                "description": "Where Nav2 stdout/stderr goes. Empty: <map dir>/nav2.log, else /tmp/fasim/navigation.log."
+            },
+            "extraArgs": {
+                "type": "string",
+                "default": "",
+                "description": "Extra `key:=value` launch args, space separated. Must be arguments the launch file declares."
+            }
+        },
+        "outputs": {
+            "execOut": {
+                "type": "execution",
+                "description": "Fires once Nav2 has started (or immediately when disabled)."
+            },
+            "command": {
+                "type": "string",
+                "description": "Resolved `ros2 launch ...` command line, for debugging."
+            },
+            "logPath": {
+                "type": "string",
+                "description": "Path Nav2 is logging to."
+            }
+        },
+        "state": {
+            "configured": {
+                "type": "bool",
+                "default": false,
+                "description": "True after a successful launch. Stop clears it and relaunches on the next Play."
+            }
+        }
+    }
+}

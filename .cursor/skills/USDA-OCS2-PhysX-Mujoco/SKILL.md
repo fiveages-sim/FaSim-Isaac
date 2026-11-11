@@ -107,7 +107,20 @@ over "base_link" (
 }
 ```
 
-**Arms / EE** — `over "root_joint" ( active = false )` **only**. Do **not** `delete apiSchemas` ArticulationRoot on the arm `root_joint` (that dropped child joints / `CreateJoint - no bodies`).
+**Arms / EE** — `over "root_joint" ( active = false )` **only**. Do **not** `delete apiSchemas` ArticulationRoot on the arm/EE `root_joint` (that dropped child joints / `CreateJoint - no bodies`).
+
+### EE ArtRoot placement (critical)
+
+PhysX: **no nested ArticulationRoots**. One live root under the robot.
+
+| Put ArtRoot on | Standalone | Nested under arm/humanoid |
+|----------------|------------|---------------------------|
+| `root_joint` (AG2F90 / Dex1) | OK | Mount `active=false` → child root gone; `AssemblerFixedJoint` merges Mimic DOFs into parent |
+| gripper `*_base_link` RB (legacy) | OK | **Illegal nested root** if kept; if deleted without merge → Mimic “not part of an articulation” → tensors die → arms scatter |
+
+New gripper assets: ArtRoot (+ NewtonArticulationRoot) on **`root_joint`**, base link = RB + mass only.
+Mount weld: `body0` = parent **RigidBody** (wrist/link), not Xform-only `tcp`; `localPos0` = tcp offset in that RB.
+Full traps / G1D Dex1: project skill **`fasim-ros2-control-launch` §2.1**.
 
 ---
 
@@ -214,8 +227,9 @@ variantSet "Physics" = {
 Typical stack:
 
 - Isaac OmniGraph: `ROS2SubscribeJointState` → `IsaacArticulationController` on the **merged** articulation prim (parent root / chassis `base_link`).
+- In-process CM: FaSim `ROS2ControlLaunch` (`OgnROS2ControlLaunch` + `emit_control`) — ArtRoot/`targetPrim`, synth URDF dedupe, ATM/VR frames: project skill **`fasim-ros2-control-launch`**.
 - Publish `joint_states` via `IsaacReadJointState`.
-- Host: `topic_based_ros2_control` + `ocs2_arm_controller` + `adaptive_gripper_controller`.
+- Host: `topic_based_ros2_control` + `ocs2_arm_controller` + `adaptive_gripper_controller` (or Isaac in-process CM via the node above).
 - Nested chassis `cmd_vel` graphs: retarget + author `jointNames` — see [reference.md](reference.md) § Nested chassis ROS / DiffDrive.
 
 Gripper AdaptiveGripperController:
@@ -248,6 +262,7 @@ Play checklist:
 ## Additional resources
 
 - [reference.md](reference.md) — gripper PhysX/OCS2, DiffDrive, 4WS cmd_vel, steer PD, nested chassis ROS, optical Camera, Piper Revo EE, USDA `delete …connect` parse trap, VariantSwitcher
+- Project skill `fasim-ros2-control-launch` — in-process ROS2ControlLaunch, synth URDF, ATM/VR `target_manager.yaml`, G1/G1D ArtRoot/Assembler traps
 - Project skill `fasim-urdf-isaac-import` — official `urdf_import.py` playbook (`visuals/`+`collisions/`, materials, Zerith DiffDrive/casters)
 - Project notes: `Isaac-Intern-Folder/LunarBot/notes/URDF-to-USD-USDA.md`
 - NVIDIA: [Asset Structure](https://docs.isaacsim.omniverse.nvidia.com/latest/robot_setup/asset_structure.html)

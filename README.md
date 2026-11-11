@@ -52,24 +52,38 @@ cd FaSim-Isaac
 
 可选 Isaac Sim 版本（菜单会查询 GitHub 最新 3 个稳定 tag，失败则回退 `config/fa_sim.conf`），下载对应 ROS workspaces，提取 `jazzy_ws` 到 `isaac_jazzy_ws/`，安装 rosdep / colcon 依赖，构建工作空间并写入 `~/.bashrc`。也可通过环境变量指定：`ISAAC_SIM_VERSION=6.0.1 ./init.sh`
 
-#### 操作 5：安装舵轮控制节点并启用脚本静默
+#### 操作 5：安装 FaSim 扩展并启用脚本静默
 
 只改本机 Isaac 安装目录（默认 `${HOME}/isaacsim`，可用 `ISAACSIM_DIR` 覆盖），不拉子模块、不构建 ROS 工作空间。重装 Isaac 后需要再选一次。正在运行的 Isaac 要重启后才生效。
 
-- **舵轮控制节点**：把 `exts/fasim.steering.nodes` 链到 `extsUser/`，并在 `isaacsim.exp.full.kit` 与 Newton kit 中启用。Linkhou S2_V1 和 Taku 底盘的舵轮控制因此走普通 OmniGraph 节点 `fasim.steering.nodes.SwerveController`，打开场景时不会因为 ScriptNode 把全部 Action Graph 关掉。
-- **脚本静默**：写入 `opt_in = true` 与 `ignoreWarningDialog = true`。前者默认授权仍留在资产里的 ScriptNode，后者跳过 ArtVIP 行为脚本的安全弹窗。
+- **舵轮控制节点**：`exts/fasim.steering.nodes` → `extsUser/`，写入 full / Newton / streaming kit。Linkhou / Taku 用 `SwerveController`，避免 ScriptNode 关掉 Action Graph。
+- **ROS2 Control 节点**：`exts/fasim.ros2.nodes` → `extsUser/`，同上 kit。提供 `ROS2ControlLaunch`（in-process ControllerManager / emit_control，G1D·G1·W2 等）。
+- **ROS / pink 策略**：`./run.sh` 设 `FASIM_FULL_HOST_ROS=1`——保留完整 `/opt/ros` LD+AMENT（workspace 在前），只清 PYTHONPATH，并禁用 `isaacsim.robot_motion.pink*`（与 apt pinocchio/eigenpy 冲突）。原版 `isaac-sim.sh` 仍走强隔离（剥掉 `/opt/ros` LD），好让 pink 示例能开。
+- **脚本静默**：`opt_in = true` 与 `ignoreWarningDialog = true`（授权残留 ScriptNode、跳过 ArtVIP 行为脚本弹窗）。
 
 ### 3. 启动 Isaac Sim
 
 ```bash
-./run.sh
+./run.sh              # 普通 GUI
+./run_headless.sh     # Headless Streaming
 ```
 
-`run.sh` 会依次执行：
+启动时先展示已保存的默认配置，再选：
 
-1. 尝试将 CPU 调频设为 performance（默认 `auto`：容器/distrobox 内不 apt 安装；可在 `config/fa_sim.local.conf` 设为 `0` 跳过）
-2. 若环境变量 `RMW_IMPLEMENTATION=rmw_zenoh_cpp`，自动启动 Zenoh router 并在退出时清理
-3. 选择启动模式：PhysX 正常启动 / Newton 物理引擎 / Headless Streaming
+1. **使用已选默认配置**（直接启动）
+2. **重新选择**：物理引擎 PhysX/Newton、CPU performance、ROS2 工作空间（及 headless 实例号）
+
+重新选择后可写入 `config/fa_sim.local.conf` 作为下次默认。
+
+非交互示例：
+
+```bash
+./run.sh -y --physics physx --cpu auto --ros-ws ~/ros2_ws
+./run_headless.sh -y --physics newton --instance 1   # → isaac-sim.newton.streaming.sh
+./run_headless.sh -y --physics physx --instance 0    # → isaac-sim.streaming.sh
+```
+
+另：若 `RMW_IMPLEMENTATION=rmw_zenoh_cpp`，自动启动 Zenoh router，退出时清理。
 
 ### 配置说明
 
@@ -78,11 +92,11 @@ cd FaSim-Isaac
 | 文件 | 说明 |
 |------|------|
 | `config/fa_sim.conf` | 仓库默认配置（提交 git）：Isaac 路径、版本列表、apt 依赖等 |
-| `config/fa_sim.local.conf` | 本机覆盖（gitignore）：复制 `fa_sim.local.template.conf` 后修改 |
+| `config/fa_sim.local.conf` | 本机覆盖（gitignore）：交互保存或手改 |
 
 ```bash
 cp config/fa_sim.local.template.conf config/fa_sim.local.conf
-# 编辑 ISAACSIM_DIR / ISAAC_SIM_DEFAULT_VERSION 等
+# 编辑 ISAACSIM_DIR / RUN_PHYSICS_BACKEND / RUN_ROS2_WS 等
 ```
 
 ---
@@ -91,13 +105,16 @@ cp config/fa_sim.local.template.conf config/fa_sim.local.conf
 
 ```
 FaSim-Isaac/
-├── init.sh                       # 一键初始化；选项 2 / --update 更新子模块，选项 3 下载官方 ArtVIP，选项 5 安装舵轮控制节点
-├── run.sh                        # Isaac Sim 启动脚本
+├── init.sh                       # 一键初始化；选项 5 安装舵轮 + ROS2 Control 扩展
+├── run.sh                        # Isaac Sim 普通 GUI 启动（交互选配置）
+├── run_headless.sh               # Headless Streaming 入口
 ├── exts/fasim.steering.nodes/    # 舵轮控制 OmniGraph 节点
+├── exts/fasim.ros2.nodes/        # ROS2ControlLaunch / emit_control
 ├── tools/artvip_kitchen.py       # 下载官方 ArtVIP
 ├── config/
 │   ├── fa_sim.conf               # 共用配置（init / run）
 │   └── fa_sim.local.template.conf
+
 ├── submodules_visibility.conf    # 嵌套子模块 public / private 配置
 ├── robots/                       # 机器人 USD 资产（Git 子模块）
 ├── environment/
