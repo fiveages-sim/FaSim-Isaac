@@ -405,6 +405,102 @@ def cmd_diag_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _explain_missing_path(p: Path, want: str = "episode.npz") -> None:
+    """路径不存在时给出可操作的排查提示，而不是干巴巴一句 ERROR。
+
+    实测常见三种错法：
+      1) 给的是**会话目录**而不是 episode.npz  → 提示加 /episode.npz
+      2) 还没有 pack 过                         → 提示先跑 pack
+      3) 路径打错或少了 robot/task 中间层        → 在数据根下搜同名目录并列出
+    """
+    root = runtime.data_root()
+
+    if p.is_dir():
+        ep = p / want
+        if ep.is_file():
+            _log(f"提示: 那是个目录，实际文件是 {ep}")
+            _log(f"      可直接用: {ep}")
+        else:
+            _log(f"提示: {p} 是采集会话目录，但里面还没有 {want}")
+            _log(f"      先跑:  ./scripts/sdg.sh pack {p} --robot <robot_key>")
+            frames = list((p / "frames").glob("frame_*.npz")) \
+                if (p / "frames").is_dir() else []
+            if frames:
+                _log(f"      该会话有 {len(frames)} 帧，可以 pack")
+        return
+
+    # 路径不存在：在数据根下按名字搜（最常见是漏了 <robot>/<task>/ 中间层）
+    name = p.name
+    hits: list[Path] = []
+    if root.is_dir() and name:
+        try:
+            for cand in root.rglob(name):
+                if cand.is_dir() and (cand / want).is_file():
+                    hits.append(cand)
+                elif cand.name == want and cand.is_file():
+                    hits.append(cand.parent)
+                if len(hits) >= 6:
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    # 也搜带 episode.npz 的同名项
+    if not hits and root.is_dir() and name:
+        try:
+            hits = [d for d in root.rglob(f"*{name}*")
+                    if d.is_dir() and (d / want).is_file()][:6]
+        except Exception:  # noqa: BLE001
+            pass
+
+    if hits:
+        _log(f"提示: 数据根目录下有同名会话，你可能是漏了中间的 robot/task 层级:")
+        for h in hits:
+            try:
+                rel = h.relative_to(root)
+            except ValueError:
+                rel = h
+            _log(f"      {rel}")
+        _log(f"      直接用第一个: ./scripts/sdg.sh diag {hits[0] / want}")
+        return
+
+    _log(f"      当前数据根目录: {root}（用 ./scripts/sdg.sh list 看有哪些）")
+    _log("      交互菜单（./scripts/sdg.sh）可直接列表选择，不用手输路径")
+
+
+def _check_episode_path(raw: str) -> Path | None:
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return p
+    _log(f"ERROR episode 不存在: {p}")
+    _explain_missing_path(p)
+    return None
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """列出数据根目录下的采集会话（交互菜单也用它）。"""
+    sessions = runtime.list_sessions(
+        robot=getattr(args, "robot", "") or None,
+        task=getattr(args, "task", "") or None,
+        with_episode_only=bool(getattr(args, "episode_only", False)),
+        limit=int(getattr(args, "limit", 50) or 50),
+    )
+    if not sessions:
+        _log(f"{runtime.data_root()} 下没有采集会话")
+        return 1
+    import time
+
+    print(f"{'会话':24s} {'机器人':16s} {'任务':22s} {'帧':>5s} "
+          f"{'时长':>7s} {'episode':8s} {'相机':>4s}  时间")
+    print("-" * 104)
+    for s in sessions:
+        age = max(0.0, time.time() - s["mtime"])
+        when = time.strftime("%m-%d %H:%M", time.localtime(s["mtime"]))
+        print(f"{s['name']:24s} {s['robot'] or '-':16s} {s['task'] or '-':22s} "
+              f"{s['frames']:5d} {s['duration']:6.1f}s "
+              f"{'有' if s['has_episode'] else '无':8s} {len(s['cameras']):4d}  {when}")
+    print(f"\n数据根目录: {runtime.data_root()}")
+    return 0
+
+
 def cmd_diag(args: argparse.Namespace) -> int:
     """一键体检一个 episode：末端真伪 + 关节口径 + 时间轴 + FK 交叉验证。
 
@@ -425,6 +521,7 @@ def cmd_diag(args: argparse.Namespace) -> int:
     path = Path(args.episode).expanduser().resolve()
     if not path.is_file():
         _log(f"ERROR episode 不存在: {path}")
+        _explain_missing_path(path)
         return 1
     try:
         z = np.load(str(path), allow_pickle=True)
@@ -902,6 +999,7 @@ def cmd_live(args: argparse.Namespace) -> int:
     ep = Path(args.episode).expanduser().resolve()
     if not ep.is_file():
         _log(f"ERROR episode 不存在: {ep}")
+        _explain_missing_path(ep)
         return 1
 
     req = {
@@ -1078,6 +1176,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="查看采集进度").set_defaults(func=cmd_status)
     sub.add_parser("stop", help="结束采集").set_defaults(func=cmd_stop)
     sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
+
+    ls = sub.add_parser("list", help="列出数据根目录下的采集会话")
+    ls.add_argument("--robot", default="", help="只看该机器人")
+    ls.add_argument("--task", default="", help="只看该任务")
+    ls.add_argument("--episode-only", dest="episode_only", action="store_true",
+                    help="只列已 pack 出 episode.npz 的")
+    ls.add_argument("--limit", type=int, default=50)
+    ls.set_defaults(func=cmd_list)
 
     i = sub.add_parser("info", help="看采集会话里有什么")
     i.add_argument("session", help="会话目录，如 ~/fasim_data/.../20261110-1121")

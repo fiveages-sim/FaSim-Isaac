@@ -114,47 +114,59 @@ def ask_yes(prompt: str, default: bool = True) -> bool:
     return ans in ("y", "yes", "是")
 
 
-def pick(title: str, options: list[tuple[str, str]], default_idx: int = 1) -> str:
+BACK = "<<back>>"
+
+
+def pick(title: str, options: list[tuple[str, str]], default_idx: int = 1,
+         allow_back: bool = False) -> str:
     """options: [(value, 显示文本)]。返回 value。
 
-    除了序号，也接受直接输入 value（如 ``quit``）—— 交互时手快更顺手。
+    除了序号，也接受直接输入 value（如 ``quit``）。``allow_back`` 时追加一项
+    「返回」，返回 ``BACK`` 哨兵值 —— 子菜单用它回上一级，不用 Ctrl+C 打断。
     """
     if not options:
         raise SystemExit(f"[menu] ERROR {title}: 没有可选项")
+    opts = list(options)
+    if allow_back:
+        opts.append((BACK, "返回上一级"))
     print(f"\n{_c(title, BOLD)}")
-    for i, (_v, desc) in enumerate(options, 1):
-        mark = _c("  (上次)", DIM) if i == default_idx else ""
+    for i, (_v, desc) in enumerate(opts, 1):
+        mark = _c("  (上次)", DIM) if i == default_idx and not (
+            allow_back and i == len(opts)) else ""
         print(f"  {i}) {desc}{mark}")
-    vals = [v for v, _ in options]
+    vals = [v for v, _ in opts]
     while True:
         ans = ask("选择", str(default_idx))
-        if ans.isdigit() and 1 <= int(ans) <= len(options):
-            return options[int(ans) - 1][0]
+        if ans.isdigit() and 1 <= int(ans) <= len(opts):
+            return opts[int(ans) - 1][0]
         if ans in vals:
             return ans
-        # 常见退出别名
         if ans.lower() in ("q", "quit", "exit"):
             return "quit" if "quit" in vals else vals[-1]
-        _log(f"无效选择 {ans!r}（可输序号或 {vals[:3]}…）")
+        if allow_back and ans.lower() in ("b", "back", "..", ""):
+            return BACK
+        _log(f"无效选择 {ans!r}（可输序号或 {vals[:3]}…"
+             + ("，b=返回" if allow_back else "") + "）")
 
 
 def pick_multi(title: str, options: list[tuple[str, str]],
                default: list[str] | None = None) -> list[str]:
-    """多选。输入如 ``1,3`` 或回车=默认。"""
+    """多选。输入如 ``1,3`` 或回车=上次选的那几项。"""
     print(f"\n{_c(title, BOLD)}")
-    for i, (_v, desc) in enumerate(options, 1):
-        mark = _c("  (上次)", DIM) if default and _v in default else ""
+    dflt = [v for v, _ in options] if default is None else [
+        v for v, _ in options if v in default] or [v for v, _ in options]
+    for i, (v, desc) in enumerate(options, 1):
+        mark = _c("  ✓", GREEN) if v in dflt else ""
         print(f"  {i}) {desc}{mark}")
-    d = ",".join(str(i + 1) for i, (v, _) in enumerate(options)
-                 if default and v in default) or "全部"
-    ans = ask("选择（逗号分隔，回车=默认）", d)
+    d = ",".join(str(i + 1) for i, (v, _) in enumerate(options) if v in dflt)
+    ans = ask("选择（逗号分隔，回车=用 ✓ 的项）", d)
     if ans.strip().lower() in ("", "全部", "all"):
-        return [v for v, _ in options]
+        return dflt
     idx: list[int] = []
     for tok in ans.replace(" ", "").split(","):
         if tok.isdigit() and 1 <= int(tok) <= len(options):
             idx.append(int(tok) - 1)
-    return [options[i][0] for i in idx] or [v for v, _ in options]
+    return [options[i][0] for i in idx] or dflt
 
 
 def run(cmd: list[str]) -> int:
@@ -165,6 +177,90 @@ def run(cmd: list[str]) -> int:
     except KeyboardInterrupt:
         print()
         return 130
+
+
+def _fmt_age(mtime: float) -> str:
+    import time
+
+    d = max(0.0, time.time() - mtime)
+    if d < 3600:
+        return f"{d/60:.0f}分钟前"
+    if d < 86400:
+        return f"{d/3600:.0f}小时前"
+    return f"{d/86400:.0f}天前"
+
+
+def pick_session(
+    state: dict,
+    robot: str,
+    task: str,
+    *,
+    need_episode: bool = False,
+    kind: str = "会话",
+) -> Path | None:
+    """从数据根目录列出已有会话让用户选，而不是手输路径。
+
+    手输路径最容易出错（``run_01`` vs ``run_1``），而且用户通常记不住完整
+    路径。这里直接扫 ``data_root()`` 下的 ``session.json``，带帧数/时间/
+    是否已 pack。也支持手输路径（列表里没有的，比如挂在别的盘）。
+
+    Args:
+        need_episode: True 时只列已 pack 出 ``episode.npz`` 的会话，
+            并在标题里说明依赖（pack 之前不能 diag/fk-diag）。
+        kind: 标题用词（``会话`` / ``episode``）。
+
+    Returns:
+        选中的路径；用户选「返回」或没有候选时返回 ``None``。
+    """
+    with_ep = need_episode
+    sessions = runtime.list_sessions(robot=robot or None, task=task or None,
+                                     with_episode_only=with_ep, limit=40)
+    last = state.get("last_session", "")
+
+    def _desc(s: dict) -> str:
+        bits = [f"{s['name']:24s}"]
+        bits.append(f"{s['frames']:4d}帧")
+        if s["duration"]:
+            bits.append(f"{s['duration']:5.1f}s")
+        bits.append("有episode" if s["has_episode"] else "未pack")
+        if s["cameras"]:
+            bits.append(f"{len(s['cameras'])}相机")
+        bits.append(_fmt_age(s["mtime"]))
+        return "  ".join(bits)
+
+    if not sessions:
+        _log(f"数据目录下没有可用{kind}: {runtime.data_root()}")
+        if need_episode:
+            _log("提示：先执行 pack，生成 episode.npz 后再回来")
+        manual = ask("手动输入路径（回车=返回）", "")
+        return Path(manual).expanduser() if manual else None
+
+    opts = [(str(s["path"]), _desc(s)) for s in sessions]
+    opts.append(("__manual__", "手动输入其他路径…"))
+    d_idx = 1
+    for i, (p, _d) in enumerate(opts, 1):
+        if last and p == last:
+            d_idx = i
+            break
+    title = f"选择{kind}"
+    if need_episode:
+        title += f"（只列已 pack 的；共 {len(sessions)} 个）"
+    else:
+        title += f"（共 {len(sessions)} 个，最新在前）"
+    sel = pick(title, opts, d_idx, allow_back=True)
+    if sel == BACK:
+        return None
+    if sel == "__manual__":
+        manual = ask("路径", last or str(runtime.data_root()))
+        p = Path(manual).expanduser()
+        if not p.exists():
+            _log(f"{_c(f'路径不存在: {p}', RED)}")
+            return None
+        return p
+    p = Path(sel)
+    state["last_session"] = sel
+    save_state(state)
+    return p
 
 
 # ---------------------------------------------------------------- 上下文
@@ -239,7 +335,7 @@ def _default_out(robot: str, task: str) -> str:
 
 
 def menu_capture(robot: str, task: str, state: dict) -> None:
-    """采集：只问该问的。"""
+    """采集：只问该问的。每步都能 b 返回上一级。"""
     print(f"\n{_c('=== 采集 ===', BOLD)}")
     all_what = ["camera", "joint", "ee", "object"]
     desc = {
@@ -265,17 +361,29 @@ def menu_capture(robot: str, task: str, state: dict) -> None:
             opts = [(c, c) for c in cams]
             if len(cams) > 1:
                 opts.append(("all", f"全部（{len(cams)} 个）"))
-            camera = pick("选择相机", opts, 1 if len(cams) == 1 else len(opts))
+            camera = pick("选择相机", opts, 1 if len(cams) == 1 else len(opts),
+                          allow_back=True)
+            if camera == BACK:
+                return
+            if camera == "quit":
+                return
 
     every = pick(
         "采集频率（每 N 个物理步采一帧）",
         [("5", "5   约 40fps 仿真时间（最细，开销大）"),
          ("10", "10  约 20fps 仿真时间（推荐）"),
          ("20", "20  约 10fps 仿真时间（省开销）")],
-        2,
+        2, allow_back=True,
     )
+    if every in (BACK, "quit"):
+        return
 
-    out = ask("输出目录", _default_out(robot, task) + "/" + _suggest_name())
+    base = _default_out(robot, task)
+    suggest = f"{base}/{_suggest_name(base)}"
+    print(f"\n{DIM}  数据根目录: {runtime.data_root()}{NC}")
+    out = ask("输出目录（回车=用建议名）", suggest)
+    if out.lower() in ("b", "back"):
+        return
     state["last_out"] = out
 
     args = ["capture", "--robot", robot, "--task", task,
@@ -285,16 +393,17 @@ def menu_capture(robot: str, task: str, state: dict) -> None:
     run([str(SDG_SH)] + args)
 
 
-def _suggest_name() -> str:
-    """建议输出目录名：run_<序号>，取已有最大序号+1。"""
+def _suggest_name(base: str) -> str:
+    """建议输出目录名：run_<序号>，取该 robot/task 下已有最大序号+1。
+
+    只扫本 robot/task 目录（不是全局），避免不同任务互相干扰编号。
+    """
     try:
-        root = runtime.data_root()
-        if root.is_dir():
-            nums = []
-            for p in root.rglob("run_*"):
-                suf = p.name[len("run_"):]
-                if suf.isdigit():
-                    nums.append(int(suf))
+        d = Path(base)
+        if d.is_dir():
+            nums = [int(p.name[4:]) for p in d.iterdir()
+                    if p.is_dir() and p.name.startswith("run_")
+                    and p.name[4:].isdigit()]
             return f"run_{max(nums) + 1:02d}" if nums else "run_01"
     except Exception:  # noqa: BLE001
         pass
@@ -302,55 +411,100 @@ def _suggest_name() -> str:
 
 
 def menu_tools(robot: str, task: str, state: dict) -> None:
-    """转数据：pack / trim / shots / diag / fk-diag。"""
-    print(f"\n{_c('=== 数据工具 ===', BOLD)}")
-    tool = pick(
-        "选择工具",
-        [
-            ("pack", "pack      采集会话 → episode.npz（含末端指令位姿反算）"),
-            ("shots", "shots     相机联络图（人工检查 RGB）"),
-            ("diag", "diag      一键体检 episode（7 项）"),
-            ("fkdiag", "fk-diag   回放体检（回放 vs 编排，mm 级 + 方向）"),
-            ("trim", "trim      切成任务片段（剔除待机段）"),
-            ("info", "info      看会话里有什么"),
-        ],
-        1,
-    )
-    if tool == "fkdiag":
-        ep = ask("回放记录路径（*.replay_fN.npz）")
-        src = ask("原始 episode（可留空）")
-        args = ["fk-diag", ep] + (["--source", src] if src else [])
-        run([str(SDG_SH)] + args)
-        return
+    """转数据：pack / shots / diag / fk-diag / trim / info。
 
-    sess = ask("会话/episode 路径", state.get("last_session", ""))
-    if not sess:
-        _log("需要路径（会话目录或 episode.npz）")
-        return
-    state["last_session"] = sess
-    save_state(state)
+    流程有顺序：**采集 → pack → diag/shots/trim**。
+    diag 要 episode.npz，所以这里只列已 pack 的会话，并在没 pack 过时明确
+    提示先 pack —— 而不是让用户对着 "episode 不存在" 猜。
+    """
+    while True:
+        print(f"\n{_c('=== 数据工具 ===', BOLD)}")
+        if state.get("_tools_hint", True):
+            print(f"{DIM}  顺序: 采集 → pack（生成 episode.npz）→ diag / shots / trim"
+                  f"{NC}")
+        tool = pick(
+            "选择工具",
+            [
+                ("pack", "pack      采集会话 → episode.npz（含末端指令位姿反算）"),
+                ("shots", "shots     相机联络图（人工检查 RGB）"),
+                ("diag", "diag      一键体检 episode（7 项，需先 pack）"),
+                ("fkdiag", "fk-diag   回放体检（回放 vs 编排，需先 live 回放）"),
+                ("trim", "trim      切成任务片段（剔除待机段，需先 pack）"),
+                ("info", "info      看会话里有什么（不需要 pack）"),
+            ],
+            1, allow_back=True,
+        )
+        if tool == BACK or tool == "quit":
+            return
 
-    if tool == "pack":
-        run([str(SDG_SH), "pack", sess, "--robot", robot])
-    elif tool == "shots":
-        seg = ask_yes("只看任务段（自动剔除待机）", True)
-        run([str(SDG_SH), "shots", sess] + (["--segment"] if seg else []))
-    elif tool == "diag":
-        run([str(SDG_SH), "diag", sess])
-    elif tool == "trim":
-        run([str(SDG_SH), "trim", sess])
-    elif tool == "info":
-        run([str(SDG_SH), "info", sess])
+        if tool == "fkdiag":
+            rec = ask("回放记录路径（*.replay_fN.npz，live 回放后生成，回车=返回）", "")
+            if not rec:
+                continue
+            rp = Path(rec).expanduser()
+            if not rp.is_file():
+                _log(f"{_c(f'找不到文件: {rp}', RED)}")
+                _log("提示：先跑 live 回放，结束时会在 episode 同目录生成 "
+                     "<episode>.replay_f0.npz")
+                continue
+            src = ask("原始 episode（可留空；给了才能算「回放 vs 编排」）", "")
+            args = ["fk-diag", str(rp)] + (["--source", src] if src else [])
+            run([str(SDG_SH)] + args)
+            continue
+
+        # 需要 episode 的工具：只列已 pack 的会话
+        need_ep = tool in ("diag", "trim")
+        sess = pick_session(
+            state, robot, task,
+            need_episode=need_ep,
+            kind="episode" if need_ep else "会话",
+        )
+        if sess is None:
+            continue
+        if not sess.exists():
+            _log(f"{_c(f'路径不存在: {sess}', RED)}")
+            continue
+
+        # 目录给成 episode.npz（diag/fk-diag 要文件）
+        target = sess
+        if need_ep and sess.is_dir():
+            ep = sess / "episode.npz"
+            if not ep.is_file():
+                _log(f"{_c('该会话还没有 episode.npz —— 先跑 pack', YELLOW)}")
+                if ask_yes("现在就 pack 它", True):
+                    run([str(SDG_SH), "pack", str(sess), "--robot", robot])
+                    if not ep.is_file():
+                        continue
+                else:
+                    continue
+            target = ep
+        state["last_session"] = str(sess)
+        save_state(state)
+
+        if tool == "pack":
+            run([str(SDG_SH), "pack", str(sess), "--robot", robot])
+        elif tool == "shots":
+            seg = ask_yes("只看任务段（自动剔除待机）", True)
+            run([str(SDG_SH), "shots", str(sess)] + (["--segment"] if seg else []))
+        elif tool == "diag":
+            run([str(SDG_SH), "diag", str(target)])
+        elif tool == "trim":
+            run([str(SDG_SH), "trim", str(target)])
+        elif tool == "info":
+            run([str(SDG_SH), "info", str(sess)])
 
 
 def menu_replay(robot: str, task: str, state: dict) -> None:
     """回放：关节 / 末端。"""
-    print(f"\n{_c('=== 回放 ===', BOLD)}")
-    ep = ask("episode.npz 路径", state.get("last_episode", ""))
-    if not ep:
-        _log("需要 episode 路径（先跑 pack）")
+    ep = pick_session(state, robot, task, need_episode=True, kind="episode")
+    if ep is None:
         return
-    state["last_episode"] = ep
+    if ep.is_dir():
+        ep = ep / "episode.npz"
+    if not ep.is_file():
+        _log(f"{_c(f'找不到 {ep}', RED)}")
+        return
+    state["last_episode"] = str(ep)
     save_state(state)
 
     drive = pick(
@@ -359,8 +513,11 @@ def menu_replay(robot: str, task: str, state: dict) -> None:
             ("joints", "joints  逐帧驱关节（纯 Isaac，不需要运控）"),
             ("ee", "ee      末端位姿发运控（需运控在跑，会锁底盘+切 FSM）"),
         ],
-        1,
+        1, allow_back=True,
     )
+    if drive == BACK or drive == "quit":
+        return
+
     if drive == "joints":
         src = pick(
             "关节角来源",
@@ -368,11 +525,17 @@ def menu_replay(robot: str, task: str, state: dict) -> None:
                 ("cmd", "cmd     下发目标（推荐，与编排一致）"),
                 ("actual", "actual  实测值（会多偏一次稳态误差，仅对照用）"),
             ],
-            1,
+            1, allow_back=True,
         )
-        run([str(SDG_SH), "live", ep, "--drive", "joints", "--joint-src", src, "--wait"])
+        if src == BACK or src == "quit":
+            return
+        run([str(SDG_SH), "live", str(ep), "--robot", robot, "--task", task,
+             "--drive", "joints", "--joint-src", src, "--wait"])
     else:
-        run([str(SDG_SH), "live", ep, "--drive", "ee", "--wait"])
+        if not ask_yes("确认运控已在跑，且 FSM 可切到 OCS2", True):
+            return
+        run([str(SDG_SH), "live", str(ep), "--robot", robot, "--task", task,
+             "--drive", "ee", "--wait"])
 
 
 def menu_selfcheck(robot: str, task: str, state: dict) -> None:
@@ -414,13 +577,15 @@ def main() -> int:
 
     robot = state.get("robot")
     task = state.get("task")
-    if not (robot and task) or ask_yes("重新选择机器人/任务", False):
+    if not (robot and task):
         robot, task = choose_context(state)
     else:
         show_context(robot, task)
+        print(f"{DIM}  （要换机器人/任务：主菜单选「切换机器人/任务」）{NC}")
 
     while True:
         print()
+        print(_c("─" * 62, DIM))
         print(_c(f"上下文: {robot} / {task or '（无任务）'}", GREEN))
         hint = {
             "status": "查看采集进度",

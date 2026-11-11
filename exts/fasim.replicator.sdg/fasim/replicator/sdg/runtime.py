@@ -82,3 +82,83 @@ def default_session_dir(robot: str, task: str, name: str = "") -> Path:
 
     stamp = name.strip() or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     return data_root() / robot / task / stamp
+
+
+def list_sessions(
+    robot: str | None = None,
+    task: str | None = None,
+    *,
+    with_episode_only: bool = False,
+    limit: int = 50,
+) -> list[dict]:
+    """扫描数据根目录下的采集会话，供交互菜单/CLI **列表选择**。
+
+    为什么要这个：手输路径既慢又容易打错（``run_01`` 打成 ``run_1``），而且
+    用户通常记不住完整路径。这里直接列目录，带帧数/时间/是否有 episode。
+
+    目录约定（``default_session_dir``）::
+
+        <data_root>/<robot>/<task>/<session_name>/
+            session.json    采集元信息（帧数/相机/robot_key…）
+            frames/         逐帧 npz
+            episode.npz     pack 的产物（可能还没生成）
+
+    非标准位置（如 ``<data_root>/cam03``）也会被收进来 —— 它们没有
+    robot/task 层级，靠 session.json 里的 robot_key/task_key 归属。
+
+    Args:
+        robot/task: 过滤条件；``None`` 表示不限。
+        with_episode_only: 只要已经 pack 出 ``episode.npz`` 的会话。
+        limit: 最多返回多少条（按 mtime 倒序，最新的在前）。
+
+    Returns:
+        每项::
+
+            {"path": Path, "name": str, "robot": str, "task": str,
+             "frames": int, "duration": float, "has_episode": bool,
+             "mtime": float, "cameras": [..]}
+    """
+    import json
+
+    root = data_root()
+    if not root.is_dir():
+        return []
+
+    out: list[dict] = []
+    for sj in root.rglob("session.json"):
+        sess = sj.parent
+        # 跳过 .runtime 之类的隐藏目录
+        if any(p.startswith(".") for p in sess.relative_to(root).parts):
+            continue
+        try:
+            meta = json.loads(sj.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            meta = {}
+        r = str(meta.get("robot_key") or "")
+        t = str(meta.get("task_key") or "")
+        # 没有 robot_key 的老会话：从路径猜 <data>/<robot>/<task>/<name>
+        if not r or not t:
+            rel = sess.relative_to(root).parts
+            if len(rel) >= 3:
+                r, t = (r or rel[0]), (t or rel[1])
+        if robot and r != robot:
+            continue
+        if task and t != task:
+            continue
+        ep = sess / "episode.npz"
+        if with_episode_only and not ep.is_file():
+            continue
+        out.append({
+            "path": sess,
+            "name": sess.name,
+            "robot": r,
+            "task": t,
+            "frames": int(meta.get("frames_saved", 0) or 0),
+            "duration": float(meta.get("duration_sec", 0) or 0),
+            "cameras": [c.get("name") for c in (meta.get("cameras") or [])],
+            "has_episode": ep.is_file(),
+            "mtime": sj.stat().st_mtime,
+        })
+
+    out.sort(key=lambda d: -d["mtime"])
+    return out[:limit]
