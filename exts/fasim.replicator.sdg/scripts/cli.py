@@ -512,6 +512,29 @@ def cmd_diag(args: argparse.Namespace) -> int:
         _log("  注: tcp 是法兰，实际夹持点在指尖前方几厘米，"
              "抓到试管时法兰距中心 10-15cm 属正常")
 
+    # ---- 6) 物体位姿（rigid 读取的健全性） ----
+    objs = sorted(k for k in keys if k.startswith("obj/") and k.endswith("_pos"))
+    if objs:
+        _log("\n[6] 交互物体位姿")
+        for k in objs:
+            label = k[len("obj/"):-len("_pos")]
+            p = np.asarray(z[k], dtype=np.float64)
+            good = np.isfinite(p).all(axis=1)
+            if not good.any():
+                _log(f"  {label}: 全 NaN ❌")
+                verdicts.append((False, f"{label} 位姿全 NaN"))
+                continue
+            travel = float(np.linalg.norm(p[good] - p[good][0], axis=1).max() * 1000)
+            # 架子类应该是静态的（不该被手带走）；试管会被移动
+            static_hint = any(t in label.lower() for t in ("rack", "table", "stand"))
+            if static_hint and travel > 50.0:
+                _log(f"  {label}: travel={travel:.1f}mm  ⚠ 静止物体被移动了")
+                verdicts.append((False, f"{label} 不该移动却动了 {travel:.0f}mm"))
+            else:
+                _log(f"  {label}: travel={travel:.1f}mm  "
+                     f"NaN={int((~good).sum())} 帧  ✅")
+                verdicts.append((True, f"{label} travel={travel:.0f}mm"))
+
     # ---- 总结 ----
     _log("\n" + "=" * 62)
     bad = [r for ok, r in verdicts if not ok]
