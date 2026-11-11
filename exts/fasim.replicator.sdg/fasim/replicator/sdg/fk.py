@@ -416,6 +416,71 @@ def _average_rotation(Rs: list[np.ndarray]) -> np.ndarray:
 # ---------------------------------------------------------------- 离线入口
 
 
+def compute_cmd_poses(
+    episode_path: str | Path,
+    urdf_path: str | Path | None = None,
+    to_world: bool = True,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """从 ``joint_pos_cmd`` 反算**末端指令位姿**。
+
+    为什么需要
+    ----------
+    EE 回放（``drive="ee"``，发 /left_target 给 OCS2）必须发**指令目标**，
+    不能发实测位姿 —— 否则和关节回放踩同一个坑：运控把指令执行一次产生
+    误差 e，末端落在 目标 − e；若目标本身已经是含 e 的实测值，就变成
+    目标 − 2e，手稳定偏下。``ee_traj.py`` 里也是这个逻辑：优先
+    ``*_cmd_pos``，没有才回退实测。
+
+    但采集时拿不到末端指令位姿：
+    - 它是运控内部 MPC 解出来的，Isaac 侧只有关节目标 ``joint_pos_cmd``
+    - ROS 的 ``/left_current_target`` 需要额外订阅（违反"数采走 Isaac 内部"）
+
+    所以用 FK 从 ``joint_pos_cmd`` 算 —— 和运控自己的 ``eeFrame`` 定义同源
+    （同一个 planning URDF），是等价的。
+
+    Args:
+        episode_path: 含 ``joint_pos_cmd`` 的 episode。
+        urdf_path: planning URDF；``None`` → 自动找。
+        to_world: 换算到 world（需要能解 base，用实测末端定）。
+
+    Returns:
+        ``{"left": (pos (N,3), quat_wxyz (N,4)), "right": ...}``。
+
+    Raises:
+        ValueError: episode 没有 ``joint_pos_cmd``。
+    """
+    z = np.load(str(episode_path), allow_pickle=True)
+    if "joint_pos_cmd" not in z.files:
+        raise ValueError(
+            f"{episode_path} 没有 joint_pos_cmd（下发目标关节角）。\n"
+            "  EE 回放必须用指令位姿，不能用实测值 —— 否则末端会多偏一次。\n"
+            "  重新采集：sdg.sh capture --what joint,ee,object"
+        )
+    fk = TcpFK(urdf_path)
+    names = [str(x) for x in z["joint_names"]]
+    q_cmd = np.asarray(z["joint_pos_cmd"], dtype=np.float64)
+
+    if to_world:
+        # base 位姿要用**实测**末端 + 实测关节角解（那才是真实几何）
+        rest = {}
+        restq = {}
+        q_act = np.asarray(z["joint_pos"], dtype=np.float64)
+        for side in fk.ee_frames:
+            if f"{side}_pos" in z.files:
+                rest[side] = z[f"{side}_pos"][0]
+                if f"{side}_quat" in z.files:
+                    restq[side] = z[f"{side}_quat"][0]
+        if rest:
+            # 用实测关节角算 FK base —— 实测末端对应实测关节角
+            fk.solve_base_from_rest(
+                {s: p for s, p in rest.items()},
+                {s: v for s, v in restq.items()} if restq else None,
+            )
+        del q_act
+
+    return fk.tcp_poses(q_cmd, names, to_world=to_world)
+
+
 def analyze_episode(path: str | Path, urdf_path: str | Path | None = None) -> dict:
     """离线体检一个 episode：用 FK 给末端真值，报运动学量。
 

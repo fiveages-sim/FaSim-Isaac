@@ -226,6 +226,47 @@ def pack_episode(
         elif (k.endswith("_pos_xform") or k.endswith("_quat_xform")) and len(v) == n:
             payload[k] = np.stack(v).astype(np.float64)
 
+    # 末端**指令**位姿 —— EE 回放用（见 fk.compute_cmd_poses 的说明）。
+    # 采集时 Isaac 侧拿不到（那是运控 MPC 内部解），所以用 FK 从
+    # joint_pos_cmd 反算，存进 episode 免得每次回放都算一遍。
+    if joint_pos_cmd is not None:
+        try:
+            from .fk import TcpFK
+
+            fk = TcpFK()
+            names = joint_names or [f"j{i}" for i in range(joint_pos.shape[1])]
+            # base 位姿用**实测**末端 + 实测关节角解（真实几何）
+            rest = {}
+            restq = {}
+            for side in fk.ee_frames:
+                pv = payload.get(f"{side}_pos")
+                qv = payload.get(f"{side}_quat")
+                if pv is not None and np.isfinite(np.asarray(pv)).any():
+                    rest[side] = np.asarray(pv)[0]
+                    if qv is not None:
+                        restq[side] = np.asarray(qv)[0]
+            if rest:
+                fk.solve_base_from_rest(rest, restq or None)
+            cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
+            for side, (pos, quat) in cmd_poses.items():
+                payload[f"{side}_cmd_pos"] = pos
+                payload[f"{side}_cmd_quat"] = quat
+            _log("  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算并写入"
+                 "（EE 回放用这个，不会多偏一次）")
+            # 顺带报告指令与实测的差 —— 这就是"手偏低"的量
+            for side in fk.ee_frames:
+                pv = payload.get(f"{side}_pos")
+                if pv is None:
+                    continue
+                d = np.linalg.norm(
+                    np.asarray(pv) - payload[f"{side}_cmd_pos"], axis=1
+                ) * 1000
+                if np.isfinite(d).any():
+                    _log(f"    {side}: 实测比指令低 mean={np.nanmean(d):.1f}mm "
+                         f"max={np.nanmax(d):.1f}mm（物理稳态误差）")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  WARN 反算末端指令位姿失败（EE 回放将回退实测值）: {exc}")
+
     # 下发目标关节角 —— 回放用它。
     if joint_pos_cmd is not None:
         payload["joint_pos_cmd"] = joint_pos_cmd

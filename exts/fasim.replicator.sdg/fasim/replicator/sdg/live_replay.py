@@ -267,6 +267,47 @@ def play_episode(
                 "error": "episode 没有末端位姿（left_pos/right_pos 含 NaN）。"
                          "采集要选 ee：sdg.sh capture --what joint,ee",
             }
+        # **发指令位姿，不发实测位姿**。
+        #
+        # 这是 EE 回放最容易踩的坑，和关节回放的「cmd vs actual」是同一个：
+        # 运控收到目标后自己执行一次，产生稳态误差 e，手落在 目标−e。
+        # 若发的是实测位姿（已含 −e），就变成 目标−2e，手稳定偏下。
+        #
+        # 取指令位姿：优先 episode 里现成的 *_cmd_pos；没有则用 FK 从
+        # joint_pos_cmd 反算（与运控 eeFrame 同源）。
+        ee_pos: dict[str, np.ndarray] = {}
+        ee_quat: dict[str, np.ndarray] = {}
+        try:
+            from .fk import compute_cmd_poses
+
+            need_fk = any(
+                getattr(episode, f"{s}_cmd_pos", None) is None
+                for s in ("left", "right")
+            )
+            fk_cmd = compute_cmd_poses(episode.path) if (need_fk and episode.path) else {}
+            for side in ("left", "right"):
+                cp = getattr(episode, f"{side}_cmd_pos", None)
+                cq = getattr(episode, f"{side}_cmd_quat", None)
+                if cp is not None and cq is not None and np.isfinite(cp).all():
+                    ee_pos[side], ee_quat[side] = np.asarray(cp), np.asarray(cq)
+                    src = "episode *_cmd_pos"
+                elif side in fk_cmd:
+                    ee_pos[side], ee_quat[side] = fk_cmd[side]
+                    src = "FK(joint_pos_cmd)"
+                else:
+                    ee_pos[side] = np.asarray(getattr(episode, f"{side}_pos"))
+                    ee_quat[side] = np.asarray(getattr(episode, f"{side}_quat"))
+                    src = "实测值（会多偏一次！）"
+                _log(f"  末端 {side} 目标来源: {src}")
+            if need_fk and fk_cmd:
+                _log("  提示: 用 FK 从 joint_pos_cmd 反算指令位姿"
+                     "（与运控 eeFrame 同源）")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"WARN 取指令位姿失败（{exc}），回退实测值 —— 末端可能偏下 2-3cm")
+            for side in ("left", "right"):
+                ee_pos[side] = np.asarray(getattr(episode, f"{side}_pos"))
+                ee_quat[side] = np.asarray(getattr(episode, f"{side}_quat"))
+
         try:
             import rclpy
             from geometry_msgs.msg import Pose
@@ -282,6 +323,8 @@ def play_episode(
             pub_r=node.create_publisher(Pose, right_topic, 1),
             mk_pose=_make_pose_factory(Pose),
             last_emit=0.0,
+            ee_pos=ee_pos,
+            ee_quat=ee_quat,
         )
         _log(f"末端驱动 → {left_topic} / {right_topic}，{1/(frame_dt/speed):.1f} Hz")
     else:
@@ -1168,10 +1211,20 @@ def _step_joints(ctx: dict, i: int) -> None:
 
 
 def _step_ee(ctx: dict, i: int) -> None:
-    episode = ctx["episode"]
+    """发**指令位姿**给运控（不是实测位姿）。
+
+    ctx["ee_pos"] / ctx["ee_quat"] 在 play_episode 里已选好来源：
+    episode 的 *_cmd_pos、或由 joint_pos_cmd 经 FK 反算。
+    """
     mk = ctx["mk_pose"]
-    ctx["pub_l"].publish(mk(episode.left_pos[i], episode.left_quat[i]))
-    ctx["pub_r"].publish(mk(episode.right_pos[i], episode.right_quat[i]))
+    pos = ctx.get("ee_pos") or {}
+    quat = ctx.get("ee_quat") or {}
+    for side, pub in (("left", ctx["pub_l"]), ("right", ctx["pub_r"])):
+        p = pos.get(side)
+        q = quat.get(side)
+        if p is None or q is None or i >= len(p):
+            continue
+        pub.publish(mk(p[i], q[i]))
     try:
         ctx["rclpy"].spin_once(ctx["node"], timeout_sec=0.0)
     except Exception:  # noqa: BLE001
