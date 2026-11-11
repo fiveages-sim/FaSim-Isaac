@@ -177,7 +177,8 @@ def pack_episode(
                 qc = np.asarray(z["joint_pos_cmd"], dtype=np.float64).reshape(-1)
                 cols.setdefault("joint_pos_cmd", []).append(qc)
 
-            # 末端 + 物体：<side>_pos/_quat 与 obj/<label>_pos/_quat
+            # 末端 / 物体 / 相机位姿：<side>_pos/_quat、obj/<label>_*、
+            # 以及相机参数 <cam>_K / <cam>_pos / <cam>_quat。
             for k in keys:
                 if k in ("joint_pos", "joint_vel", "joint_names", "joint_pos_cmd"):
                     continue
@@ -190,6 +191,13 @@ def pack_episode(
                     cols.setdefault(k, []).append(
                         np.asarray(z[k], dtype=np.float64).reshape(-1)
                     )
+                # 相机内参 (3,3)。**必须搬**：没有它深度图无法转点云、
+                # 也无法做视觉-状态对齐校验。（原来漏了这一步，导致 diag
+                # 误报「无内参（老数据）」，其实是 pack 没传。）
+                elif k.endswith("_K"):
+                    arr = np.asarray(z[k], dtype=np.float64)
+                    if arr.shape == (3, 3):
+                        cols.setdefault(k, []).append(arr.reshape(-1))
 
     if "joint_pos" not in cols:
         raise ValueError(
@@ -291,6 +299,29 @@ def pack_episode(
         # Xform 对照值一并保留（诊断用，训练时要忽略 *_xform）
         elif (k.endswith("_pos_xform") or k.endswith("_quat_xform")) and len(v) == n:
             payload[k] = np.stack(v).astype(np.float64)
+        # 相机内参 (N, 9) → (N, 3, 3)
+        elif k.endswith("_K") and len(v) == n:
+            st = np.stack(v).astype(np.float64)
+            if st.shape[1:] == (9,):
+                st = st.reshape(n, 3, 3)
+            payload[k] = st
+
+    # 相机世界位姿：<cam>_pos/_quat 与末端 <side>_pos/_quat 同名风格但语义
+    # 不同，为避免和 left/right 混淆，统一加 ``cam/`` 前缀重命名:
+    #     cam/<name>_pos (N,3)   cam/<name>_quat (N,4)
+    # 腕部相机是随手臂动的，所以必须逐帧存，不能只存一份标定值。
+    #
+    # **用 ``<cam>_K`` 判断哪些是相机**，不要靠 ``_pos`` 后缀 —— 那样会把
+    # ``joint_pos`` 也当成相机名（实测会误抓成 cam/joint_pos）。
+    cam_names = sorted(k[: -len("_K")] for k in cols if k.endswith("_K"))
+    for cname in cam_names:
+        pk, qk = f"{cname}_pos", f"{cname}_quat"
+        if pk in cols and len(cols[pk]) == n:
+            payload[f"cam/{cname}_pos"] = np.stack(cols[pk]).astype(np.float64)
+            if qk in cols and len(cols[qk]) == n:
+                payload[f"cam/{cname}_quat"] = np.stack(cols[qk]).astype(np.float64)
+    if cam_names:
+        _log(f"  相机参数: {cam_names}（内参 + 世界位姿，位姿前缀 cam/）")
 
     # 末端**指令**位姿 —— EE 回放用（见 fk.compute_cmd_poses 的说明）。
     #

@@ -166,6 +166,7 @@ def play_episode(
     reset_objects: bool = True,
     task_key: str = "",
     joint_src: str = "cmd",
+    restore_cm: bool = False,
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -265,6 +266,10 @@ def play_episode(
         "robot_key": robot_key,
         "task_key": task_key,
         "reset_objects": bool(reset_objects),
+        # 回放结束后是否把控制权交还运控。默认 False —— 交还很危险
+        # （运控重新激活时关节被猛拉，表现为"机器人突然抽一下"，
+        # 偶尔还会把控制器状态机搞乱）。见 _finish 的说明。
+        "restore_cm": bool(restore_cm),
         "cm_done": True,  # _pause_controllers 会改成 False（异步流程）
     }
 
@@ -1544,15 +1549,25 @@ def _step_ee(ctx: dict, i: int) -> None:
 
 
 def _finish() -> None:
-    """收尾：把关节送回回放前姿态、等稳定、恢复运控、退订、打印统计。
+    """收尾：退订、打印统计。**默认不把控制权还给运控**。
 
-    **顺序很重要**（用户实测验证过）：
-      1. 先把关节恢复到回放前的位置（用 teleport）
-      2. 等物理几帧稳定
-      3. 再激活控制器
+    为什么默认不归还
+    ================
+    原来的做法是「复位关节 → 等稳定 → 恢复运控控制器」。实际使用中这套
+    很危险：
 
-    如果直接恢复控制器，OCS2 的初始状态和当前姿态有偏差 → 关节被猛拉，
-    表现为"回放结束时突然抽动、异常转身"。这个坑之前修运控解决过。
+    - 运控被重新激活时，它的初始状态和当前姿态有偏差 → 关节被猛拉，
+      表现是**机器人突然抽一下**
+    - 偶尔会把仿真环境搞坏（控制器状态机错乱、后续动作全乱）
+
+    而实际工作流是：回放完看一眼结果 → 关掉仿真（环境随之重置）。
+    也就是说「交还运控」没有任何后续使用者，纯粹是风险。
+
+    所以现在默认**停在最后一帧的姿态**，运控保持让出状态。仿真的启停由人
+    负责。需要旧行为时传 ``restore_cm=True``（CLI: ``--restore-cm``）。
+
+    注意 ``_restore_initial_pose`` 也一并跳过 —— 那会把手拉回回放前的位置，
+    正是"停下后动一下"的来源。
     """
     import time
 
@@ -1561,16 +1576,20 @@ def _finish() -> None:
     _STATE["cancel"] = False
     _uninstall_update_hook()
 
-    # 1) 送回原位（在恢复运控之前）
-    _restore_initial_pose(ctx)
-
-    # 2) 等物理稳定。已退出 update 回调链，这里 sleep 是安全的
-    #   （不会重入主循环）。Isaac 自己的循环会推进物理。
-    if ctx.get("paused_controllers"):
-        time.sleep(0.3)
-        _log("姿态已复位，等待物理稳定后交还运控")
-        # 3) 恢复运控
-        _resume_controllers(ctx)
+    restore_cm = bool(ctx.get("restore_cm", False))
+    if restore_cm:
+        # 旧行为：复位 → 等稳定 → 交还运控。保留给需要连续跑多次的场合。
+        _restore_initial_pose(ctx)
+        if ctx.get("paused_controllers"):
+            time.sleep(0.3)
+            _log("姿态已复位，等待物理稳定后交还运控")
+            _resume_controllers(ctx)
+    else:
+        # 默认：什么都不动，就停在最后一帧
+        _log("回放结束：保持当前姿态，未交还运控（仿真请手动关闭/重启）")
+        if ctx.get("paused_controllers"):
+            _log("  运控仍处于让出状态；下次回放前如需运控参与，"
+                 "重启仿真最简单")
 
     if ctx.get("node") is not None:
         try:

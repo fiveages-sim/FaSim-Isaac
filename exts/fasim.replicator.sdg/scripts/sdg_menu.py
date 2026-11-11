@@ -519,6 +519,8 @@ def menu_replay(robot: str, task: str, state: dict) -> None:
     )
     if drive == BACK or drive == "quit":
         return
+    print(f"{DIM}  注: 回放结束后会停在最后一帧，不交还运控"
+          f"（如需要用 --restore-cm）{NC}")
 
     if drive == "joints":
         src = pick(

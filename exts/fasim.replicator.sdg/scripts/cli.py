@@ -798,10 +798,36 @@ def cmd_diag(args: argparse.Namespace) -> int:
                 else:
                     _log("    ✅ 量化检查通过")
                     verdicts.append((True, f"相机 {_cam} 正常"))
-                # 内参（新采集才有）
-                for k in ("_K",):
-                    if f"{_cam}{k}" not in keys:
-                        _log(f"    注: 无内参（老数据）。新采集会写 {_cam}_K/_pos/_quat")
+                # 内参：优先看 episode（pack 会搬），没有就看 frames/ 里的原始帧
+                kk = f"{_cam}_K"
+                if kk in keys:
+                    K = np.asarray(z[kk], dtype=np.float64)
+                    if K.ndim == 3:
+                        K = K[0]
+                    _log(f"    内参: fx={K[0,0]:.2f} fy={K[1,1]:.2f} "
+                         f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}"
+                         + ("  ✅" if abs(K[0, 0] - K[1, 1]) / max(K[0, 0], 1) < 0.02
+                            else "  ⚠ fx/fy 差异大"))
+                    verdicts.append((True, f"相机 {_cam} 内参齐全"))
+                else:
+                    # episode 里没有 —— 可能 pack 版本旧，去看原始帧
+                    f0 = None
+                    fd = frames_dir / "frames" if (frames_dir / "frames").is_dir() else frames_dir
+                    if fd.is_dir():
+                        cand = sorted(fd.glob("frame_*.npz"))
+                        f0 = cand[0] if cand else None
+                    has_in_frame = False
+                    if f0 is not None:
+                        try:
+                            with np.load(str(f0), allow_pickle=False) as zz:
+                                has_in_frame = kk in zz.files
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if has_in_frame:
+                        _log(f"    内参: ⚠ 原始帧里有 {kk}，但 episode 里没有 —— "
+                             f"重新跑 pack 即可搬过来")
+                    else:
+                        _log(f"    内参: 缺失（该会话采集时没记 camera_params）")
         except Exception as exc:  # noqa: BLE001
             _log(f"  跳过（{type(exc).__name__}: {exc}）")
 
@@ -1113,6 +1139,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "joint_api": str(args.joint_api),
         "joint_src": str(args.joint_src),
         "reset_objects": bool(args.reset_objects),
+        "restore_cm": bool(getattr(args, "restore_cm", False)),
     }
     if args.drive == "ee":
         req["left_topic"] = args.left_topic
@@ -1422,6 +1449,13 @@ def main(argv: list[str] | None = None) -> int:
         "目标 joint_pos_cmd —— 与编排一致，末端不会多偏；actual=实测 "
         "joint_pos，会多叠一次稳态误差（手臂前伸时稳定偏下 2-3cm），"
         "仅用于对照复现问题",
+    )
+    lv.add_argument(
+        "--restore-cm", dest="restore_cm", action="store_true", default=False,
+        help="回放结束后把控制权交还运控，并把关节复位到回放前姿态。"
+        "默认**不做**（停在最后一帧）—— 交还时运控重新激活会猛拉关节"
+        "（机器人抽一下），偶尔还会搞坏控制器状态机。"
+        "正常流程是回放完直接关仿真，所以默认关掉。",
     )
     lv.add_argument(
         "--no-reset-objects", dest="reset_objects", action="store_false",
