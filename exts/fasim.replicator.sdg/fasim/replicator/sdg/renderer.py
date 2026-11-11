@@ -188,40 +188,6 @@ def _lock_base(robot_config: Any) -> None:
     _log(f"锁底盘: {base_prim} → PhysicsFixedJoint@{joint_path}")
 
 
-def _measure_app_dt(app: Any, samples: int = 10) -> float:
-    """实测「一次 app.update() 推进多少仿真秒」。
-
-    默认是 16.667 ms（kit player 按 60 Hz 渲染时间推进）。必须实测，
-    不能靠 1/tcps 推算；也不要改成 fixed time stepping：实测那样时间轴
-    会走但 PhysX 不再被 step（关节读回恒等于设定值、画面定格）。
-
-    注意：本函数在 ``Articulation`` 已构造之后调用，此时重复
-    ``timeline.play()`` 会让 physics tensor 失效并静默退出，所以只在
-    timeline **未**播放时才启动它。
-    """
-    import omni.timeline
-
-    timeline = omni.timeline.get_timeline_interface()
-    started = False
-    if not timeline.is_playing():
-        timeline.play()
-        started = True
-    try:
-        for _ in range(5):  # 预热，跳过首帧开销
-            app.update()
-        t0 = float(timeline.get_current_time())
-        for _ in range(samples):
-            app.update()
-        t1 = float(timeline.get_current_time())
-        dt = (t1 - t0) / samples
-        return dt if dt > 0 else 0.0
-    finally:
-        # 保持播放状态：后续逐帧循环需要 timeline 处于播放中
-        # （set_dof_positions 依赖 physics tensor entity）。
-        if started:
-            pass
-
-
 def _build_gripper_switches(
     dof_names: list[str],
     target_idx: np.ndarray,
@@ -293,40 +259,37 @@ def _build_gripper_switches(
             continue
 
         vals = col_vals[valid]
-        # 张开值 = 录制里出现最多的极值（Dex1 为 +0.0245 = 上限）
         open_val = float(np.percentile(vals, 98))
         closed_val = float(np.percentile(vals, 2))
-
-        # 开关判定：必须**明显远离张开值**才算闭合。
-        #
-        # 注意不能只看「小于某个中间阈值」：录制开头夹爪常停在 0.0
-        # （两指合拢的中间态，运控还没下发指令），那一段不是「抓取」。
-        # 若把它判成闭合并压到限位，会在真正抓取前就把物理状态搞坏
-        # （实测：293~773 帧被误判闭合，手指一直压着，后面抓取就空了）。
-        #
-        # 用「距离张开值超过行程的 60%」作为判据，0.0 这种中间态落在
-        # 阈值之上，不会被误判。
         span = abs(hi - lo)
-        threshold = open_val - 0.60 * span
-        closed = np.zeros(col_vals.shape, dtype=bool)
-        closed[valid] = col_vals[valid] < threshold
-        # 未采到的帧沿用上一个已知状态，避免中途误开
-        idx_valid = np.where(valid, np.arange(len(col_vals)), 0)
-        np.maximum.accumulate(idx_valid, out=idx_valid)
-        closed = closed[idx_valid]
+        # 「显著闭合」的门槛：低于它才算真的夹住东西
+        close_thr = open_val - 0.60 * span
 
-        # 闭合目标 = 关节下限，**与运控一致**。
-        # 运控的 closed_position_ 就是 joint_lower_limit_；手指被物体挡住后
-        # 停在中途（如 -0.0143），drive 持续出力 ⇒ 这就是夹持力的来源。
-        # 不能设成录制里闭合时的实际角度——那等于 target==actual，力为 0。
+        has_close = closed_val < close_thr
+
+        closed = np.zeros(col_vals.shape, dtype=bool)
+        if has_close:
+            closed[valid] = col_vals[valid] < close_thr
+            idx_valid = np.where(valid, np.arange(len(col_vals)), 0)
+            np.maximum.accumulate(idx_valid, out=idx_valid)
+            closed = closed[idx_valid]
+        else:
+            _log(f"夹爪 {name}: 录制里没有明显闭合段（2% 分位 {closed_val:+.4f} "
+                 f">= 阈值 {close_thr:+.4f}），全部按位置回放")
+
+        # 驱动目标：
+        #   闭合帧 → 关节下限（压出夹持力，与运控一致）
+        #   其余   → **录制里该帧的原值**（保留 0.0 中立态、保留张开的中间过程）
         close_target = float(np.clip(lo, lo, hi))
 
         n_closed = int(closed.sum())
         _log(
-            f"夹爪 {name}: 记录开/合 = [{open_val:+.4f}, {closed_val:+.4f}] "
-            f"限位 [{lo:+.4f}, {hi:+.4f}] → 驱动目标 开 {open_val:+.4f} / 合 {close_target:+.4f}，"
-            f"闭合 {n_closed}/{len(closed)} 帧"
+            f"夹爪 {name}: 录制值域 [{closed_val:+.4f}, {open_val:+.4f}] "
+            f"限位 [{lo:+.4f}, {hi:+.4f}]"
         )
+        if has_close:
+            _log(f"  闭合 {n_closed}/{len(closed)} 帧 → 目标 {close_target:+.4f}；"
+                 f"其余帧按录制原值驱动")
         specs.append(
             {
                 "name": name,
@@ -337,9 +300,40 @@ def _build_gripper_switches(
                 "open_target": open_val,
                 "close_target": close_target,
                 "closed": closed,
+                # 录制原值：非闭合帧直接用它（保留 0.0 中立态与张开的中间过程）
+                "raw_values": col_vals.astype(np.float32),
             }
         )
     return specs
+
+
+def _gripper_target(spec: dict, frame: int) -> float:
+    """夹爪该帧的驱动目标。
+
+    - 闭合帧 → 关节下限（压出夹持力，与运控一致）
+    - 其余帧 → **录制里该帧的原值**
+
+    为什么非闭合帧要用原值，而不是统一"张开"：
+    录制开头夹爪常停在 0.0（运控未下指令时的自然位置），之后才张到
+    +0.0245。若把 0.0 也当成"张开"驱动到 +0.0245，回放一开始夹爪就
+    全开了 —— 与编排现象不符（用户实测）。
+
+    原值里可能有 NaN（采集缺失），那时往前找最近的有效值。
+    """
+    closed = spec.get("closed")
+    idx = min(max(0, frame), len(closed) - 1) if closed is not None else 0
+    if closed is not None and bool(closed[idx]):
+        return float(spec["close_target"])
+    raw = spec.get("raw_values")
+    if raw is not None and 0 <= idx < len(raw):
+        v = float(raw[idx])
+        if np.isfinite(v):
+            return v
+        for k in range(idx - 1, -1, -1):
+            vv = float(raw[k])
+            if np.isfinite(vv):
+                return vv
+    return float(spec["open_target"])
 
 
 def _measure_app_dt(app: Any, samples: int = 10) -> float:
@@ -793,7 +787,7 @@ def render_episode(
         """按开/合驱动夹爪（走 drive 产生夹持力，与运控同一协议）。"""
         for spec in grip_specs:
             state = bool(spec["closed"][min(frame_i, len(spec["closed"]) - 1)])
-            target = spec["close_target"] if state else spec["open_target"]
+            target = _gripper_target(spec, frame_i)
             try:
                 art.set_dof_position_targets(
                     np.array([[target]], dtype=np.float32),

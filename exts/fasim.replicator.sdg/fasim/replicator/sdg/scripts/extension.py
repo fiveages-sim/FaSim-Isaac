@@ -155,6 +155,8 @@ def _dispatch(req: dict) -> dict:
 
         if verb in ("live", "play"):
             # 在同一实例里回放 episode（非阻塞，靠 update 推进）
+            # 注意：这里**不做热重载**。重载正在使用的模块会破坏扩展状态
+            # （实测导致 socket 断开、connection refused）。改代码后请重启 Isaac。
             from fasim.replicator.sdg import live_replay
 
             ep = str(req.pop("episode", "") or "")

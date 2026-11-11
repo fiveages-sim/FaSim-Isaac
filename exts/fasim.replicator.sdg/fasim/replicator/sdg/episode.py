@@ -24,6 +24,7 @@
 
     t                 (N,)      相对秒数，仅日志用
     joint_pos         (N, J)    实测关节角（rad / m），按 joint_names 排列
+    joint_pos_cmd     (N, J)    下发**目标**关节角（可选，见下）
     joint_vel         (N, J)    实测关节速度
     left_pos          (N, 3)    左末端实测位置（world）
     left_quat         (N, 4)    左末端实测姿态 xyzw
@@ -42,6 +43,24 @@
     frame_id                  末端位姿的坐标系（如 "world"）
     meta                       JSON 字符串（robot/task/来源话题等）
     schema_version            格式版本
+
+``joint_pos`` vs ``joint_pos_cmd`` —— 为什么两个都要
+=====================================================
+``joint_pos`` 是**实测**（Isaac ``get_dof_positions``，即 ``/joint_states``）。
+``joint_pos_cmd`` 是当时**下发给 drive 的目标**（``get_dof_position_targets``）。
+
+两者差一个物理稳态误差 ``e``：手臂自重让实测永远比目标低一点点。
+
+这个区别在"采集→回放"闭环里非常关键::
+
+    编排：q_cmd ──drive──> q_act = q_cmd − e     ← 采集记 q_act
+    回放：q_act ──drive──> q_act − e             ← 误差被加第二次
+
+末端偏差 = J·e，手臂前伸时主要指向**下方**，量级 = 几十 mrad × 臂长
+≈ 2-3cm，且每次稳定复现。本项目的"右手抓试管偏下 2-3cm" 就是这个机制。
+
+所以回放必须用 ``joint_pos_cmd``（让 drive 再产生同样的 e，实测才落在
+和编排相同的 q_act）。``joint_pos`` 保留给训练 observation 用。
 """
 
 from __future__ import annotations
@@ -77,6 +96,10 @@ class Episode:
     right_pos: np.ndarray
     right_quat: np.ndarray
     joint_vel: np.ndarray | None = None
+    #: 下发给 drive 的**目标**关节角 (N, J)。回放优先用它 —— 见模块
+    #: docstring 里「joint_pos vs joint_pos_cmd」。缺省时回退到 joint_pos
+    #: （旧数据的行为，会多叠一次稳态误差）。
+    joint_pos_cmd: np.ndarray | None = None
     left_cmd_pos: np.ndarray | None = None
     left_cmd_quat: np.ndarray | None = None
     right_cmd_pos: np.ndarray | None = None
@@ -167,6 +190,7 @@ class Episode:
         }
         for name in (
             "joint_vel",
+            "joint_pos_cmd",
             "left_cmd_pos", "left_cmd_quat",
             "right_cmd_pos", "right_cmd_quat",
             "left_grip", "right_grip",
@@ -230,6 +254,7 @@ class Episode:
                 right_pos=z["right_pos"],
                 right_quat=z["right_quat"],
                 joint_vel=opt("joint_vel"),
+                joint_pos_cmd=opt("joint_pos_cmd"),
                 left_cmd_pos=opt("left_cmd_pos"),
                 left_cmd_quat=opt("left_cmd_quat"),
                 right_cmd_pos=opt("right_cmd_pos"),

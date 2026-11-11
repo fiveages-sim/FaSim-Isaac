@@ -42,6 +42,9 @@ usage() {
   info        看采集会话里有什么（帧数、相机、关节数、体积）
   pack        采集会话 → episode npz（层2 能读的格式）
   trim        切成任务片段，剔除待机段（ACT 训练必需）
+  fk          用 FK 算末端真值（需要 pinocchio）
+              fk <episode.npz>                     体检采集：末端是不是真采到了
+              fk <*.replay_fN.npz> --source <ep>   体检回放：手偏了几毫米、偏哪
 
 回放自检（需要 Isaac python，preview 的 --drive ee 还需要运控在跑）:
   preview     回放 episode 验证采集是否忠实
@@ -87,6 +90,22 @@ pick_python() {
     return 1
 }
 
+# 带 pinocchio 的 python：`fk` 做正解需要它（Isaac 的 python 里没有，
+# 系统 python3 通常也没有）。按优先级找一个能 import pinocchio 的。
+pick_fk_python() {
+    local cand
+    for cand in "${SDG_FK_PYTHON:-}" \
+                /home/fiveages/miniconda3/envs/lerobot-ros2/bin/python \
+                "$(command -v python3)" /usr/bin/python3; do
+        [ -n "$cand" ] || continue
+        [ -x "$cand" ] || continue
+        if "$cand" -c "import pinocchio, numpy, yaml" >/dev/null 2>&1; then
+            echo "$cand"; return 0
+        fi
+    done
+    return 1
+}
+
 need_isaac_py() {
     [ -x "$ISAAC_PY" ] || die "找不到 Isaac python: $ISAAC_PY（设 ISAACSIM_DIR 或装 Isaac Sim）"
 }
@@ -95,6 +114,12 @@ CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
 case "$CMD" in
+    fk)
+        # FK 需要 pinocchio —— Isaac 的 python 里没有，所以单独选解释器。
+        PY="$(pick_fk_python)" || die "找不到带 pinocchio 的 python（设 SDG_FK_PYTHON）"
+        export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+        exec "$PY" "${SCRIPT_DIR}/cli.py" fk "$@"
+        ;;
     capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"

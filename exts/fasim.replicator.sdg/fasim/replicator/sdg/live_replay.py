@@ -55,6 +55,46 @@ _STATE: dict[str, Any] = {
 }
 
 
+def _gripper_target(spec: dict, frame: int) -> float:
+    """夹爪该帧的驱动目标。
+
+    - 闭合帧 → 关节下限（压出夹持力，与运控一致）
+    - 其余帧 → **录制里该帧的原值**
+
+    为什么非闭合帧要用原值，而不是统一"张开"：
+    录制开头夹爪常停在 0.0（运控未下指令时的自然位置），之后才张到
+    +0.0245。若把 0.0 也当成"张开"驱动到 +0.0245，回放一开始夹爪就
+    全开了 —— 与编排现象不符（用户实测）。
+
+    原值里可能有 NaN（采集缺失），那时退回上一个有效值 / 张开值。
+    """
+    closed = spec.get("closed")
+    idx = min(max(0, frame), len(closed) - 1) if closed is not None else 0
+    if closed is not None and bool(closed[idx]):
+        return float(spec["close_target"])
+    raw = spec.get("raw_values")
+    if raw is not None and 0 <= idx < len(raw):
+        v = float(raw[idx])
+        if np.isfinite(v):
+            return v
+        # 该帧缺失 → 往前找最近的有效值
+        for k in range(idx - 1, -1, -1):
+            vv = float(raw[k])
+            if np.isfinite(vv):
+                return vv
+    return float(spec["open_target"])
+
+
+def _apply_grip_specs(art, grip_specs: list[dict], frame: int) -> None:
+    """按帧驱动所有夹爪。"""
+    for spec in grip_specs:
+        tgt = _gripper_target(spec, frame)
+        art.set_dof_position_targets(
+            np.array([[tgt]], dtype=np.float32),
+            dof_indices=np.array([spec["dof"]], dtype=np.int64),
+        )
+
+
 def _log(msg: str) -> None:
     print(f"[live] {msg}", flush=True)
 
@@ -125,6 +165,7 @@ def play_episode(
     joint_api: str = "target",
     reset_objects: bool = True,
     task_key: str = "sinopec_test_tube",
+    joint_src: str = "cmd",
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
@@ -145,6 +186,10 @@ def play_episode(
         loop: 播完循环。
         on_frame: 每帧回调。
         left_topic / right_topic: ``drive="ee"`` 时的话题。
+        joint_src: 回放用哪套关节角当驱动目标。``"cmd"``（默认）用
+            ``joint_pos_cmd``（当时下发给 drive 的目标）—— 与编排一致；
+            ``"actual"`` 用 ``joint_pos``（实测），会多叠一次稳态误差，
+            末端偏下，仅供对照排查。
 
     Returns:
         ``{"ok": True, "frames": N, "drive": ...}``
@@ -246,8 +291,31 @@ def play_episode(
         dofs = list(art.dof_names)
         target_idx, source_idx, missing = build_dof_mapping(dofs, episode.joint_names)
 
+        # 回放**用哪套关节角当驱动目标** —— 这决定了末端会不会比编排多偏一次。
+        #
+        #   cmd（默认）: joint_pos_cmd = 当时下发给 drive 的目标 q_cmd。
+        #       回放再走一次同样的 drive，实测落在 q_cmd − e，与编排一致。
+        #   actual: joint_pos = 实测 q_act = q_cmd − e。拿它当目标再驱一次，
+        #       得到 q_cmd − 2e，末端 = J·e → 手臂前伸时**稳定偏下**，
+        #       量级几十 mrad × 臂长 ≈ 2-3cm。这就是之前的坑。
+        #
+        # 老数据没有 joint_pos_cmd，只能回退 actual（行为不变，但会偏）。
+        drive_src = str(joint_src or "cmd").lower()
+        qmat = getattr(episode, "joint_pos_cmd", None)
+        if drive_src in ("cmd", "command", "target") and qmat is not None:
+            _log("关节驱动源: joint_pos_cmd（下发目标）—— 与编排一致")
+        else:
+            if drive_src in ("cmd", "command", "target"):
+                _log("WARN 该 episode 没有 joint_pos_cmd，回退用实测关节角")
+                _log("     末端会比编排多偏一次稳态误差（几厘米）。"
+                     "重新采集可获得：sdg.sh capture --what joint,ee,object")
+            else:
+                _log(f"关节驱动源: joint_pos（实测）—— 显式指定 {drive_src}")
+            qmat = episode.joint_pos
+        ctx["qmat"] = np.asarray(qmat, dtype=np.float64)
+
         if len(source_idx):
-            ok = np.isfinite(episode.joint_pos[:, source_idx]).any(axis=0)
+            ok = np.isfinite(ctx["qmat"][:, source_idx]).any(axis=0)
             dead = [episode.joint_names[c] for c, k in zip(source_idx, ok) if not k]
             if dead:
                 _log(f"跳过整列 NaN: {dead}")
@@ -310,6 +378,19 @@ def play_episode(
         ctx.update(art=art, target_idx=target_idx, source_idx=source_idx,
                    grip_specs=grip_specs,
                    target_names=[dofs[int(d)] for d in target_idx])
+
+        # 末端诊断：**不读 Xform 位姿**。
+        #
+        # tcp 是纯 Xform 帧，而 newton kit 里关了 PhysX→USD/Fabric 同步
+        #   updateToUsd                  = false
+        #   fabricUpdateTransformations  = false
+        # 所以 XformPrim 无论 usd/usdrt/fabric 后端读到的都是 authoring
+        # 静态值（实测 765 帧偏离 0.0mm，且值 == q≈0 静止姿态的位姿）。
+        #
+        # 改成记录**实际关节角**，回放结束后离线用 sdg.fk 做 FK 对照 ——
+        # 纯数学，不依赖任何同步管道，且与 OCS2 的 eeFrame 同源。
+        ctx["q_log"] = {"frame": [], "target": [], "actual": []}
+        _log("关节记录已启用（回放后可用 sdg.sh fk 算末端真值）")
         # 手臂 drive gain —— 与 render_episode 一致。
         # 不设的话用资产默认值（Dex1 的 gain 是给夹爪调的），手臂追不上
         # 目标，实测关节误差 268 mrad。
@@ -403,7 +484,7 @@ def play_episode(
         # 归位：从当前姿态平滑过渡到第 0 帧，避免 drive 猛冲把物体撞飞。
         # 实测不归位时：右手从远处瞬间追到第 0 帧，扫过试管架把它带起来。
         try:
-            first = episode.joint_pos[n_start][source_idx]
+            first = ctx["qmat"][n_start][source_idx]
             if np.all(np.isfinite(first)):
                 ctx["home_target"] = first.astype(np.float32)
                 ctx["homing"] = bool(home_frames > 0)
@@ -425,9 +506,7 @@ def play_episode(
     ctx["_last_sim_time"] = None
 
     _STATE.update(playing=True, paused=False, frame=n_start, total=n_end,
-                  episode=episode, cancel=False, ctx=ctx, i=n_start,
-                  since_frame=0.0)
-    ctx["since_frame"] = 0.0
+                  episode=episode, cancel=False, ctx=ctx, i=n_start)
 
     if not _install_update_hook():
         _STATE.update(playing=False)
@@ -756,8 +835,8 @@ def _on_update(_event) -> None:
     if not ctx.get("cm_done", True):
         if not _poll_cm(ctx):
             return
-        # 停用完成（成功或失败）：清掉上一帧目标，从头开始
-        ctx["since_frame"] = 0.0
+        # 停用完成（成功或失败）：从这一刻重新计时间基准
+        ctx["t_base"] = None
         ctx["_last_sim_time"] = None
         if ctx.get("paused_controllers"):
             _log("运控已让出控制权，开始回放")
@@ -766,18 +845,6 @@ def _on_update(_event) -> None:
 
     app_dt = _ensure_app_dt(ctx)
     frame_dt = ctx.get("frame_dt", 0.05)
-    if app_dt <= 0:
-        # 首帧还不知道步长；先设第 0 帧目标，下一帧再开始累积
-        if ctx.get("since_frame", 0.0) == 0.0:
-            try:
-                if ctx["drive"] == "ee":
-                    _step_ee(ctx, _STATE["i"])
-                else:
-                    _step_joints(ctx, _STATE["i"])
-                ctx["since_frame"] = 0.001
-            except Exception:  # noqa: BLE001
-                pass
-        return
 
     # 阶段 1：归位过渡（从当前姿态线性插值到第 0 帧）
     if ctx.get("homing"):
@@ -785,13 +852,31 @@ def _on_update(_event) -> None:
         ctx["home_step"] = ctx.get("home_step", 0) + 1
         if ctx["home_step"] >= ctx["home_total"]:
             ctx["homing"] = False
-            ctx["since_frame"] = 0.0
+            ctx["t_base"] = None  # 归位结束后重新记时间基准
             _log("归位完成，开始回放")
         return
 
-    # 本回调已经推进了 app_dt 的仿真时间
-    ctx["since_frame"] = ctx.get("since_frame", 0.0) + app_dt
-    advance = ctx["since_frame"] >= frame_dt - app_dt * 0.5
+    # 时间基准：**直接用 timeline 的仿真时间**判断该不该切下一帧。
+    #
+    # 之前用 app_dt 累加估算，但回调频率 ≠ 物理步进频率：实测 250 帧只
+    # 推进 1.67s 仿真时间（应约 14.7s），说明累加值远大于真实推进量 ——
+    # 于是每帧都"够一帧"立刻切换，动作被压缩成跳跃（一卡一卡）。
+    #
+    # 正确做法：记下开始回放时的仿真时间 t_base，每帧比较
+    #   (now - t_base) 与 (target_frame - n_start) * frame_dt
+    # 落后就保持当前帧、等待；赶上才切下一帧。
+    import omni.timeline
+
+    tl = omni.timeline.get_timeline_interface()
+    now = float(tl.get_current_time())
+    if ctx.get("t_base") is None:
+        ctx["t_base"] = now
+        ctx["i_base"] = _STATE["i"]
+
+    elapsed = now - ctx["t_base"]
+    want = (_STATE["i"] - ctx["i_base"]) * frame_dt
+    # 容差半帧，避免抖动
+    advance = elapsed >= want - frame_dt * 0.5
 
     i = _STATE["i"]
     n_end = ctx["n_end"]
@@ -799,7 +884,6 @@ def _on_update(_event) -> None:
 
     try:
         if advance:
-            ctx["since_frame"] = 0.0
             if ctx["drive"] == "ee":
                 _step_ee(ctx, i)
             else:
@@ -856,18 +940,12 @@ def _hold_joints(ctx: dict, i: int) -> None:
     source_idx = ctx["source_idx"]
     target_idx = ctx["target_idx"]
     episode = ctx["episode"]
-    row = episode.joint_pos[i][source_idx]
+    row = ctx["qmat"][i][source_idx]
     if np.all(np.isfinite(row)):
         art.set_dof_position_targets(
             row.astype(np.float32).reshape(1, -1), dof_indices=target_idx
         )
-    for spec in ctx.get("grip_specs", []):
-        closed = bool(spec["closed"][min(i, len(spec["closed"]) - 1)])
-        tgt = spec["close_target"] if closed else spec["open_target"]
-        art.set_dof_position_targets(
-            np.array([[tgt]], dtype=np.float32),
-            dof_indices=np.array([spec["dof"]], dtype=np.int64),
-        )
+    _apply_grip_specs(art, ctx.get("grip_specs", []), i)
 
 
 def _ensure_app_dt(ctx: dict) -> float:
@@ -923,13 +1001,7 @@ def _step_homing(ctx: dict) -> None:
     val = (s + (g - s) * ratio).astype(np.float32).reshape(1, -1)
     art.set_dof_position_targets(val, dof_indices=target_idx)
 
-    for spec in ctx.get("grip_specs", []):
-        closed = bool(spec["closed"][min(ctx["n_start"], len(spec["closed"]) - 1)])
-        tgt = spec["close_target"] if closed else spec["open_target"]
-        art.set_dof_position_targets(
-            np.array([[tgt]], dtype=np.float32),
-            dof_indices=np.array([spec["dof"]], dtype=np.int64),
-        )
+    _apply_grip_specs(art, ctx.get("grip_specs", []), ctx["n_start"])
 
 
 def tl_now(ctx: dict) -> float:
@@ -987,16 +1059,26 @@ def _reset_objects(ctx: dict) -> int:
             _log(f"WARN 物体 {label} 的 prim 不存在: {prim_path}")
             continue
         try:
-            # 用 USD xform 直接写（回放还没开始，物理未接管这个刚体时最可靠）
-            from pxr import Gf, UsdGeom
+            # **必须用 RigidPrim.set_world_poses，不能用 USD xform 直写**：
+            #   - USD 写对已被物理接管的刚体无效（下一帧就被物理覆盖）
+            #   - 而且 xf.ClearXformOpOrder() 会**清掉 scale** —— 物体失去
+            #     缩放后被物理弹飞（实测试管架跑到几米外的地板上）
+            from isaacsim.core.experimental.prims import RigidPrim
 
-            xf = UsdGeom.Xformable(prim)
-            xf.ClearXformOpOrder()
-            xf.AddTranslateOp().Set(Gf.Vec3d(*[float(x) for x in p0[:3]]))
-            xf.AddOrientOp().Set(
-                Gf.Quatf(float(q0[0]), float(q0[1]), float(q0[2]), float(q0[3]))
+            rp = RigidPrim(str(prim_path))
+            rp.set_world_poses(
+                np.asarray(p0[:3], dtype=np.float32).reshape(1, 3),
+                np.asarray(q0[:4], dtype=np.float32).reshape(1, 4),
             )
-            _log(f"物体复位 {label} → {np.round(p0, 3)}")
+            # 清速度，避免复位瞬间带着上次的残余速度冲出去
+            try:
+                rp.set_velocities(
+                    linear_velocities=np.zeros((1, 3), dtype=np.float32),
+                    angular_velocities=np.zeros((1, 3), dtype=np.float32),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            _log(f"物体复位 {label} → {np.round(p0[:3], 3)}")
             n += 1
         except Exception as exc:  # noqa: BLE001
             _log(f"WARN 复位物体 {label} 失败: {exc}")
@@ -1056,8 +1138,24 @@ def _step_joints(ctx: dict, i: int) -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    # 记录本帧的 target / actual 关节角，供回放结束后离线 FK 对照。
+    #
+    # 为什么在这里记 actual：上一帧的 target 已被物理步进消化过，
+    # 此时读到的 actual 才是「那一帧物理真正到的位置」。用 prev_values
+    # 配对上一步的目标，就能得到逐帧的稳态跟踪误差。
+    qlog = ctx.get("q_log")
+    if qlog is not None and prev is not None:
+        try:
+            qlog["frame"].append(int(i) - 1)
+            qlog["target"].append(np.asarray(prev, dtype=np.float32).copy())
+            qlog["actual"].append(np.asarray(
+                art.get_dof_positions(dof_indices=target_idx), dtype=np.float32
+            ).reshape(-1).copy())
+        except Exception:  # noqa: BLE001
+            pass
+
     # 2) 再设当前帧目标
-    row = episode.joint_pos[i][source_idx]
+    row = ctx["qmat"][i][source_idx]
     if np.all(np.isfinite(row)):
         values = row.astype(np.float32).reshape(1, -1)
         _apply_joint_target(ctx, values, i)
@@ -1065,13 +1163,7 @@ def _step_joints(ctx: dict, i: int) -> None:
     else:
         ctx["prev_values"] = None
 
-    for spec in ctx.get("grip_specs", []):
-        closed = bool(spec["closed"][min(i, len(spec["closed"]) - 1)])
-        tgt = spec["close_target"] if closed else spec["open_target"]
-        art.set_dof_position_targets(
-            np.array([[tgt]], dtype=np.float32),
-            dof_indices=np.array([spec["dof"]], dtype=np.int64),
-        )
+    _apply_grip_specs(art, ctx.get("grip_specs", []), i)
 
 
 def _step_ee(ctx: dict, i: int) -> None:
@@ -1141,6 +1233,38 @@ def _finish() -> None:
                 _log("  误差最大的关节: " + "  ".join(
                     f"{k}={v*1000:.1f}mrad" for k, v in worst
                 ))
+
+            # 逐帧 target / actual 关节角落盘 —— 这是末端真值的来源。
+            #
+            # 为什么不在回放里直接算末端：tcp 是 Xform，newton kit 关了
+            # PhysX→USD/Fabric 同步，Isaac 里读不到动态值。而 pinocchio
+            # 不在 Isaac 的 python 里。所以导出关节角，用
+            #   python -m fasim.replicator.sdg.fk replay.npz
+            # 离线 FK 对照（与 OCS2 的 eeFrame 同源）。
+            traj_out = None
+            qlog = ctx.get("q_log") or {}
+            if qlog.get("frame"):
+                try:
+                    from pathlib import Path as _P
+
+                    ep_path = getattr(ctx.get("episode"), "path", None)
+                    base = _P(str(ep_path)).with_suffix("") if ep_path else _P("/tmp/replay")
+                    traj_out = _P(str(base) + f".replay_f{ctx.get('n_start', 0)}.npz")
+                    np.savez_compressed(
+                        traj_out,
+                        frame=np.asarray(qlog["frame"], dtype=np.int32),
+                        target=np.stack(qlog["target"]).astype(np.float32),
+                        actual=np.stack(qlog["actual"]).astype(np.float32),
+                        dof_names=np.array(ctx.get("target_names", [])),
+                        # 让离线 FK 能重建 world 系：录制里的静止帧 tcp 位姿
+                        source_episode=np.array(str(ep_path or "")),
+                    )
+                    _log(f"  关节记录已导出: {traj_out}")
+                    _log("  → 算末端真值: python -m fasim.replicator.sdg.fk "
+                         f"{traj_out} --source {ep_path}")
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"WARN 导出关节记录失败: {exc}")
+
             _STATE["last_result"] = {
                 "frames": n, "drive": "joints",
                 "max_err_mrad": round(me, 2), "p95_err_mrad": round(p95, 2),
@@ -1151,6 +1275,7 @@ def _finish() -> None:
                     k: round(v * 1000, 1) for k, v in
                     sorted((per or {}).items(), key=lambda kv: -kv[1])[:10]
                 },
+                "joint_log": str(traj_out) if traj_out else None,
             }
         else:
             _log(f"回放结束: 发了 {n} 帧末端位姿")

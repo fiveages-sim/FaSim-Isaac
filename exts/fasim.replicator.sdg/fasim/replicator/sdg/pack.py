@@ -106,6 +106,10 @@ def pack_episode(
             if "joint_pos" in keys:
                 q = np.asarray(z["joint_pos"], dtype=np.float64).reshape(-1)
                 cols.setdefault("joint_pos", []).append(q)
+            # 下发目标（回放用）。老会话没有这个字段，回退到实测值。
+            if "joint_pos_cmd" in keys:
+                qc = np.asarray(z["joint_pos_cmd"], dtype=np.float64).reshape(-1)
+                cols.setdefault("joint_pos_cmd", []).append(qc)
 
             # 末端 + 物体：<side>_pos/_quat 与 obj/<label>_pos/_quat
             for k in keys:
@@ -161,6 +165,12 @@ def pack_episode(
 
     # --- 组装 episode ---
     joint_pos = np.stack(cols["joint_pos"]).astype(np.float64)
+    # 下发目标：缺了就回退实测，并在报告里说清楚（这会多叠一次稳态误差）
+    if "joint_pos_cmd" in cols and len(cols["joint_pos_cmd"]) == n:
+        joint_pos_cmd = np.stack(cols["joint_pos_cmd"]).astype(np.float64)
+    else:
+        joint_pos_cmd = None
+
     payload: dict[str, Any] = {
         "schema_version": np.array(SCHEMA_VERSION),
         "t": t,
@@ -200,11 +210,35 @@ def pack_episode(
         if k.startswith("obj/") and len(v) == n:
             payload[k] = np.stack(v).astype(np.float64)
 
+    # 下发目标关节角 —— 回放用它。
+    if joint_pos_cmd is not None:
+        payload["joint_pos_cmd"] = joint_pos_cmd
+        payload["meta"] = np.array(
+            json.dumps(
+                {**json.loads(str(payload["meta"])), "has_joint_cmd": True},
+                ensure_ascii=False,
+            )
+        )
+
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **payload)
 
     _log(f"已写出 {out}")
     _log(f"  {n} 帧 × {joint_pos.shape[1]} 关节，dt={dt*1000:.2f}ms")
+
+    # 稳态误差报告 —— 这个数字直接解释了"回放偏下几厘米"。
+    if joint_pos_cmd is not None:
+        e = np.abs(joint_pos - joint_pos_cmd)
+        emax = e.max(axis=0)
+        k = int(np.argmax(emax))
+        nm = (joint_names or [f"j{i}" for i in range(e.shape[1])])[k]
+        _log(f"  drive 稳态误差: mean={e.mean()*1000:.2f} max={emax[k]*1000:.1f} mrad"
+             f"（最大 @{nm}）")
+        _log("  → 回放会用 joint_pos_cmd（下发目标），避免误差叠加两次")
+    else:
+        _log("  WARN 没有 joint_pos_cmd（下发目标）—— 回放将用实测值，"
+             "末端会比编排多偏一次稳态误差 ≈ 几厘米")
+        _log("       重新采集即可获得：sdg.sh capture --what joint,ee,object")
     ee = [
         k for k in payload
         if k.endswith("_pos") and not k.startswith("obj/") and k != "joint_pos"

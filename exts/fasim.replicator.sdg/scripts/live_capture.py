@@ -104,6 +104,66 @@ def _to_np(x: Any) -> np.ndarray:
     return np.asarray(x, dtype=np.float64)
 
 
+def _read_xform_world(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """读一个 Xform prim 的**动态**世界位姿 (pos[3], quat[4])。
+
+    tcp 这类纯 Xform 帧不是刚体，默认 ``XformPrim.get_world_poses()`` 走
+    ``usd`` 后端，读到的是 **authoring stage 的静态值** —— 物理跑起来后
+    完全不变（实测 765 帧偏离 0.0mm）。
+
+    必须切到 ``fabric``（或 ``usdrt``）后端才能拿到物理更新后的世界变换。
+    本函数依次尝试 fabric → usdrt → 默认，返回第一个成功且**有效**的结果。
+    """
+    from isaacsim.core.experimental.prims import XformPrim
+    from isaacsim.core.experimental.utils import backend as backend_utils
+
+    for backend in ("fabric", "usdrt", None):
+        try:
+            if backend is None:
+                p, q = XformPrim(prim_path).get_world_poses()
+            else:
+                with backend_utils.use_backend(backend, raise_on_unsupported=True):
+                    p, q = XformPrim(prim_path).get_world_poses()
+            pos = _to_np(p).reshape(-1)[:3]
+            quat = _to_np(q).reshape(-1)[:4]
+            if np.all(np.isfinite(pos)):
+                return pos, quat
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _probe_xform_backend(prim_path: str) -> tuple[bool, str]:
+    """自检：哪个后端能读到该 Xform 的动态世界位姿。
+
+    Returns:
+        ``(ok, 后端名)``。``ok=False`` 表示读不到（只能拿静态值）。
+    """
+    from isaacsim.core.experimental.prims import XformPrim
+    from isaacsim.core.experimental.utils import backend as backend_utils
+
+    for backend in ("fabric", "usdrt"):
+        try:
+            with backend_utils.use_backend(backend, raise_on_unsupported=True):
+                p, _q = XformPrim(prim_path).get_world_poses()
+            pos = _to_np(p).reshape(-1)[:3]
+            if np.all(np.isfinite(pos)):
+                return True, backend
+        except Exception:  # noqa: BLE001
+            continue
+    return False, "usd(静态)"
+
+
+def _pose_delta_mm(
+    a: tuple[np.ndarray, np.ndarray] | None,
+    b: tuple[np.ndarray, np.ndarray] | None,
+) -> float:
+    """两个位姿的位置差（mm）；任一无效返回 nan。"""
+    if a is None or b is None:
+        return float("nan")
+    return float(np.linalg.norm(np.asarray(a[0]) - np.asarray(b[0])) * 1000.0)
+
+
 def arm_capture(
     out_dir: str = "",
     every: int = 10,
@@ -211,20 +271,19 @@ def arm_capture(
 
     # 末端位姿（tcp，world 系）—— 来自 robot.yaml 的 ee_prims。
     # 与层1 的 /left_current_pose 语义对齐：都是 tcp 的世界位姿。
-    ee_views: dict[str, Any] = {}
+    #
+    # **关键**：tcp 是纯 Xform 帧（不是刚体）。默认的 ``XformPrim`` 用
+    # ``usd`` 后端读**静态 authoring 值**，物理跑起来后也不变（实测 765
+    # 帧完全恒定 0.0mm 偏离）。必须切到 ``fabric``/``usdrt`` 后端才能读到
+    # 物理更新后的世界变换。
+    ee_prims: dict[str, str] = {}
     if record_ee:
-        try:
-            from isaacsim.core.experimental.prims import XformPrim
-
-            for side, prim in (getattr(robot, "ee_prims", None) or {}).items():
-                try:
-                    ee_views[side] = XformPrim(str(prim))
-                except Exception as exc:  # noqa: BLE001
-                    _log(f"WARN 末端 {side} 不可用（{prim}）: {exc}")
-            if ee_views:
-                _log(f"末端位姿: {list(ee_views)}（world 系）")
-        except Exception as exc:  # noqa: BLE001
-            _log(f"WARN 末端位姿不可用: {exc}")
+        for side, prim in (getattr(robot, "ee_prims", None) or {}).items():
+            ee_prims[side] = str(prim)
+        if ee_prims:
+            ok, detail = _probe_xform_backend(next(iter(ee_prims.values())))
+            _log(f"末端位姿: {list(ee_prims)}（world 系，后端={detail}）"
+                 + ("" if ok else "  WARN 读不到动态位姿！"))
 
     # 交互物体位姿 —— 来自 task.yaml 的 tracked_prims
     obj_views: dict[str, Any] = {}
@@ -249,7 +308,7 @@ def arm_capture(
         what.append("camera")
     if art is not None:
         what.append("joint")
-    if ee_views:
+    if ee_prims:
         what.append("ee")
     if obj_views:
         what.append("object")
@@ -276,7 +335,7 @@ def arm_capture(
         armed=True, cameras=cams, out=out, every=max(1, int(every)),
         step=0, saved=0, skipped=0, t0=time.monotonic(), records=[],
         size=cams[0]["size"] if cams else (0, 0),
-        ee_views=ee_views, obj_views=obj_views, what=what,
+        ee_prims=ee_prims, obj_views=obj_views, what=what,
         code_stamp=_code_stamp(),
         physics_dt=physics_dt,
     )
@@ -324,16 +383,31 @@ def arm_capture(
                     payload["joint_names"] = dof_names
                 except Exception:  # noqa: BLE001
                     pass
-            # 末端位姿（world）：<side>_pos / <side>_quat
-            for side, view in _S.get("ee_views", {}).items():
+                # **下发目标**关节角 —— 回放要用这个，不是实测值。
+                #
+                # 编排时 OCS2 把 q_cmd 写给 drive，物理跟上到 q_act = q_cmd − e
+                # （手臂自重造成稳态误差 e）。若采集记 q_act、回放又把它当
+                # 目标驱动一次，e 会被叠加两次，末端 = J·e，手臂前伸时主要
+                # 指向下方 —— 正是"抓试管稳定偏下 2-3cm"的成因。
                 try:
-                    p, q = view.get_world_poses()
-                    payload[f"{side}_pos"] = _to_np(p).reshape(-1)[:3]
-                    payload[f"{side}_quat"] = _to_np(q).reshape(-1)[:4]
+                    qt = art.get_dof_position_targets()
+                    payload["joint_pos_cmd"] = _to_np(qt).astype(np.float32).reshape(1, -1)
                 except Exception as exc:  # noqa: BLE001
+                    if _S.get("_qt_err", 0) < 2:
+                        _S["_qt_err"] = _S.get("_qt_err", 0) + 1
+                        _log(f"WARN 读 drive 目标失败（回放将回退用实测值，"
+                             f"末端会多叠一次稳态误差）: {exc}")
+            # 末端位姿（world）：<side>_pos / <side>_quat
+            # 用 _read_xform_world —— tcp 是纯 Xform，必须走 fabric 后端
+            for side, prim_path in _S.get("ee_prims", {}).items():
+                got = _read_xform_world(prim_path)
+                if got is None:
                     if _S.get("_ee_err", 0) < 2:
                         _S["_ee_err"] = _S.get("_ee_err", 0) + 1
-                        _log(f"WARN 末端 {side} 取值失败: {exc!r}")
+                        _log(f"WARN 末端 {side} 读不到动态位姿（{prim_path}）")
+                    continue
+                payload[f"{side}_pos"] = got[0]
+                payload[f"{side}_quat"] = got[1]
             # 物体位姿（world）：obj/<label>_pos / obj/<label>_quat
             for label, view in _S.get("obj_views", {}).items():
                 try:
@@ -410,7 +484,7 @@ def stop_capture() -> dict:
         ],
         # 采了什么 —— 排查「字段没写进帧」时第一眼看这里
         "what": _S.get("what", []),
-        "ee_captured": sorted(_S.get("ee_views", {}).keys()),
+        "ee_captured": sorted(_S.get("ee_prims", {}).keys()),
         "objects_captured": sorted(_S.get("obj_views", {}).keys()),
         "code_stamp": _S.get("code_stamp", "unknown"),
         "physics_dt": _S.get("physics_dt", 0.0),

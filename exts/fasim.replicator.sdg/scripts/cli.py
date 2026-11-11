@@ -315,6 +315,78 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fk(args: argparse.Namespace) -> int:
+    """用 FK 算末端真值（离线，不需要 Isaac / 不需要 pinocchio 在 Isaac 里）。
+
+    两种用法：
+
+    - ``sdg.sh fk <episode.npz>``：体检采集数据。用关节角做 FK，检查录制的
+      ``left_pos`` / ``right_pos`` 是不是真的动态值（本项目实测过它们恒定
+      不变，读到的是 authoring 静态值）。
+    - ``sdg.sh fk <xxx.replay_f0.npz> --source <episode.npz>``：体检回放。
+      对比「回放实际到达的关节角」与「录制目标」的末端偏差，给出毫米级
+      mean/p95/max 和最大偏差帧的方向分量 —— 这才是"手偏 2-3cm"的真度量。
+    """
+    from fasim.replicator.sdg import fk as fkmod
+
+    try:
+        path = args.path
+        is_replay = str(path).endswith(".npz") and "replay_f" in str(path)
+        if is_replay or args.source:
+            out = fkmod.compare_replay(
+                path,
+                source_episode=args.source or None,
+                urdf_path=args.urdf or None,
+            )
+        else:
+            out = fkmod.analyze_episode(path, urdf_path=args.urdf or None)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR {exc}")
+        return 1
+
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+    # 关键结论用中文直说，不用让人去读 JSON
+    v = out.get("validate")
+    if v is not None and not v.get("ok"):
+        _log("!" * 56)
+        _log(f"末端位姿采集有问题: {v.get('reason')}")
+        _log("→ 这不是回放精度问题，是采集时就没读到动态位姿。")
+        _log("  原因：newton kit 关了 PhysX→USD/Fabric 同步"
+             "（updateToUsd=false / fabricUpdateTransformations=false）。")
+        _log("!" * 56)
+    sides = out.get("sides")
+    if sides:
+        for side, st in sides.items():
+            _log(f"末端 {side}: 回放实际 vs 下发目标 mean={st['mean_mm']}mm "
+                 f"p95={st['p95_mm']}mm max={st['max_mm']}mm")
+            if st.get("worst_frame") is not None:
+                dx, dy, dz = st["worst_delta_xyz_mm"]
+                _log(f"  最大 @frame {st['worst_frame']}: "
+                     f"dx={dx:+.1f} dy={dy:+.1f} dz={dz:+.1f} mm")
+        _log("  ↑ 这是物理稳态误差（drive 天生有），不是缺陷")
+
+    rvr = out.get("replay_vs_recording")
+    if rvr:
+        _log("-" * 56)
+        _log("关键判据：回放手到的地方 vs 编排手到的地方")
+        for side, st in rvr.items():
+            _log(f"  末端 {side}: mean={st['mean_mm']}mm p95={st['p95_mm']}mm "
+                 f"max={st['max_mm']}mm")
+            dx, dy, dz = st["worst_delta_xyz_mm"]
+            _log(f"    最大 @frame {st['worst_frame']}: "
+                 f"dx={dx:+.1f} dy={dy:+.1f} dz={dz:+.1f} mm")
+        jr = out.get("replay_vs_recording_joint_mrad") or {}
+        if jr:
+            top = list(jr.items())[:4]
+            _log("  关节最大差: " + "  ".join(f"{k}={v}mrad" for k, v in top))
+        if all(st["mean_mm"] < 10.0 for st in rvr.values()):
+            _log("  → 回放复现良好（末端均值 < 10mm）")
+        else:
+            _log("  → 回放与编排有明显偏差，见上面的方向分量")
+    return 0
+
+
 def cmd_info(args: argparse.Namespace) -> int:
     """看一个采集会话里有什么（不转换）。"""
     from fasim.replicator.sdg import pack
@@ -534,6 +606,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "home_frames": int(args.home_frames),
         "waist_gain": str(args.waist_gain),
         "joint_api": str(args.joint_api),
+        "joint_src": str(args.joint_src),
         "reset_objects": bool(args.reset_objects),
     }
     if args.drive == "ee":
@@ -563,6 +636,15 @@ def cmd_live(args: argparse.Namespace) -> int:
                             _log(f"  关节 max_err = {lr['max_err_mrad']} mrad")
                             _log(f"  关节 p95_err = {lr['p95_err_mrad']} mrad")
                             _log(f"  驱动关节数  = {lr.get('driven_joints')}")
+                        jl = lr.get("joint_log")
+                        if jl:
+                            _log(f"  关节记录 = {jl}")
+                            _log("  → 算末端真值: sdg.sh fk "
+                                 f"{jl} --source {lr.get('source_episode', '<episode>')}")
+                        per_j = lr.get("err_per_joint_mrad") or {}
+                        if per_j:
+                            top = list(per_j.items())[:4]
+                            _log("  误差最大关节: " + "  ".join(f"{k}={v}mrad" for k, v in top))
                         _log(f"  每次 update = {lr.get('app_dt_ms', st.get('app_dt_ms'))} ms")
                         _log("=" * 50)
                     else:
@@ -737,6 +819,13 @@ def main(argv: list[str] | None = None) -> int:
         "逐帧精确，但破坏接触）。用它对比可判断是数据问题还是驱动跟不上",
     )
     lv.add_argument(
+        "--joint-src", choices=("cmd", "actual"), default="cmd",
+        help="用哪套关节角当回放驱动目标。cmd（默认）=采集时下发给 drive 的"
+        "目标 joint_pos_cmd —— 与编排一致，末端不会多偏；actual=实测 "
+        "joint_pos，会多叠一次稳态误差（手臂前伸时稳定偏下 2-3cm），"
+        "仅用于对照复现问题",
+    )
+    lv.add_argument(
         "--no-reset-objects", dest="reset_objects", action="store_false",
         default=True,
         help="不回放前把交互物体复位到 episode 起点。默认会复位"
@@ -748,6 +837,21 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("live-stop", help="停止回放").set_defaults(func=cmd_live_stop)
     sub.add_parser("live-pause", help="暂停回放").set_defaults(func=cmd_live_pause)
     sub.add_parser("live-resume", help="继续回放").set_defaults(func=cmd_live_resume)
+
+    fkp = sub.add_parser(
+        "fk",
+        help="用 FK 算末端真值（离线；诊断采集是否真采到位姿 / 回放偏多少）",
+    )
+    fkp.add_argument("path", help="episode.npz（采集体检）或 *.replay_fN.npz（回放体检）")
+    fkp.add_argument(
+        "--source", default="",
+        help="回放体检时给原始 episode，用于解 world→base（不给则只在 base 系比较）",
+    )
+    fkp.add_argument(
+        "--urdf", default="",
+        help="planning URDF；默认自动找 /tmp/ocs2_ros2/*/planning_urdf/*.urdf（最新）",
+    )
+    fkp.set_defaults(func=cmd_fk)
 
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):
