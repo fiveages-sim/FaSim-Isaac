@@ -123,19 +123,38 @@ def pack_episode(
         )
 
     # --- 时间轴 ---
+    #
+    # 帧间隔必须用**真实**物理步长换算。假设 5ms（200Hz）会偏 —— 实测
+    # 这台机器物理步长 5.876ms（177Hz），按 5ms 算会让回放快 15%，
+    # 手到得早、抓取位置偏。
+    #
+    # 优先级：
+    #   1) 调用方显式给 frame_dt
+    #   2) session.json 的 physics_dt（采集时用 SimulationManager 读的真值）
+    #   3) 墙钟反推：duration_sec / physics_steps
+    #   4) 兜底 5ms（并明确告警）
     dt = frame_dt
     if dt is None:
         every = int(meta.get("every", 0) or 0)
-        # 从 sim_step 反推真实步长，比假设 5ms 更稳
-        if len(sim_steps) >= 2:
-            dsteps = np.diff(sim_steps)
-            med = float(np.median(dsteps)) if dsteps.size else 0.0
-            if med > 0:
-                # 物理步长从 session.json 拿不到，用 5ms（200Hz）作为标称值，
-                # 但优先用 sim_step 差值算出的"每帧物理步数"
-                dt = med * 0.005
-        if dt is None or dt <= 0:
-            dt = (every or 10) * 0.005
+        dsteps = np.diff(sim_steps) if len(sim_steps) >= 2 else np.array([])
+        med = float(np.median(dsteps)) if dsteps.size else float(every or 10)
+
+        phys_dt = float(meta.get("physics_dt", 0) or 0)
+        src = "session.json physics_dt"
+        if phys_dt <= 0:
+            n_phys = float(meta.get("physics_steps", 0) or 0)
+            dur = float(meta.get("duration_sec", 0) or 0)
+            if n_phys > 0 and dur > 0:
+                phys_dt = dur / n_phys
+                src = f"墙钟反推 ({phys_dt*1000:.3f}ms)"
+        if phys_dt <= 0:
+            phys_dt = 0.005
+            src = "兜底假设 5ms（可能不准！）"
+            _log("WARN session.json 没有 physics_dt，退回假设 5ms —— "
+                 "若回放速度不对，用 --frame-dt 手动指定")
+        dt = med * phys_dt
+        _log(f"帧间隔推算: {med:g} 物理步 × {phys_dt*1000:.3f}ms "
+             f"= {dt*1000:.2f}ms   来源: {src}")
     dt = float(dt)
     n = len(cols["joint_pos"])
     t = np.arange(n, dtype=np.float64) * dt

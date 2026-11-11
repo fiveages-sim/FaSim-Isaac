@@ -79,12 +79,32 @@ def load_tracks(session_dir: str | Path) -> dict[str, Any]:
         raise ValueError("没有 joint_pos（采集时关了 record_joints？trim 需要关节角）")
 
     steps = np.asarray(sim_steps, dtype=np.int64)
-    # 帧间隔（秒）：用 sim_step 差值 × 物理步长（标称 5ms）
+    # 帧间隔（秒）：sim_step 差值 × **真实**物理步长。
+    # 不能假设 5ms —— 实测这台机器 5.876ms（177Hz），按 5ms 算会让时间轴
+    # 偏快 15%。优先用 session.json 的 physics_dt，其次墙钟反推。
+    phys_dt = 0.0
+    try:
+        sj = d / "session.json"
+        if sj.is_file():
+            meta = json.loads(sj.read_text(encoding="utf-8"))
+            phys_dt = float(meta.get("physics_dt", 0) or 0)
+            if phys_dt <= 0:
+                n_phys = float(meta.get("physics_steps", 0) or 0)
+                dur = float(meta.get("duration_sec", 0) or 0)
+                if n_phys > 0 and dur > 0:
+                    phys_dt = dur / n_phys
+    except Exception:  # noqa: BLE001
+        pass
+    if phys_dt <= 0:
+        phys_dt = 0.005
+        _log("WARN 没有 physics_dt，退回假设 5ms（时间轴可能偏）")
+
     if len(steps) >= 2:
         dstep = float(np.median(np.diff(steps)))
-        dt = dstep * 0.005 if dstep > 0 else 0.05
+        dt = dstep * phys_dt if dstep > 0 else phys_dt * 10
     else:
-        dt = 0.05
+        dt = phys_dt * 10
+    _log(f"帧间隔: {dt*1000:.2f} ms（物理步长 {phys_dt*1000:.3f}ms）")
 
     return {
         "dir": d,

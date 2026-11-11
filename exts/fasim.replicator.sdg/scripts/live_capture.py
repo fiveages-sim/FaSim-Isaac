@@ -259,13 +259,30 @@ def arm_capture(
 
     import time
 
+    # 记录**真实**物理步长 —— pack 用它算帧间隔，假设 5ms 会导致速度偏差。
+    # 实测这台机器物理步长 5.876ms（177Hz 而非 200Hz），若按 5ms 换算，
+    # 回放会快 15%，手到得早、位置偏。
+    physics_dt = 0.0
+    try:
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        physics_dt = float(SimulationManager.get_physics_dt())
+        if physics_dt <= 0:
+            physics_dt = 0.0
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 读物理步长失败（pack 将回退假设 5ms）: {exc}")
+
     _S.update(
         armed=True, cameras=cams, out=out, every=max(1, int(every)),
         step=0, saved=0, skipped=0, t0=time.monotonic(), records=[],
         size=cams[0]["size"] if cams else (0, 0),
         ee_views=ee_views, obj_views=obj_views, what=what,
         code_stamp=_code_stamp(),
+        physics_dt=physics_dt,
     )
+    if physics_dt > 0:
+        _log(f"物理步长 {physics_dt*1000:.3f} ms（{1/physics_dt:.1f} Hz）"
+             f"→ 每帧 {physics_dt*max(1,int(every))*1000:.2f} ms")
 
     def _on_physics_step(dt: float) -> None:
         """物理步进回调：按 every 降采样，取最近渲染的一帧落盘。必须快速返回。
@@ -396,6 +413,7 @@ def stop_capture() -> dict:
         "ee_captured": sorted(_S.get("ee_views", {}).keys()),
         "objects_captured": sorted(_S.get("obj_views", {}).keys()),
         "code_stamp": _S.get("code_stamp", "unknown"),
+        "physics_dt": _S.get("physics_dt", 0.0),
     }
     try:
         (out / "session.json").write_text(
