@@ -529,6 +529,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         "end": args.end,
         "loop": args.loop,
         "robot_key": args.robot,
+        "task_key": args.task,
         "pause_cm": bool(args.pause_cm),
         "home_frames": int(args.home_frames),
         "waist_gain": str(args.waist_gain),
@@ -700,6 +701,8 @@ def main(argv: list[str] | None = None) -> int:
     lv = sub.add_parser("live", help="在同一 Isaac 实例里回放 episode（不弹新窗口）")
     lv.add_argument("episode")
     lv.add_argument("--robot", default="unitree_g1d")
+    lv.add_argument("--task", default="sinopec_test_tube",
+                    help="任务配置 key（用于找 tracked_prims 复位物体）")
     lv.add_argument("--drive", choices=("joints", "ee"), default="joints",
                     help="joints=逐帧 drive 关节角（不需要 ROS）；"
                     "ee=发末端位姿给运控 /left_target,/right_target")

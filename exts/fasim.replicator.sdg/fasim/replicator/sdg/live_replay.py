@@ -124,6 +124,7 @@ def play_episode(
     waist_gain: str = "usd",
     joint_api: str = "target",
     reset_objects: bool = True,
+    task_key: str = "sinopec_test_tube",
 ) -> dict:
     """在当前 Isaac 实例里**非阻塞**回放 —— 只装载，靠 update 推进。
 
