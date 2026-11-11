@@ -79,8 +79,8 @@ def pack_episode(
     Returns:
         写出的 npz 路径。
     """
-    entries, meta, d = load_session(session_dir)
-    out = Path(out_path).expanduser() if out_path else d / "episode.npz"
+    entries, meta, session_dir_p = load_session(session_dir)
+    out = Path(out_path).expanduser() if out_path else session_dir_p / "episode.npz"
 
     # --- 逐帧读取，按 key 归并 ---
     cols: dict[str, list[Any]] = {}
@@ -194,7 +194,7 @@ def pack_episode(
             json.dumps(
                 {
                     "kind": "live_capture",
-                    "source_session": str(d),
+                    "source_session": str(session_dir_p),
                     "frames": n,
                     "frame_dt": dt,
                     "every": meta.get("every"),
@@ -226,46 +226,18 @@ def pack_episode(
         elif (k.endswith("_pos_xform") or k.endswith("_quat_xform")) and len(v) == n:
             payload[k] = np.stack(v).astype(np.float64)
 
-    # 末端**指令**位姿 —— EE 回放用（见 fk.compute_cmd_poses 的说明）。
-    # 采集时 Isaac 侧拿不到（那是运控 MPC 内部解），所以用 FK 从
-    # joint_pos_cmd 反算，存进 episode 免得每次回放都算一遍。
+    # 末端**指令**位姿：暂不计算。
+    #
+    # 为什么不在这里用 FK 反算（虽然可行）：
+    #   1) 会让 pack 依赖运动学解算（项目原则：不引入外部工具）
+    #   2) 目前还在验证 EE 回放能不能直接发**真值**给运控 —— 运控是闭环、
+    #      两端 frame 都是 world，理论上它能自己收敛过去，误差不会被放大两次
+    #      （这一点和关节回放不同：关节是直接 drive 位置，运控闭环有反馈）。
+    #
+    # 若实测发现 EE 回放偏下，再回来在这里补 <side>_cmd_pos。
+    # 相关讨论见 fk.compute_cmd_poses 的文档。
     if joint_pos_cmd is not None:
-        try:
-            from .fk import TcpFK
-
-            fk = TcpFK()
-            names = joint_names or [f"j{i}" for i in range(joint_pos.shape[1])]
-            # base 位姿用**实测**末端 + 实测关节角解（真实几何）
-            rest = {}
-            restq = {}
-            for side in fk.ee_frames:
-                pv = payload.get(f"{side}_pos")
-                qv = payload.get(f"{side}_quat")
-                if pv is not None and np.isfinite(np.asarray(pv)).any():
-                    rest[side] = np.asarray(pv)[0]
-                    if qv is not None:
-                        restq[side] = np.asarray(qv)[0]
-            if rest:
-                fk.solve_base_from_rest(rest, restq or None)
-            cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
-            for side, (pos, quat) in cmd_poses.items():
-                payload[f"{side}_cmd_pos"] = pos
-                payload[f"{side}_cmd_quat"] = quat
-            _log("  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算并写入"
-                 "（EE 回放用这个，不会多偏一次）")
-            # 顺带报告指令与实测的差 —— 这就是"手偏低"的量
-            for side in fk.ee_frames:
-                pv = payload.get(f"{side}_pos")
-                if pv is None:
-                    continue
-                d = np.linalg.norm(
-                    np.asarray(pv) - payload[f"{side}_cmd_pos"], axis=1
-                ) * 1000
-                if np.isfinite(d).any():
-                    _log(f"    {side}: 实测比指令低 mean={np.nanmean(d):.1f}mm "
-                         f"max={np.nanmax(d):.1f}mm（物理稳态误差）")
-        except Exception as exc:  # noqa: BLE001
-            _log(f"  WARN 反算末端指令位姿失败（EE 回放将回退实测值）: {exc}")
+        _log("  末端指令位姿: 未计算（EE 回放先发真值试效果）")
 
     # 下发目标关节角 —— 回放用它。
     if joint_pos_cmd is not None:
@@ -317,13 +289,14 @@ def pack_episode(
         if xv is not None:
             xv = np.asarray(xv)
             xt = float(np.linalg.norm(xv - xv[0], axis=1).max() * 1000)
-            d = np.linalg.norm(pv - xv, axis=1) * 1000
-            line += f"  |  Xform 对照 travel={xt:.1f}mm 差值 mean={d.mean():.1f}mm"
+            # 注意变量名：这里**绝不能**叫 d —— 会把上面的目录变量 d 覆盖掉
+            xdev = np.linalg.norm(pv - xv, axis=1) * 1000
+            line += f"  |  Xform 对照 travel={xt:.1f}mm 差值 mean={xdev.mean():.1f}mm"
         _log(line)
     if any(k.endswith("_pos_xform") for k in payload):
         _log("  注: *_xform 是 Xform 直读的静态对照值，训练时必须忽略")
     if has_cam:
-        _log(f"  相机图像仍在 {d / 'frames'}（未并入 npz）")
+        _log(f"  相机图像仍在 {session_dir_p / 'frames'}（未并入 npz）")
     # 缺末端/物体时明确告警（否则 pack 只说「无」，看不出是采集没采还是
     # 转换丢了）
     if not ee:

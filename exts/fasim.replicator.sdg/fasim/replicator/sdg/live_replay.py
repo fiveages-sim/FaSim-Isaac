@@ -267,46 +267,28 @@ def play_episode(
                 "error": "episode 没有末端位姿（left_pos/right_pos 含 NaN）。"
                          "采集要选 ee：sdg.sh capture --what joint,ee",
             }
-        # **发指令位姿，不发实测位姿**。
+        # 目标位姿 = **实测真值**（left_pos/right_pos）。
         #
-        # 这是 EE 回放最容易踩的坑，和关节回放的「cmd vs actual」是同一个：
-        # 运控收到目标后自己执行一次，产生稳态误差 e，手落在 目标−e。
-        # 若发的是实测位姿（已含 −e），就变成 目标−2e，手稳定偏下。
+        # 为什么这里可以直接发真值（和关节回放不同）：
+        # 关节回放是往 drive 写位置目标 —— 物理跟不到位就少走一段，没有任何
+        # 东西来纠正，所以「目标已经含误差」会导致误差叠加两次。
         #
-        # 取指令位姿：优先 episode 里现成的 *_cmd_pos；没有则用 FK 从
-        # joint_pos_cmd 反算（与运控 eeFrame 同源）。
-        ee_pos: dict[str, np.ndarray] = {}
-        ee_quat: dict[str, np.ndarray] = {}
-        try:
-            from .fk import compute_cmd_poses
-
-            need_fk = any(
-                getattr(episode, f"{s}_cmd_pos", None) is None
-                for s in ("left", "right")
-            )
-            fk_cmd = compute_cmd_poses(episode.path) if (need_fk and episode.path) else {}
-            for side in ("left", "right"):
-                cp = getattr(episode, f"{side}_cmd_pos", None)
-                cq = getattr(episode, f"{side}_cmd_quat", None)
-                if cp is not None and cq is not None and np.isfinite(cp).all():
-                    ee_pos[side], ee_quat[side] = np.asarray(cp), np.asarray(cq)
-                    src = "episode *_cmd_pos"
-                elif side in fk_cmd:
-                    ee_pos[side], ee_quat[side] = fk_cmd[side]
-                    src = "FK(joint_pos_cmd)"
-                else:
-                    ee_pos[side] = np.asarray(getattr(episode, f"{side}_pos"))
-                    ee_quat[side] = np.asarray(getattr(episode, f"{side}_quat"))
-                    src = "实测值（会多偏一次！）"
-                _log(f"  末端 {side} 目标来源: {src}")
-            if need_fk and fk_cmd:
-                _log("  提示: 用 FK 从 joint_pos_cmd 反算指令位姿"
-                     "（与运控 eeFrame 同源）")
-        except Exception as exc:  # noqa: BLE001
-            _log(f"WARN 取指令位姿失败（{exc}），回退实测值 —— 末端可能偏下 2-3cm")
-            for side in ("left", "right"):
-                ee_pos[side] = np.asarray(getattr(episode, f"{side}_pos"))
-                ee_quat[side] = np.asarray(getattr(episode, f"{side}_quat"))
+        # 而 EE 回放是发给 OCS2 的**闭环**控制器：它拿 world 系目标做
+        # IK/MPC，跟踪不上会持续纠偏，不会把误差当新目标再偏一次。
+        # 两端 frame 都是 world，语义直接对齐。
+        #
+        # 先这样试 —— 若实测仍然稳定偏下，再改用「指令位姿」为目标
+        # （需从 joint_pos_cmd 做正解，见 fk.compute_cmd_poses）。
+        ee_pos = {
+            "left": np.asarray(episode.left_pos, dtype=np.float64),
+            "right": np.asarray(episode.right_pos, dtype=np.float64),
+        }
+        ee_quat = {
+            "left": np.asarray(episode.left_quat, dtype=np.float64),
+            "right": np.asarray(episode.right_quat, dtype=np.float64),
+        }
+        _log("末端目标来源: episode 实测真值（left_pos/right_pos，world 系）")
+        _log("  运控是闭环，会把误差纠回来；先这样试效果")
 
         try:
             import rclpy
