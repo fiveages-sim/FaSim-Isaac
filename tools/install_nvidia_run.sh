@@ -15,13 +15,23 @@
 #                                                   # 保留 NVreg_PreserveVideoMemoryAllocations=1
 #   sudo ./tools/install_nvidia_run.sh --uninstall  # 卸载 .run 驱动（回滚第一步）
 #   sudo ./tools/install_nvidia_run.sh --no-apt-pin # 不写 apt pin（默认写，防 unattended-upgrades 装回 apt 驱动）
+#   sudo ./tools/install_nvidia_run.sh --allow-loaded
+#                                                   # 模块仍在用时也继续（安装器基本必然失败，仅调试用）
+#
+# 重要：nvidia-installer 的 sanity check 只要检测到 nvidia-drm 已加载就会中止。
+# 图形会话会把 nvidia_drm 立刻拉回来，所以必须在多用户模式下安装：
+#   Ctrl+Alt+F3 登录 TTY → sudo systemctl isolate multi-user.target
+#   sudo ./tools/install_nvidia_run.sh
+#   sudo systemctl isolate graphical.target   （或 reboot）
 #
 # 环境变量：
 #   NVIDIA_RUN_VERSION=595.58.03   目标版本（默认 595.112.07）
 #   NVIDIA_RUN_CACHE=/var/tmp/nvidia-run   runfile 缓存目录
 #
-# 说明：全程非交互（stdin=/dev/null + --no-questions），不会等待输入，也不会因为
-# 图形会话而阻塞；如果当前还有残留 NVIDIA 模块，脚本会先尽力卸载，卸不掉只告警。
+# 说明：全程非交互（stdin=/dev/null + --no-questions），不会等待输入。但
+# nvidia-installer 的 sanity check 只要看到 nvidia-drm 已加载就会提示并中止，
+# 而图形会话会立刻把它重新加载，所以脚本在模块卸不掉时直接报错退出，
+# 需在多用户模式（TTY）下执行；确需强装时加 --allow-loaded。
 # 当前无驱动加载时（nvidia-smi 不存在）可直接在桌面终端运行。
 set -euo pipefail
 
@@ -36,6 +46,7 @@ DRY_RUN=0
 UNINSTALL=0
 KEEP_SUSPEND=0
 APT_PIN=1
+ALLOW_LOADED=0
 APT_PIN_FILE="/etc/apt/preferences.d/90-nvidia-run.pref"
 
 # apt 管理、需要在新驱动前移除的包（不含 libnvidia-container* / nvidia-container-toolkit*）
@@ -67,6 +78,7 @@ for arg in "$@"; do
     --uninstall) UNINSTALL=1 ;;
     --keep-suspend-resume) KEEP_SUSPEND=1 ;;
     --no-apt-pin) APT_PIN=0 ;;
+    --allow-loaded) ALLOW_LOADED=1 ;;
     -h|--help) usage; exit 0 ;;
     *) error "未知参数: $arg"; usage; exit 1 ;;
   esac
@@ -91,14 +103,25 @@ fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
   if lsmod | grep -qE '^nvidia'; then
-    info "检测到残留 NVIDIA 模块，尝试卸载（失败也继续，不会阻塞）"
+    info "检测到已加载的 NVIDIA 模块，尝试卸载"
     for m in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
       modprobe -r "$m" 2>/dev/null || true
     done
     if lsmod | grep -qE '^nvidia'; then
-      warn "仍有 NVIDIA 模块在使用中；如安装器报 sanity check 失败，重启后重跑本脚本即可"
+      if [ "$ALLOW_LOADED" -eq 1 ]; then
+        warn "仍有 NVIDIA 模块在使用中（--allow-loaded）：安装器很可能因 sanity check 中止"
+      else
+        error "NVIDIA 模块仍在使用中（nvidia-drm refcount 非 0），安装器一定会因 sanity check 失败而中止"
+        error "请先离开图形会话再装："
+        error "    Ctrl+Alt+F3 登录 TTY（或在多用户模式下运行）"
+        error "    sudo systemctl isolate multi-user.target"
+        error "    sudo $0 $*"
+        error "    sudo systemctl isolate graphical.target   # 装完切回桌面"
+        error "确实要强装可加 --allow-loaded"
+        exit 1
+      fi
     else
-      info "  已全部卸载"
+      info "  NVIDIA 模块已全部卸载，可以安装"
     fi
   else
     info "当前没有加载中的 NVIDIA 模块，可直接安装"

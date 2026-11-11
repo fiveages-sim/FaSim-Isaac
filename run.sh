@@ -26,6 +26,7 @@ CLI_CPU=""
 CLI_ROS_WS=""
 CLI_INSTANCE=""
 CLI_KIT_PROFILE=""
+CLI_ASSET_REGION=""
 LIST_KIT_PROFILES=0
 NONINTERACTIVE=0
 
@@ -42,6 +43,9 @@ usage() {
   --ros-ws PATH         默认加载的 ROS2 工作空间（含 install/setup.bash）
   --instance N          Headless 实例序号（端口 / ROS_DOMAIN_ID）
   --kit-profile NAME    Kit settings 预设档位（默认 none）
+  --asset-region none|us|china
+                        Isaac 资产区：none=不改环境变量；china=国内镜像；
+                        us=切回主站（会 unset ISAACSIM_ASSET_ROOT）
   --list-kit-profiles   列出可用档位后退出
   -y, --yes             非交互：全部用配置/默认值
   -h, --help
@@ -65,6 +69,9 @@ while [ $# -gt 0 ]; do
             ;;
         --kit-profile)
             CLI_KIT_PROFILE="${2:-}"; shift 2
+            ;;
+        --asset-region)
+            CLI_ASSET_REGION="${2:-}"; shift 2
             ;;
         --list-kit-profiles)
             LIST_KIT_PROFILES=1; shift
@@ -116,6 +123,7 @@ RUN_PHYSICS_BACKEND="${RUN_PHYSICS_BACKEND:-physx}"
 RUN_SET_CPU_PERFORMANCE="${RUN_SET_CPU_PERFORMANCE:-auto}"
 RUN_ROS2_WS="${RUN_ROS2_WS:-${HOME}/ros2_ws}"
 RUN_ISAAC_ROS_WS="${RUN_ISAAC_ROS_WS:-${SCRIPT_DIR}/${ISAAC_JAZZY_WS_NAME:-isaac_jazzy_ws}}"
+RUN_ASSET_REGION_PROFILE="${RUN_ASSET_REGION_PROFILE:-none}"
 RUN_SAVE_LOCAL="${RUN_SAVE_LOCAL:-1}"
 
 is_container_env() {
@@ -263,12 +271,13 @@ save_local_conf() {
         echo "RUN_SET_CPU_PERFORMANCE=\"${RUN_SET_CPU_PERFORMANCE}\""
         echo "RUN_ROS2_WS=\"${RUN_ROS2_WS}\""
         echo "RUN_ISAAC_ROS_WS=\"${RUN_ISAAC_ROS_WS}\""
+        echo "RUN_ASSET_REGION_PROFILE=\"${RUN_ASSET_REGION_PROFILE:-none}\""
         if [ -f "$FA_SIM_LOCAL_CONFIG" ]; then
             # 保留用户其它键（非本次管理的）；丢掉会破坏 ROS/Kit 的 PYTHONPATH 清场行
             while IFS= read -r line || [ -n "$line" ]; do
                 case "$line" in
                     ''|\#*) continue ;;
-                    ISAACSIM_DIR=*|RUN_PHYSICS_BACKEND=*|RUN_KIT_PROFILE=*|RUN_SET_CPU_PERFORMANCE=*|RUN_ROS2_WS=*|RUN_ISAAC_ROS_WS=*|RUN_SAVE_LOCAL=*)
+                    ISAACSIM_DIR=*|RUN_PHYSICS_BACKEND=*|RUN_KIT_PROFILE=*|RUN_SET_CPU_PERFORMANCE=*|RUN_ROS2_WS=*|RUN_ISAAC_ROS_WS=*|RUN_ASSET_REGION_PROFILE=*|RUN_SAVE_LOCAL=*)
                         continue
                         ;;
                     unset\ PYTHONPATH*|unset\ PYTHONPATH|PYTHONPATH=*)
@@ -284,6 +293,15 @@ save_local_conf() {
     print_info "已保存本机默认到 config/fa_sim.local.conf"
 }
 
+normalize_asset_region() {
+    case "${1,,}" in
+        ""|none|off|0|default) echo "none" ;;
+        us|usa|primary) echo "us" ;;
+        cn|china|zh|prc) echo "china" ;;
+        *) echo "" ;;
+    esac
+}
+
 print_config_summary() {
     local title="${1:-已保存的默认配置}"
     echo -e "${CYAN}${title}:${NC}"
@@ -291,6 +309,7 @@ print_config_summary() {
     echo "  CPU:      ${RUN_SET_CPU_PERFORMANCE}"
     echo "  ROS2 WS:  ${RUN_ROS2_WS}"
     echo "  Kit预设:  ${RUN_KIT_PROFILE:-none}"
+    echo "  资产区:   ${RUN_ASSET_REGION_PROFILE:-none}"
     if [ "$HEADLESS" -eq 1 ]; then
         echo "  Instance: ${FA_SIM_INSTANCE:-0}"
     fi
@@ -319,6 +338,14 @@ apply_cli_overrides() {
     fi
     if [ -n "$CLI_KIT_PROFILE" ]; then
         RUN_KIT_PROFILE="$CLI_KIT_PROFILE"
+    fi
+    if [ -n "$CLI_ASSET_REGION" ]; then
+        ans="$(normalize_asset_region "$CLI_ASSET_REGION")"
+        if [ -z "$ans" ]; then
+            print_error "无效 --asset-region: $CLI_ASSET_REGION（用 none|us|china）"
+            exit 1
+        fi
+        RUN_ASSET_REGION_PROFILE="$ans"
     fi
     if [ -n "${CLI_INSTANCE}" ]; then
         if ! is_nonneg_int "${CLI_INSTANCE}"; then
@@ -454,6 +481,31 @@ prompt_reselect_config() {
         RUN_KIT_PROFILE="$ans"
     fi
 
+    # --- Isaac 资产区（Asset Region Profile）---
+    echo ""
+    echo "Isaac 资产区（ISAACSIM_ASSET_REGION_PROFILE）:"
+    echo "  1) none   — 不改环境变量（沿用 Kit persistent 当前值）"
+    echo "  2) china  — 国内镜像（simready.cn / 上海 OSS）"
+    echo "  3) us     — 切回美西主站"
+    case "${RUN_ASSET_REGION_PROFILE:-none}" in
+        china) prompt_choice "选择 [1/2/3]" "2" ;;
+        us)    prompt_choice "选择 [1/2/3]" "3" ;;
+        *)     prompt_choice "选择 [1/2/3]" "1" ;;
+    esac
+    case "$REPLY" in
+        1) RUN_ASSET_REGION_PROFILE=none ;;
+        2) RUN_ASSET_REGION_PROFILE=china ;;
+        3) RUN_ASSET_REGION_PROFILE=us ;;
+        *)
+            ans="$(normalize_asset_region "$REPLY")"
+            if [ -z "$ans" ]; then
+                print_error "无效选项: $REPLY"
+                exit 1
+            fi
+            RUN_ASSET_REGION_PROFILE="$ans"
+            ;;
+    esac
+
     if [ "$HEADLESS" -eq 1 ]; then
         instance="${FA_SIM_INSTANCE:-0}"
         echo ""
@@ -475,6 +527,8 @@ interactive_config() {
     RUN_PHYSICS_BACKEND="${ans:-physx}"
     ans="$(normalize_cpu "${RUN_SET_CPU_PERFORMANCE}")"
     RUN_SET_CPU_PERFORMANCE="${ans:-auto}"
+    ans="$(normalize_asset_region "${RUN_ASSET_REGION_PROFILE:-none}")"
+    RUN_ASSET_REGION_PROFILE="${ans:-none}"
     FA_SIM_INSTANCE="${FA_SIM_INSTANCE:-0}"
 
     apply_cli_overrides
@@ -499,7 +553,7 @@ interactive_config() {
 
     if [ "$NONINTERACTIVE" -eq 1 ]; then
         reselect=0
-    elif [ -n "$CLI_PHYSICS$CLI_CPU$CLI_ROS_WS$CLI_INSTANCE" ]; then
+    elif [ -n "$CLI_PHYSICS$CLI_CPU$CLI_ROS_WS$CLI_INSTANCE$CLI_KIT_PROFILE$CLI_ASSET_REGION" ]; then
         # 命令行已指定部分项：不再进菜单，直接用（默认 + 覆盖）
         reselect=0
     else
@@ -707,6 +761,34 @@ sanitize_host_ros_paths_for_isaac() {
     fi
 }
 
+apply_asset_region_profile() {
+    # Isaac Sim: ISAACSIM_ASSET_ROOT 优先于 region profile；切区时必须清掉。
+    # none：不改环境变量（沿用 Kit persistent.isaac.asset_root）。
+    local profile
+    profile="$(normalize_asset_region "${RUN_ASSET_REGION_PROFILE:-none}")"
+    RUN_ASSET_REGION_PROFILE="${profile:-none}"
+    case "$RUN_ASSET_REGION_PROFILE" in
+        none)
+            print_info "资产区: none（不设置 ISAACSIM_ASSET_REGION_PROFILE）"
+            if [ -n "${ISAACSIM_ASSET_ROOT:-}" ]; then
+                print_info "  当前 ISAACSIM_ASSET_ROOT=${ISAACSIM_ASSET_ROOT}"
+            fi
+            ;;
+        us|china)
+            if [ -n "${ISAACSIM_ASSET_ROOT:-}" ]; then
+                print_warn "清除 ISAACSIM_ASSET_ROOT（否则会盖过 region profile）: ${ISAACSIM_ASSET_ROOT}"
+                unset ISAACSIM_ASSET_ROOT
+            fi
+            export ISAACSIM_ASSET_REGION_PROFILE="$RUN_ASSET_REGION_PROFILE"
+            print_info "资产区: ISAACSIM_ASSET_REGION_PROFILE=${ISAACSIM_ASSET_REGION_PROFILE}"
+            ;;
+        *)
+            print_error "内部错误: 未知资产区 ${RUN_ASSET_REGION_PROFILE}"
+            exit 1
+            ;;
+    esac
+}
+
 # --- main ---
 interactive_config
 set_cpu_performance
@@ -737,6 +819,7 @@ if [ -d "${_isaac_ros2_lib}" ]; then
 fi
 
 sanitize_host_ros_paths_for_isaac
+apply_asset_region_profile
 build_isaac_excluded_ext_args
 if [ "${#ISAAC_EXCLUDED_EXTS[@]}" -gt 0 ]; then
     print_info "禁用冲突扩展: ${ISAAC_EXCLUDED_EXTS[*]}"
