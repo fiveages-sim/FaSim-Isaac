@@ -642,6 +642,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
             args.session,
             out_path=args.out or None,
             frame_dt=args.frame_dt or None,
+            robot_key=getattr(args, "robot", "") or None,
         )
     except Exception as exc:  # noqa: BLE001
         _log(f"ERROR {exc}")
@@ -982,6 +983,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default="", help="输出 npz；留空 <session>/episode.npz")
     p.add_argument("--frame-dt", type=float, default=0.0,
                    help="帧间隔（秒）；留空自动推算")
+    p.add_argument(
+        "--robot", default="",
+        help="机器人 key，用于读 configs/<robot>/robot.yaml 的 planning 段"
+        "（决定反算末端指令位姿用哪份 URDF）。留空自动从会话目录猜",
+    )
     p.set_defaults(func=cmd_pack)
 
     v = sub.add_parser("preview", help="用层2 回放路径预览 episode（需 Isaac python）")

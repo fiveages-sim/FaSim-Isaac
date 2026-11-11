@@ -1,64 +1,70 @@
 """从关节角算 tcp 位姿 —— 纯 numpy，不依赖 pinocchio。
 
-为什么需要这个
-==============
-1. **末端真值**：``left_tcp`` / ``right_tcp`` 是纯 Xform（fixed joint 的子
-   frame）。newton kit 里关了 PhysX→USD/Fabric 同步::
+用途（只有两个，都在"指令"侧）
+================================
+1. **末端指令位姿**（主要用途）
+   EE 回放必须发**指令目标**而不是实测值，否则运控二次叠加稳态误差::
 
-       [settings.exts."omni.physx"]
-       updateToUsd                 = false
-       fabricUpdateTransformations = false
+       编排:   目标 → 运控 → 实测 = 目标 − 7~9mm      ✅
+       EE回放: 实测 → 运控 → 实测 − 7~9mm            ❌ 稳定偏下
 
-   所以 ``XformPrim.get_world_poses()`` 无论 usd/usdrt/fabric 后端都读到
-   authoring 静态值（实测 765 帧偏离 0.0mm，且值恰等于 q≈0 静止姿态位姿）。
+   指令位姿只存在于运控 MPC 内部；Isaac 侧只有关节指令角
+   ``joint_pos_cmd``（``get_dof_position_targets``，实测与 actual 无时间
+   滞后、连续可导，可信）。所以用 FK 把关节指令角换算成末端指令位姿。
 
-   采集侧已经改用「父刚体 + 固定偏移」解决（见 ``live_capture``），本模块
-   是**离线**交叉验证与回放诊断。
+2. **末端真值的离线交叉验证**
+   采集侧的真值已经用「父刚体 + 固定偏移」直读 PhysX（见 ``live_capture``），
+   本模块只用来对拍（差异应 < 3mm）。
 
-2. **末端指令位姿**：EE 回放必须发**指令目标**而不是实测值（否则稳态误差
-   叠加两次，手稳定偏下 2-3cm）。运控的指令位姿只存在于 MPC 内部，Isaac
-   侧只有关节目标 ``joint_pos_cmd`` —— 必须做正解才能得到对应 tcp 位姿。
-
-   这一步无法用"实测手腕位姿 + 固定偏移"替代：末端偏移大部分来自根部
-   关节（肩，力臂约 50cm），而刚体读到的手腕位姿已经含了这些误差。
+**为什么末端真值不用 FK**：``left_tcp`` 是纯 Xform，newton kit 关了
+PhysX→USD/Fabric 同步（``updateToUsd=false``），直接读只会得到静态值。
+刚体读取绕开了这个管道，比 FK 更贴近"仿真实际发生的事"。
 
 为什么不用 pinocchio
 ====================
-本项目的原则是**不引入外部工具依赖**。而且：
-
-- Isaac 的 python 里没有 pinocchio（``ModuleNotFoundError``）
-- ``sdg.sh pack`` 走系统 python，也没有
-
-planning URDF 结构很简单（只有 fixed / revolute / prismatic，18 个驱动
-关节），从根到 tcp 的链式变换用 numpy 累乘即可，约 100 行。
+项目原则是不引入外部工具。而且 Isaac python 与 ``sdg.sh pack`` 用的系统
+python 里都没有 pinocchio。planning URDF 结构简单（只有 fixed / revolute /
+prismatic），链式变换用 numpy 累乘即可。
 
 实现要点
 ========
-- URDF 的 ``<origin xyz rpy>`` 是 parent→child 的固定变换，固定轴 XYZ：
+- URDF ``<origin xyz rpy>`` 是 parent→child 固定变换，固定轴 XYZ：
   ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``
-- 关节运动叠在 origin **之后**（在 joint frame 里）：
+- 关节运动叠在 origin 之后（joint frame 内）：
   ``T = Trans(xyz) @ R_rpy @ Rot(axis, q)``
 - 只走 root→tip 的单链，忽略其他分支（脚轮/相机等）
 
-准确性
-======
-与 pinocchio 对同一份 planning URDF 的结果差异 < 0.1mm（在
-``__main__`` 的自检里可复现）。采集数据上，本模块 FK 与刚体读取的实测
-末端互差约 2mm —— 那反映的是 URDF 装配角与 USD 的细微差异，不是算法误差。
+迁移到新机器人
+==============
+**不需要改本文件**。在 ``configs/<robot>/robot.yaml`` 配::
+
+    planning:
+      urdf: auto            # 从运控缓存自动找（改配置会生成新 hash，取最新）
+      cache_dir: ""         # 留空 = $OCS2_PLANNING_URDF_DIR 或 /tmp
+      ee_frames:
+        left: left_tcp      # 对应运控 .info 的 eeFrame
+        right: right_tcp    # 对应 eeFrame1
+
+前置条件：运控已经在跑过（缓存目录里得有
+``<cache>/ocs2_ros2/<robot>/planning_urdf/*.urdf``）。URDF 的缓存规则见
+robot_common_launch/common/robot_utils.py 的 ``get_planning_urdf_cache_dir``
+与 ``_planning_urdf_cache_key`` —— hash 依赖 xacro 映射参数，无法复算，
+所以按 mtime 取最新。
+
+若某个机器人不想启用 FK：``urdf: none``，此后 EE 回放回退发实测位姿
+（精度差 7~9mm）。指定了 ``robot_key`` 却找不到对应 URDF 时**不会**跨机器人
+回退 —— 宁可失败也不要拿错模型算出错误位姿。
 """
 
 from __future__ import annotations
 
 import math
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-#: OCS2 编译缓存目录里的 planning URDF —— 运控运行时**真正**用的那份，
-#: 与 ``eeFrame`` 语义严格一致，优先级最高。
-PLANNING_URDF_GLOB = "/tmp/ocs2_ros2/*/planning_urdf/*.urdf"
 
 #: 兜底：手工 xacro 生成的 URDF（语义相同，但可能不是运控当前用的版本）
 FALLBACK_URDFS = (
@@ -74,16 +80,106 @@ def _log(msg: str) -> None:
     print(f"[fk] {msg}", flush=True)
 
 
-def find_planning_urdf() -> Path | None:
-    """找 OCS2 实际加载的 planning URDF（优先 /tmp/ocs2_ros2 下最新那份）。
+def find_planning_urdf(
+    robot_key: str | None = None,
+    cache_dir: str | Path | None = None,
+) -> Path | None:
+    """找 OCS2 实际加载的 planning URDF。
 
-    OCS2 把（URDF + .info 的 hash）编到 ``/tmp/ocs2_ros2/<robot>/planning_urdf/``
-    下，那份就是运控运行时真正用的 —— 与 ``eeFrame`` 语义严格一致，所以
-    优先级最高。其余候选只是兜底。
+    运控把（xacro 参数 + schema 版本）的 sha256[:16] 当文件名，缓存到::
+
+        $OCS2_PLANNING_URDF_DIR/<robot>/planning_urdf/<hash>.urdf
+        （未设该环境变量时 base 为 /tmp）
+
+    见 robot_common_launch/common/robot_utils.py 的 get_planning_urdf_cache_dir
+    与 _planning_urdf_cache_key。hash 依赖 xacro 映射参数，我们无法复算，所以
+    **取 mtime 最新那份** —— 改过配置会生成新 hash，最新的就是当前在用的。
+
+    Args:
+        robot_key: 机器人名（缓存目录名）。给定时只在该子目录找。
+        cache_dir: 缓存根目录；``None`` 时读 ``OCS2_PLANNING_URDF_DIR`` 或 ``/tmp``。
+
+    Returns:
+        URDF 路径；找不到返回 ``None``。
     """
-    ocs2: list[Path] = [p for p in Path("/").glob(PLANNING_URDF_GLOB.lstrip("/")) if p.is_file()]
-    if ocs2:
-        return max(ocs2, key=lambda p: p.stat().st_mtime)
+    candidates: list[Path] = []
+    bases: list[Path] = []
+    if cache_dir:
+        bases.append(Path(str(cache_dir)).expanduser())
+    env_dir = os.environ.get("OCS2_PLANNING_URDF_DIR", "").strip()
+    if env_dir:
+        bases.append(Path(env_dir))
+    bases.append(Path("/tmp"))
+
+    for base in bases:
+        if not base.is_dir():
+            continue
+        # 根目录可能直接是 <...>/planning_urdf，也可能是 <...>/ocs2_ros2
+        for pat in (
+            "ocs2_ros2/*/planning_urdf/*.urdf",
+            "*/planning_urdf/*.urdf",
+            "planning_urdf/*.urdf",
+        ):
+            hits = [p for p in base.glob(pat) if p.is_file()]
+            if robot_key:
+                hits = [p for p in hits if robot_key in p.parts]
+            candidates.extend(hits)
+        if candidates:
+            break
+
+    if candidates:
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    if robot_key:
+        # 指定了机器人却找不到 —— **不要**跨机器人回退，否则会拿错 URDF
+        # 算出完全错误的末端位姿（多机器人场景下尤其危险）。
+        return None
+    for pat in FALLBACK_URDFS:
+        p = Path(pat).expanduser()
+        if p.is_file():
+            return p
+    return None
+
+
+def resolve_urdf_from_config(planning: dict[str, Any] | None,
+                             robot_key: str | None = None) -> Path | None:
+    """按 ``robot.yaml`` 的 ``planning`` 段决定用哪份 URDF。
+
+    ``urdf`` 取值：
+      - ``"auto"``（默认）：从运控缓存自动找
+      - ``"none"``：不启用 FK（返回 None）
+      - 其它：当路径用
+
+    迁移新机器人时只需要改这段配置 —— 见 ``configs/*/robot.yaml`` 的说明。
+    """
+    cfg = dict(planning or {})
+    raw = str(cfg.get("urdf") or "auto").strip()
+    if raw.lower() in ("none", "off", "disabled", ""):
+        return None
+    if raw.lower() not in ("auto", "cached", "cache"):
+        p = Path(raw).expanduser()
+        if p.is_file():
+            return p
+        _log(f"WARN planning.urdf 指定的文件不存在: {p}（回退自动查找）")
+    return find_planning_urdf(robot_key=robot_key,
+                              cache_dir=cfg.get("cache_dir") or None)
+
+
+def make_fk(planning: dict[str, Any] | None = None,
+            robot_key: str | None = None) -> "TcpFK | None":
+    """按配置构造 ``TcpFK``；未启用或无 URDF 时返回 ``None``（不抛异常）。
+
+    采集/转换链路用这个，保证「没配 FK 也不影响其他功能」。
+    """
+    cfg = dict(planning or {})
+    urdf = resolve_urdf_from_config(cfg, robot_key)
+    if urdf is None:
+        return None
+    frames = cfg.get("ee_frames") or None
+    try:
+        return TcpFK(urdf, ee_frames=frames or None)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 构造 FK 失败（{urdf}）: {exc}")
+        return None
     for pat in FALLBACK_URDFS:
         p = Path(pat)
         if p.is_file():

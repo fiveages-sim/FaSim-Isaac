@@ -71,6 +71,14 @@ def load_robot_config(robot_key: str, config_root: Path | None = None) -> RobotS
                 }
                 for k, v in (raw.get("ee_links") or {}).items()
             },
+            planning={
+                "urdf": str((raw.get("planning") or {}).get("urdf") or "auto"),
+                "cache_dir": str((raw.get("planning") or {}).get("cache_dir") or ""),
+                "ee_frames": {
+                    str(k): str(v)
+                    for k, v in ((raw.get("planning") or {}).get("ee_frames") or {}).items()
+                },
+            },
             gripper_joints=tuple(str(j) for j in (raw.get("gripper_joints") or ())),
             expected_dof_count=raw.get("expected_dof_count"),
         )

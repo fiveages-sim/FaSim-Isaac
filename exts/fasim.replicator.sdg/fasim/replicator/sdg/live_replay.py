@@ -294,26 +294,39 @@ def play_episode(
         if any(
             getattr(episode, f"{s}_cmd_pos", None) is None for s in ("left", "right")
         ):
-            # 老数据兜底：现场算
+            # 老数据兜底：现场算。走 robot.yaml 的 planning 配置，
+            # 迁移新机器人只需改那份配置（见 configs/*/robot.yaml）。
             try:
-                from .fk import TcpFK
+                from .config_io import load_robot_config
+                from .fk import make_fk
 
                 jpc = getattr(episode, "joint_pos_cmd", None)
                 if jpc is not None:
-                    fk = TcpFK()
-                    rest = {
-                        s: np.asarray(getattr(episode, f"{s}_pos"))[0]
-                        for s in fk.ee_frames
-                    }
-                    restq = {
-                        s: np.asarray(getattr(episode, f"{s}_quat"))[0]
-                        for s in fk.ee_frames
-                    }
-                    fk.solve_base_from_rest(rest, restq)
-                    got = fk.tcp_poses(np.asarray(jpc), episode.joint_names, to_world=True)
-                    for s, (p, q) in got.items():
-                        ee_pos[s], ee_quat[s] = p, q
-                    _log("  已现场用 FK 反算指令位姿（覆盖实测目标）")
+                    cfg: dict = {}
+                    try:
+                        cfg = dict(load_robot_config(robot_key).planning or {})
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"  读 {robot_key}/robot.yaml 失败（用默认）: {exc}")
+                    fk = make_fk(cfg, robot_key=robot_key)
+                    if fk is None:
+                        _log("WARN 没有可用 URDF（planning.urdf），无法反算指令位姿")
+                    else:
+                        rest = {
+                            s: np.asarray(getattr(episode, f"{s}_pos"))[0]
+                            for s in fk.ee_frames
+                        }
+                        restq = {
+                            s: np.asarray(getattr(episode, f"{s}_quat"))[0]
+                            for s in fk.ee_frames
+                        }
+                        fk.solve_base_from_rest(rest, restq)
+                        got = fk.tcp_poses(
+                            np.asarray(jpc), episode.joint_names, to_world=True
+                        )
+                        for s, (p, q) in got.items():
+                            ee_pos[s], ee_quat[s] = p, q
+                        _log(f"  已现场用 FK 反算指令位姿（URDF="
+                             f"{__import__('pathlib').Path(fk.urdf_path).name}）")
                 else:
                     _log("WARN episode 没有 joint_pos_cmd —— 无法反算指令位姿，"
                          "EE 回放会明显偏下")

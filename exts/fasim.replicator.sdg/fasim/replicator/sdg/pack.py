@@ -67,6 +67,7 @@ def pack_episode(
     session_dir: str | Path,
     out_path: str | Path | None = None,
     frame_dt: float | None = None,
+    robot_key: str | None = None,
 ) -> Path:
     """把采集会话转成层2 能读的 episode npz。
 
@@ -75,6 +76,8 @@ def pack_episode(
         out_path: 输出 npz；留空 = ``<session_dir>/episode.npz``。
         frame_dt: 帧间隔（秒）。留空从 ``physics_dt × every`` 推算，
             取不到就用 0.05（20fps）。
+        robot_key: 用于读 ``configs/<robot>/robot.yaml`` 的 ``planning`` 段，
+            决定 FK 用哪份 URDF。留空则按会话目录名猜、再不行自动找。
 
     Returns:
         写出的 npz 路径。
@@ -230,49 +233,85 @@ def pack_episode(
     #
     # 为什么必须有：``left_pos``/``right_pos`` 是**实测**（含运控没跟到位的
     # 那部分）。EE 回放若直接把它当目标发出去，运控执行一次又掉同样的量：
-    #     编排:   目标 → 运控 → 实测 = 目标 − 8.7mm     ✅
-    #     EE回放: 实测 → 运控 → 实测 − 8.7mm           ❌ 又低一次
-    # 实测 act01：指令比实测高 mean 8.7mm / max 34.7mm，平均 dz=+8.4mm
+    #     编排:   目标 → 运控 → 实测 = 目标 − 7~9mm     ✅
+    #     EE回放: 实测 → 运控 → 实测 − 7~9mm           ❌ 又低一次
+    # 实测 act01：指令比实测高 mean 7.2/7.4mm、dz +6.4/+6.5mm
     # —— 正是"右手抓试管偏下"的量化来源。
     #
     # 采集端拿不到运控 MPC 内部的指令位姿，但 ``joint_pos_cmd``（下发目标
-    # 关节角）是准的（Isaac 直读 drive，不经同步管道）。所以用 FK 反算 ——
-    # 用的是 OCS2 实际加载的 planning URDF，与 eeFrame 同源。
+    # 关节角）是准的（Isaac get_dof_position_targets 直读 drive，实测 lag=0）。
+    # 所以用 FK 反算 —— 用的是**运控自己加载的那份** planning URDF，
+    # 与 OCS2 的 eeFrame 同源。
+    #
+    # 迁移新机器人：只需改 configs/<robot>/robot.yaml 的 planning 段
+    # （见那里的说明）。urdf: none 可关闭，此时 EE 回放会回退实测位姿。
     if joint_pos_cmd is not None:
         try:
-            from .fk import TcpFK
+            from .config_io import CONFIG_ROOT, load_robot_config
+            from .fk import make_fk
 
-            fk = TcpFK()
-            names = joint_names or [f"j{i}" for i in range(joint_pos.shape[1])]
-            rest: dict[str, np.ndarray] = {}
-            restq: dict[str, np.ndarray] = {}
-            for side in fk.ee_frames:
-                pv = payload.get(f"{side}_pos")
-                qv = payload.get(f"{side}_quat")
-                if pv is not None and np.isfinite(np.asarray(pv)).any():
-                    rest[side] = np.asarray(pv)[0]
-                    if qv is not None:
-                        restq[side] = np.asarray(qv)[0]
-            if rest:
-                fk.solve_base_from_rest(rest, restq or None)
-            cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
-            for side, (pos, quat) in cmd_poses.items():
-                payload[f"{side}_cmd_pos"] = pos
-                payload[f"{side}_cmd_quat"] = quat
-            _log("  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算并写入"
-                 "（EE 回放用这个，不会多偏一次）")
-            for side in fk.ee_frames:
-                pv = payload.get(f"{side}_pos")
-                if pv is None:
-                    continue
-                cmd_err = np.linalg.norm(
-                    np.asarray(pv) - payload[f"{side}_cmd_pos"], axis=1
-                ) * 1000
-                if np.isfinite(cmd_err).any():
-                    dv = (payload[f"{side}_cmd_pos"] - np.asarray(pv))
-                    _log(f"    {side}: 实测比指令低 mean={np.nanmean(cmd_err):.1f}mm "
-                         f"max={np.nanmax(cmd_err):.1f}mm "
-                         f"dz={np.nanmean(dv[:, 2])*1000:+.1f}mm（物理稳态误差）")
+            rk = robot_key
+            if not rk:
+                # session.json 记的 robot_key（新采集会有）
+                rk = str(meta.get("robot_key") or "") or None
+            if not rk:
+                # 老会话兜底：从输出路径猜（<data_root>/<robot>/<task>/...）。
+                # 但输出目录名通常是**会话名**（act01/fix01）而不是机器人名，
+                # 所以要校验 configs/ 下真有这个目录才采信，否则宁可不用。
+                for c in (meta.get("out"), meta.get("source_session")):
+                    if not (c and isinstance(c, str)):
+                        continue
+                    for part in Path(c).parts:
+                        if (CONFIG_ROOT / part / "robot.yaml").is_file():
+                            rk = part
+                            break
+                    if rk:
+                        break
+            if not rk:
+                _log("  提示: 判断不出机器人配置，跳过末端指令位姿反算。"
+                     "加上 --robot <key>（如 --robot unitree_g1d）即可")
+            planning_cfg: dict = {}
+            if rk:
+                try:
+                    planning_cfg = dict(load_robot_config(rk).planning or {})
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"  WARN 读 {rk}/robot.yaml 失败（用默认 FK 配置）: {exc}")
+            # **没有 robot_key 就不要猜 URDF** —— 多机器人场景下拿错模型
+            # 算出的末端位姿是错的，比不算更危险。
+            fk = make_fk(planning_cfg, robot_key=rk) if rk else None
+            if fk is None:
+                _log("  末端指令位姿: 跳过 —— EE 回放将回退实测位姿，会偏 7~9mm")
+            else:
+                names = joint_names or [f"j{i}" for i in range(joint_pos.shape[1])]
+                rest: dict[str, np.ndarray] = {}
+                restq: dict[str, np.ndarray] = {}
+                for side in fk.ee_frames:
+                    pv = payload.get(f"{side}_pos")
+                    qv = payload.get(f"{side}_quat")
+                    if pv is not None and np.isfinite(np.asarray(pv)).any():
+                        rest[side] = np.asarray(pv)[0]
+                        if qv is not None:
+                            restq[side] = np.asarray(qv)[0]
+                if rest:
+                    fk.solve_base_from_rest(rest, restq or None)
+                cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
+                for side, (pos, quat) in cmd_poses.items():
+                    payload[f"{side}_cmd_pos"] = pos
+                    payload[f"{side}_cmd_quat"] = quat
+                _log(f"  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算"
+                     f"（URDF={Path(fk.urdf_path).name}）")
+                for side in fk.ee_frames:
+                    pv = payload.get(f"{side}_pos")
+                    if pv is None:
+                        continue
+                    cmd_err = np.linalg.norm(
+                        np.asarray(pv) - payload[f"{side}_cmd_pos"], axis=1
+                    ) * 1000
+                    if np.isfinite(cmd_err).any():
+                        dv = payload[f"{side}_cmd_pos"] - np.asarray(pv)
+                        _log(f"    {side}: 实测比指令低 mean={np.nanmean(cmd_err):.1f}mm "
+                             f"max={np.nanmax(cmd_err):.1f}mm "
+                             f"dz={np.nanmean(dv[:, 2])*1000:+.1f}mm（物理稳态误差）")
         except Exception as exc:  # noqa: BLE001
             _log(f"  WARN 反算末端指令位姿失败（EE 回放会偏下）: {exc}")
 

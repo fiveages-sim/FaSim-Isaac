@@ -51,3 +51,35 @@ gripper_joints:
 
 # 关节总数（含夹爪），用于录制后自检
 expected_dof_count: 32
+
+# ---------------------------------------------------------------------------
+# 运动学（只用于「把关节指令角换算成末端指令位姿」）
+# ---------------------------------------------------------------------------
+# 为什么需要：
+#   采集只记 joint_pos_cmd（下发给 drive 的目标关节角），但 EE 回放要发
+#   **末端指令位姿**。若直接发实测末端（left_pos），运控会再掉一次稳态误差
+#   —— 这就是「右手抓试管稳定偏下」的成因。
+#
+#   末端指令位姿只存在于运控 MPC 内部，Isaac 侧拿不到。唯一的算法是 FK：
+#   用**运控自己加载的那份 planning URDF** 做正解，与 OCS2 的 eeFrame 同源。
+#
+# 迁移到新机器人
+# --------------
+#   1) 确认运控能跑（缓存目录里有 <robot>/planning_urdf/*.urdf）
+#   2) 改 ee_frames 为运控 .info 里的 eeFrame / eeFrame1
+#   3) 一般不用改 urdf：默认从运控缓存自动找
+#   4) 若运控缓存不在默认位置（OCS2_PLANNING_URDF_DIR），显式写 urdf
+#
+#   不需要 FK 的机器人（或不想用）把 urdf 设为 none 即可 —— 此时 EE 回放
+#   回退发实测末地位姿，精度会差几毫米。
+planning:
+  # auto  = 从运控缓存自动找最新的 planning_urdf（推荐）
+  # none  = 不启用 FK（EE 回放会回退实测位姿）
+  # <path> = 显式指定 urdf 路径
+  urdf: auto
+  # 缓存根目录；留空用运控默认（$OCS2_PLANNING_URDF_DIR 或 /tmp）
+  cache_dir: ""
+  # 与 OCS2 的 mobile_base_tcp.info 里 eeFrame / eeFrame1 保持一致
+  ee_frames:
+    left: left_tcp
+    right: right_tcp

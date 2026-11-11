@@ -47,6 +47,16 @@ class RobotSpec:
     #: 解法：读 tcp 的**父刚体**（``RigidPrim`` 走 tensor 后端直读 PhysX，
     #: 不经过同步管道），再叠一个 URDF 里的固定偏移（tcp_joint 是 fixed）。
     ee_links: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 运动学配置（只用于把关节**指令**角换算成末端**指令**位姿）。
+    #: ``{"urdf": "auto"|"none"|<path>, "cache_dir": str, "ee_frames": {side: name}}``
+    #:
+    #: 为什么需要：EE 回放必须发指令位姿，否则运控会二次叠加稳态误差
+    #: （实测末端比指令低 7~9mm，表现为"抓取偏下"）。指令位姿只在运控 MPC
+    #: 内部，Isaac 侧只有关节指令角，所以要用运控那份 planning URDF 做 FK。
+    #:
+    #: 迁移新机器人：改 ``ee_frames``（对应 .info 的 eeFrame/eeFrame1）即可，
+    #: ``urdf: auto`` 会从运控缓存自动找。
+    planning: dict[str, Any] = field(default_factory=dict)
     gripper_joints: tuple[str, ...] = ()
     expected_dof_count: int | None = None
 

@@ -444,6 +444,8 @@ def arm_capture(
         obj_views=obj_views, what=what,
         code_stamp=_code_stamp(),
         physics_dt=physics_dt,
+        # 供 session.json 记录，下游 pack/fk 靠它定位 planning URDF
+        robot_key=str(robot_key), task_key=str(task_key),
     )
     if physics_dt > 0:
         _log(f"物理步长 {physics_dt*1000:.3f} ms（{1/physics_dt:.1f} Hz）"
@@ -615,6 +617,10 @@ def stop_capture() -> dict:
     out = _S["out"]
     info = {
         "out": str(out),
+        # 机器人/任务 key —— 下游（pack/fk）靠它找 configs/<robot>/robot.yaml，
+        # 决定反算末端指令位姿用哪份 planning URDF。缺了就只能让用户手填。
+        "robot_key": _S.get("robot_key", ""),
+        "task_key": _S.get("task_key", ""),
         "frames_saved": _S["saved"],
         "physics_steps": _S["step"],
         "steps_skipped": _S["skipped"],
