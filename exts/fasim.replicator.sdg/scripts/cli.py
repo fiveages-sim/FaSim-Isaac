@@ -315,6 +315,204 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diag_replay(args: argparse.Namespace) -> int:
+    """体检一次回放：回放实际到达的末端 vs 编排时到达的末端。
+
+    这是"回放和编排差多少"的**最终判据**：
+    - 若 mean < 10mm → 回放忠实复现了编排
+    - 若 dz 明显为负（偏下）→ 就是"抓试管偏下"的量化证据
+    """
+    from fasim.replicator.sdg import fk as fkmod
+
+    path = Path(args.replay).expanduser().resolve()
+    if not path.is_file():
+        _log(f"ERROR 回放记录不存在: {path}")
+        return 1
+    src = Path(args.source).expanduser().resolve() if args.source else None
+    if src is not None and not src.is_file():
+        _log(f"ERROR source episode 不存在: {src}")
+        return 1
+    try:
+        out = fkmod.compare_replay(path, source_episode=src, urdf_path=args.urdf or None)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR {exc}")
+        return 1
+
+    _log("=" * 62)
+    _log(f"回放体检: {path.name}")
+    _log("=" * 62)
+    sides = out.get("sides") or {}
+    if sides:
+        _log("\n[1] 回放实际 vs 下发目标（物理稳态误差，天生存在）")
+        for side, st in sides.items():
+            _log(f"  {side}: mean={st['mean_mm']}mm p95={st['p95_mm']}mm "
+                 f"max={st['max_mm']}mm")
+            dx, dy, dz = st["worst_delta_xyz_mm"]
+            _log(f"    最大 @f{st['worst_frame']}: "
+                 f"dx={dx:+.1f} dy={dy:+.1f} dz={dz:+.1f} mm")
+
+    rvr = out.get("replay_vs_recording")
+    _log("\n[2] 回放手到的地方 vs 编排手到的地方  ← 关键")
+    if not rvr:
+        _log("  无法比较（需要 --source episode）")
+    else:
+        for side, st in rvr.items():
+            _log(f"  {side}: mean={st['mean_mm']}mm p95={st['p95_mm']}mm "
+                 f"max={st['max_mm']}mm")
+            dx, dy, dz = st["worst_delta_xyz_mm"]
+            _log(f"    最大 @f{st['worst_frame']}: "
+                 f"dx={dx:+.1f} dy={dy:+.1f} dz={dz:+.1f} mm")
+        jr = out.get("replay_vs_recording_joint_mrad") or {}
+        if jr:
+            _log("  关节最大差: "
+                 + "  ".join(f"{k}={v}mrad" for k, v in list(jr.items())[:4]))
+
+    _log("\n" + "=" * 62)
+    if rvr:
+        worst = max(st["mean_mm"] for st in rvr.values())
+        if worst < 10.0:
+            _log(f"结论: 回放复现良好 ✅（末端均值 {worst:.1f}mm）")
+        else:
+            _log(f"结论: 回放与编排偏差 {worst:.1f}mm ❌")
+            for side, st in rvr.items():
+                _log(f"  {side} 方向: {st['worst_delta_xyz_mm']} mm (dx,dy,dz)")
+    _log("=" * 62)
+    return 0
+
+
+def cmd_diag(args: argparse.Namespace) -> int:
+    """一键体检一个 episode：末端真伪 + 关节口径 + 时间轴 + FK 交叉验证。
+
+    设计目标：**跑完这一条就把问题定位完**，不用来回重启试探。
+
+    检查项
+    ------
+    1. 末端位姿是动态还是死值（与首帧偏离 + 与 Xform 对照值比对）
+    2. 末端值与 FK 的一致性（差多少、偏哪个方向）
+    3. 有没有 ``joint_pos_cmd``（回放能否避免稳态误差叠加）
+    4. drive 稳态误差 = |实测 − 目标|（解释"偏下"的量级）
+    5. 时间轴帧间隔来源是否可信（物理步长 vs 墙钟）
+    """
+    from fasim.replicator.sdg import fk as fkmod
+
+    import numpy as np
+
+    path = Path(args.episode).expanduser().resolve()
+    if not path.is_file():
+        _log(f"ERROR episode 不存在: {path}")
+        return 1
+    try:
+        z = np.load(str(path), allow_pickle=True)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR 读 npz 失败: {exc}")
+        return 1
+
+    keys = set(z.files)
+    names = [str(x) for x in z["joint_names"]] if "joint_names" in keys else []
+    n = int(z["joint_pos"].shape[0]) if "joint_pos" in keys else 0
+    verdicts: list[tuple[bool, str]] = []
+
+    _log("=" * 62)
+    _log(f"体检: {path.name}   {n} 帧")
+    _log("=" * 62)
+
+    # ---- 1) 末端是动态还是死值 ----
+    _log("\n[1] 末端位姿是否真实")
+    for side in ("left", "right"):
+        pk, xk = f"{side}_pos", f"{side}_pos_xform"
+        if pk not in keys:
+            _log(f"  {side}: 缺失")
+            verdicts.append((False, f"{side}_pos 缺失"))
+            continue
+        p = np.asarray(z[pk], dtype=np.float64)
+        travel = float(np.linalg.norm(p - p[0], axis=1).max() * 1000)
+        line = f"  {side}: travel={travel:7.1f}mm"
+        ok = travel >= 10.0
+        if xk in keys:
+            x = np.asarray(z[xk], dtype=np.float64)
+            xt = float(np.linalg.norm(x - x[0], axis=1).max() * 1000)
+            d = np.linalg.norm(p - x, axis=1) * 1000
+            line += f"  Xform对照 travel={xt:.1f}mm 差={d.mean():.1f}mm"
+        _log(line + ("   ✅" if ok else "   ❌ 死值"))
+        verdicts.append((ok, f"{side} 末端 travel={travel:.0f}mm"))
+
+    # ---- 2) 与 FK 交叉验证 ----
+    _log("\n[2] 末端 vs FK（OCS2 planning URDF 正解）")
+    try:
+        fkr = fkmod.analyze_episode(path, urdf_path=args.urdf or None)
+        v = fkr.get("validate") or {}
+        for side, st in (v.get("per_side") or {}).items():
+            _log(f"  {side}: 与 FK 差 mean={st.get('mean_mm')}mm "
+                 f"max={st.get('max_mm')}mm | FK 行程={st.get('fk_travel_mm')}mm")
+        if not v.get("ok"):
+            _log(f"  ⚠ {v.get('reason')}")
+            verdicts.append((False, "末端与 FK 不一致"))
+        else:
+            verdicts.append((True, "末端与 FK 一致"))
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  跳过（{type(exc).__name__}: {exc}）")
+
+    # ---- 3) 关节指令口径 ----
+    _log("\n[3] 关节角口径")
+    if "joint_pos_cmd" in keys:
+        qc = np.asarray(z["joint_pos_cmd"], dtype=np.float64)
+        qa = np.asarray(z["joint_pos"], dtype=np.float64)
+        e = np.abs(qa - qc)
+        k = int(np.argmax(e.max(axis=0)))
+        _log(f"  ✅ 有 joint_pos_cmd（下发目标）")
+        _log(f"  drive 稳态误差: mean={e.mean()*1000:.1f} "
+             f"max={e.max()*1000:.1f} mrad"
+             + (f"（最大 @{names[k]}）" if k < len(names) else ""))
+        # 用这个误差估算末端偏移量级
+        if e.max() > 0.01:
+            _log(f"  → 若回放误用实测值，末端会多偏 ≈ {e.max()*700:.0f}mm "
+                 f"量级（{e.max()*1000:.0f}mrad × 臂长）")
+        verdicts.append((True, "记了 joint_pos_cmd"))
+    else:
+        _log("  ❌ 没有 joint_pos_cmd —— 回放只能用实测值，"
+             "末端会多叠一次稳态误差")
+        verdicts.append((False, "缺 joint_pos_cmd，需重采"))
+
+    # ---- 4) 时间轴 ----
+    _log("\n[4] 时间轴")
+    t = np.asarray(z["t"], dtype=np.float64)
+    if len(t) > 1:
+        dt = np.diff(t)
+        med = float(np.median(dt))
+        jitter = float(np.abs(dt - med).max() * 1000)
+        _log(f"  dt(median)={med*1000:.2f}ms  抖动 max={jitter:.2f}ms  "
+             f"总时长={t[-1]:.2f}s")
+        ok = jitter < 1.0
+        verdicts.append((ok, f"时间轴抖动 {jitter:.1f}ms"))
+
+    # ---- 5) 末端与试管的关系（若有） ----
+    tube = "obj/test_tube_pos"
+    if tube in keys and "right_pos" in keys:
+        _log("\n[5] 右手与试管")
+        tp = np.asarray(z[tube], dtype=np.float64)
+        rp = np.asarray(z["right_pos"], dtype=np.float64)
+        good = np.isfinite(tp).all(axis=1) & np.isfinite(rp).all(axis=1)
+        if good.any():
+            d = np.linalg.norm(rp[good] - tp[good], axis=1)
+            i = int(np.argmin(d))
+            _log(f"  最近距离 {d.min()*1000:.1f}mm @frame {i}")
+            if d.min() * 1000 > 150:
+                _log("  ⚠ 末端始终没接近试管（>150mm）—— 可能是末端坐标系没对齐")
+                verdicts.append((False, "末端未接近试管"))
+
+    # ---- 总结 ----
+    _log("\n" + "=" * 62)
+    bad = [r for ok, r in verdicts if not ok]
+    if bad:
+        _log("结论: 发现问题")
+        for r in bad:
+            _log(f"  ✗ {r}")
+    else:
+        _log("结论: 全部通过 ✅")
+    _log("=" * 62)
+    return 0 if not bad else 2
+
+
 def cmd_fk(args: argparse.Namespace) -> int:
     """用 FK 算末端真值（离线，不需要 Isaac / 不需要 pinocchio 在 Isaac 里）。
 
@@ -852,6 +1050,26 @@ def main(argv: list[str] | None = None) -> int:
         help="planning URDF；默认自动找 /tmp/ocs2_ros2/*/planning_urdf/*.urdf（最新）",
     )
     fkp.set_defaults(func=cmd_fk)
+
+    dg = sub.add_parser(
+        "diag",
+        help="一键体检 episode：末端真伪 + 关节口径 + 时间轴 + FK 交叉验证",
+    )
+    dg.add_argument("episode", help="episode.npz")
+    dg.add_argument(
+        "--urdf", default="",
+        help="planning URDF；默认自动找 /tmp/ocs2_ros2/*/planning_urdf/*.urdf",
+    )
+    dg.set_defaults(func=cmd_diag)
+
+    dr = sub.add_parser(
+        "fk-diag",
+        help="体检回放：回放手到的地方 vs 编排手到的地方（mm 级 + 方向）",
+    )
+    dr.add_argument("replay", help="回放导出的 *.replay_fN.npz")
+    dr.add_argument("--source", default="", help="原始 episode.npz（解 world→base 用）")
+    dr.add_argument("--urdf", default="", help="planning URDF；默认自动找")
+    dr.set_defaults(func=cmd_diag_replay)
 
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):

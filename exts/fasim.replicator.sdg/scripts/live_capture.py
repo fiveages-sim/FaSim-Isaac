@@ -107,12 +107,17 @@ def _to_np(x: Any) -> np.ndarray:
 def _read_xform_world(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
     """读一个 Xform prim 的**动态**世界位姿 (pos[3], quat[4])。
 
+    **本项目里这个函数读不到动态值** —— 保留它只作对照诊断用。
+
     tcp 这类纯 Xform 帧不是刚体，默认 ``XformPrim.get_world_poses()`` 走
     ``usd`` 后端，读到的是 **authoring stage 的静态值** —— 物理跑起来后
     完全不变（实测 765 帧偏离 0.0mm）。
 
-    必须切到 ``fabric``（或 ``usdrt``）后端才能拿到物理更新后的世界变换。
-    本函数依次尝试 fabric → usdrt → 默认，返回第一个成功且**有效**的结果。
+    切 ``fabric``/``usdrt`` 后端也救不了：newton kit 里
+    ``updateToUsd=false`` / ``fabricUpdateTransformations=false``，
+    PhysX 根本不把变换写回 USD/Fabric。
+
+    真正的动态位姿见 ``_read_link_world``（读父刚体 + 固定偏移）。
     """
     from isaacsim.core.experimental.prims import XformPrim
     from isaacsim.core.experimental.utils import backend as backend_utils
@@ -131,6 +136,64 @@ def _read_xform_world(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
         except Exception:  # noqa: BLE001
             continue
     return None
+
+
+def _read_link_world(
+    view: Any, offset: np.ndarray
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """读刚体 link 的**动态**世界位姿，再叠固定偏移 → tcp 位姿。
+
+    这是本项目末端位姿的**唯一可靠来源**。
+
+    为什么可行
+    ----------
+    ``wrist_yaw_link`` 是 articulation 的刚体 link，``RigidPrim`` 走 tensor
+    后端**直读 PhysX**，不经过 USD/Fabric 同步管道 —— 所以 newton kit 里
+    关掉的那些 ``updateToUsd`` / ``fabricUpdateTransformations`` 开关对它
+    没影响。（同一机制下物体位姿一直是准确的，可作对照。）
+
+    tcp 相对 link 是 fixed joint 的常量变换，取自 URDF：沿 +X 平移
+    ``0.0415`` m，无旋转。所以只需在 link 局部位姿上叠一个平移。
+
+    Args:
+        view: 已创建的 ``RigidPrim``。
+        offset: link 系下的 tcp 偏移 (3,)。
+
+    Returns:
+        ``(pos[3], quat_wxyz[4])``；失败返回 ``None``。
+    """
+    try:
+        p, q = view.get_world_poses()
+        pos = _to_np(p).reshape(-1)[:3]
+        quat = _to_np(q).reshape(-1)[:4]
+        # pos 和 quat 都要校验 —— 只查 pos 会漏掉 NaN 姿态，
+        # 后面拿坏四元数转偏移会算出全 NaN 的 tcp 位姿。
+        if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat))):
+            return None
+        # 局部偏移转到世界：p_tcp = p_link + R(q_link) @ offset
+        off = np.asarray(offset, dtype=np.float64).reshape(3)
+        if np.any(off):
+            pos = pos + _quat_rotate(quat, off)
+            if not np.all(np.isfinite(pos)):
+                return None
+        return pos, quat
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """用 wxyz 四元数旋转向量（右手系，与 Isaac/UsdGeom 一致）。"""
+    w, x, y, z = (float(t) for t in np.asarray(q).reshape(-1)[:4])
+    vx, vy, vz = (float(t) for t in np.asarray(v).reshape(-1)[:3])
+    # t = 2 * (q_vec × v)
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return np.array([
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    ])
 
 
 def _probe_xform_backend(prim_path: str) -> tuple[bool, str]:
@@ -269,21 +332,63 @@ def arm_capture(
             _log(f"WARN 关节读取不可用，跳过关节: {exc}")
             art = None
 
-    # 末端位姿（tcp，world 系）—— 来自 robot.yaml 的 ee_prims。
-    # 与层1 的 /left_current_pose 语义对齐：都是 tcp 的世界位姿。
+    # 末端位姿（tcp，world 系）—— 两套来源，**同时采**以便一次定位问题。
     #
-    # **关键**：tcp 是纯 Xform 帧（不是刚体）。默认的 ``XformPrim`` 用
-    # ``usd`` 后端读**静态 authoring 值**，物理跑起来后也不变（实测 765
-    # 帧完全恒定 0.0mm 偏离）。必须切到 ``fabric``/``usdrt`` 后端才能读到
-    # 物理更新后的世界变换。
+    # 1) ee_links: 读父刚体 + 固定偏移 → **动态真值**（RigidPrim 直读 PhysX）
+    # 2) ee_prims: 直接读 tcp Xform → 已知是静态值，只作对照
+    #
+    # 为什么两套都采：本次调试的核心疑问就是「tcp 位姿到底采没采到」。把
+    # Xform 静态值和刚体动态值同时写进帧里，事后一眼就能看出哪个是死的、
+    # 差多少、差在哪个方向 —— 不用再来回重启试探。
+    ee_links: dict[str, Any] = {}
+    ee_offsets: dict[str, np.ndarray] = {}
     ee_prims: dict[str, str] = {}
     if record_ee:
+        from isaacsim.core.experimental.prims import RigidPrim
+
+        for side, spec in (getattr(robot, "ee_links", None) or {}).items():
+            link = str(spec.get("link") or "")
+            if not link:
+                continue
+            off = np.asarray(
+                spec.get("offset") or (0.0, 0.0, 0.0), dtype=np.float64
+            ).reshape(3)
+            view = None
+            try:
+                view = RigidPrim(link)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"  末端 {side}: RigidPrim 失败（{exc}），试 XformPrim 兜底")
+                # articulation 的 link 有时不能当独立刚体包装；XformPrim 走
+                # usdrt/fabric 也可能读不到（正是本项目的问题）。兜底只为
+                # 不至于整个采集挂掉，正确性由后面的自检报告判定。
+                try:
+                    from isaacsim.core.experimental.prims import XformPrim
+
+                    view = XformPrim(link)
+                except Exception as exc2:  # noqa: BLE001
+                    _log(f"WARN 末端 {side} 两种视图都失败（{link}）: {exc2}")
+                    continue
+            ee_links[side] = view
+            ee_offsets[side] = off
+
         for side, prim in (getattr(robot, "ee_prims", None) or {}).items():
             ee_prims[side] = str(prim)
+
+        if ee_links:
+            _log(f"末端位姿: {list(ee_links)}（刚体+偏移，动态值）"
+                 f" 偏移={ {s: v.tolist() for s, v in ee_offsets.items()} }")
+            # 自检：确认刚体真的能读到（不依赖后续物理）
+            try:
+                s0 = next(iter(ee_links))
+                got = _read_link_world(ee_links[s0], ee_offsets[s0])
+                _log(f"  自检 {s0} link 可读: "
+                     + (f"pos={np.round(got[0], 4).tolist()}" if got else "失败！"))
+            except Exception as exc:  # noqa: BLE001
+                _log(f"  WARN 自检失败: {exc}")
+        else:
+            _log("WARN 没有可用的末端刚体 —— 检查 robot.yaml 的 ee_links")
         if ee_prims:
-            ok, detail = _probe_xform_backend(next(iter(ee_prims.values())))
-            _log(f"末端位姿: {list(ee_prims)}（world 系，后端={detail}）"
-                 + ("" if ok else "  WARN 读不到动态位姿！"))
+            _log(f"末端对照: {list(ee_prims)}（Xform，静态值，仅用于对比）")
 
     # 交互物体位姿 —— 来自 task.yaml 的 tracked_prims
     obj_views: dict[str, Any] = {}
@@ -308,7 +413,7 @@ def arm_capture(
         what.append("camera")
     if art is not None:
         what.append("joint")
-    if ee_prims:
+    if ee_links:
         what.append("ee")
     if obj_views:
         what.append("object")
@@ -335,7 +440,8 @@ def arm_capture(
         armed=True, cameras=cams, out=out, every=max(1, int(every)),
         step=0, saved=0, skipped=0, t0=time.monotonic(), records=[],
         size=cams[0]["size"] if cams else (0, 0),
-        ee_prims=ee_prims, obj_views=obj_views, what=what,
+        ee_links=ee_links, ee_offsets=ee_offsets, ee_prims=ee_prims,
+        obj_views=obj_views, what=what,
         code_stamp=_code_stamp(),
         physics_dt=physics_dt,
     )
@@ -392,22 +498,58 @@ def arm_capture(
                 try:
                     qt = art.get_dof_position_targets()
                     payload["joint_pos_cmd"] = _to_np(qt).astype(np.float32).reshape(1, -1)
+                    _S["joint_cmd_ok"] = True
                 except Exception as exc:  # noqa: BLE001
                     if _S.get("_qt_err", 0) < 2:
                         _S["_qt_err"] = _S.get("_qt_err", 0) + 1
                         _log(f"WARN 读 drive 目标失败（回放将回退用实测值，"
                              f"末端会多叠一次稳态误差）: {exc}")
-            # 末端位姿（world）：<side>_pos / <side>_quat
-            # 用 _read_xform_world —— tcp 是纯 Xform，必须走 fabric 后端
-            for side, prim_path in _S.get("ee_prims", {}).items():
-                got = _read_xform_world(prim_path)
+            # 末端位姿（world）—— 主值走刚体+偏移（动态真值）
+            #   <side>_pos / <side>_quat          ← 刚体读，**训练用这个**
+            #   <side>_pos_xform / _quat_xform    ← tcp Xform 直读，静态对照值
+            #
+            # 同时写两套是刻意的：调试期一眼能看出哪个是死的、差多少、差在
+            # 哪个方向。确认无问题后可以关掉 _xform 那套省体积。
+            for side, view in _S.get("ee_links", {}).items():
+                got = _read_link_world(view, _S["ee_offsets"][side])
                 if got is None:
                     if _S.get("_ee_err", 0) < 2:
                         _S["_ee_err"] = _S.get("_ee_err", 0) + 1
-                        _log(f"WARN 末端 {side} 读不到动态位姿（{prim_path}）")
+                        _log(f"WARN 末端 {side} 刚体读取失败")
                     continue
                 payload[f"{side}_pos"] = got[0]
                 payload[f"{side}_quat"] = got[1]
+                # 累计自检：首帧值 + 与首帧的最大偏离 —— 直接回答
+                # 「这个值到底动没动」。死值会一直停在 0.0mm。
+                h = _S.setdefault("ee_health", {}).setdefault(
+                    side, {"first": None, "max_travel_mm": 0.0, "samples": 0}
+                )
+                p = got[0]
+                if h["first"] is None:
+                    h["first"] = [round(float(x), 5) for x in p]
+                h["max_travel_mm"] = max(
+                    h["max_travel_mm"],
+                    float(np.linalg.norm(p - np.asarray(h["first"])) * 1000.0),
+                )
+                h["samples"] += 1
+            for side, prim_path in _S.get("ee_prims", {}).items():
+                got = _read_xform_world(prim_path)
+                if got is not None:
+                    payload[f"{side}_pos_xform"] = got[0]
+                    payload[f"{side}_quat_xform"] = got[1]
+                    # 对照自检：Xform 静态值同样统计，两相对照即可定性
+                    hx = _S.setdefault("ee_health", {}).setdefault(
+                        f"{side}_xform",
+                        {"first": None, "max_travel_mm": 0.0, "samples": 0},
+                    )
+                    px = got[0]
+                    if hx["first"] is None:
+                        hx["first"] = [round(float(x), 5) for x in px]
+                    hx["max_travel_mm"] = max(
+                        hx["max_travel_mm"],
+                        float(np.linalg.norm(px - np.asarray(hx["first"])) * 1000.0),
+                    )
+                    hx["samples"] += 1
             # 物体位姿（world）：obj/<label>_pos / obj/<label>_quat
             for label, view in _S.get("obj_views", {}).items():
                 try:
@@ -484,10 +626,18 @@ def stop_capture() -> dict:
         ],
         # 采了什么 —— 排查「字段没写进帧」时第一眼看这里
         "what": _S.get("what", []),
-        "ee_captured": sorted(_S.get("ee_prims", {}).keys()),
+        "ee_captured": sorted(_S.get("ee_links", {}).keys()),
+        "ee_offsets": {
+            s: [round(float(x), 6) for x in v]
+            for s, v in (_S.get("ee_offsets") or {}).items()
+        },
+        "ee_xform_control": sorted(_S.get("ee_prims", {}).keys()),
         "objects_captured": sorted(_S.get("obj_views", {}).keys()),
         "code_stamp": _S.get("code_stamp", "unknown"),
         "physics_dt": _S.get("physics_dt", 0.0),
+        # 采集期逐帧自检（不落盘，只在内存里累计）—— 收工时一次看清
+        "ee_health": _S.get("ee_health", {}),
+        "joint_cmd_recorded": bool(_S.get("joint_cmd_ok", False)),
     }
     try:
         (out / "session.json").write_text(
@@ -502,8 +652,43 @@ def stop_capture() -> dict:
     if info["frames_saved"] == 0:
         _log("WARN 一帧都没存 —— 检查是否真的在跑仿真（timeline 是否 PLAY）")
 
+    _log_ee_health(_S.get("ee_health") or {})
+    if not info["joint_cmd_recorded"]:
+        _log("WARN 没采到 joint_pos_cmd（下发目标）—— 回放只能回退实测值")
+
     _S.update(armed=False, sub=None, cameras=[], out=None, records=[])
     return info
+
+
+def _log_ee_health(health: dict) -> None:
+    """把末端采集自检打成结论，不用人去读 json。
+
+    判据很直接：**值动了没有**。死值（读到静态 authoring 值）会一直停在
+    0.0mm，而动值应该跟末端行程同量级。
+    """
+    if not health:
+        return
+    _log("-" * 60)
+    _log("末端采集自检（max_travel = 与首帧的最大偏离）")
+    for name, h in sorted(health.items()):
+        t = h.get("max_travel_mm", 0.0)
+        tag = "动态 ✅" if t >= 10.0 else "静态 ❌"
+        _log(f"  {name:12s} {tag}  travel={t:7.1f}mm  首帧={h.get('first')}"
+             f"  ({h.get('samples', 0)} 次)")
+    # 结论：主值与对照值对比
+    prim = {k: v for k, v in health.items() if not k.endswith("_xform")}
+    xf = {k: v for k, v in health.items() if k.endswith("_xform")}
+    if prim and xf:
+        pmax = max(v.get("max_travel_mm", 0.0) for v in prim.values())
+        xmax = max(v.get("max_travel_mm", 0.0) for v in xf.values())
+        _log(f"  刚体读取 max={pmax:.1f}mm   Xform 对照 max={xmax:.1f}mm")
+        if pmax >= 10.0 and xmax < 1.0:
+            _log("  → 结论：刚体读取是动态的，Xform 果然是死值。"
+                 "末端现在采对了（用 <side>_pos）。")
+        elif pmax < 10.0:
+            _log("  → 结论：刚体读取也是死的！检查 ee_links 指向的 link "
+                 "是否真是 articulation 的刚体。")
+    _log("-" * 60)
 
 
 # Script Editor 里直接执行本文件时给一句提示，避免误以为自动开始了

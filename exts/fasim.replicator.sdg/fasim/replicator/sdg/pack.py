@@ -113,9 +113,14 @@ def pack_episode(
 
             # 末端 + 物体：<side>_pos/_quat 与 obj/<label>_pos/_quat
             for k in keys:
-                if k in ("joint_pos", "joint_vel", "joint_names"):
+                if k in ("joint_pos", "joint_vel", "joint_names", "joint_pos_cmd"):
                     continue
                 if k.endswith("_pos") or k.endswith("_quat"):
+                    cols.setdefault(k, []).append(
+                        np.asarray(z[k], dtype=np.float64).reshape(-1)
+                    )
+                # Xform 对照值：同样搬，但名字带 _xform，绝不参与末端主值
+                elif k.endswith("_pos_xform") or k.endswith("_quat_xform"):
                     cols.setdefault(k, []).append(
                         np.asarray(z[k], dtype=np.float64).reshape(-1)
                     )
@@ -209,6 +214,9 @@ def pack_episode(
     for k, v in cols.items():
         if k.startswith("obj/") and len(v) == n:
             payload[k] = np.stack(v).astype(np.float64)
+        # Xform 对照值一并保留（诊断用，训练时要忽略 *_xform）
+        elif (k.endswith("_pos_xform") or k.endswith("_quat_xform")) and len(v) == n:
+            payload[k] = np.stack(v).astype(np.float64)
 
     # 下发目标关节角 —— 回放用它。
     if joint_pos_cmd is not None:
@@ -246,6 +254,25 @@ def pack_episode(
     ]
     ob = [k for k in payload if k.startswith("obj/") and k.endswith("_pos")]
     _log(f"  末端: {ee or '无'}   物体: {[k[len('obj/'):-4] for k in ob] or '无'}")
+
+    # 末端是真动态还是死值 —— 直接给结论，不用人读 npz
+    for side in ("left", "right"):
+        pv = payload.get(f"{side}_pos")
+        if pv is None or not np.isfinite(np.asarray(pv)).any():
+            continue
+        pv = np.asarray(pv)
+        travel = float(np.linalg.norm(pv - pv[0], axis=1).max() * 1000)
+        tag = "动态 ✅" if travel >= 10.0 else "静态 ❌"
+        line = f"  末端 {side}: {tag} travel={travel:.1f}mm"
+        xv = payload.get(f"{side}_pos_xform")
+        if xv is not None:
+            xv = np.asarray(xv)
+            xt = float(np.linalg.norm(xv - xv[0], axis=1).max() * 1000)
+            d = np.linalg.norm(pv - xv, axis=1) * 1000
+            line += f"  |  Xform 对照 travel={xt:.1f}mm 差值 mean={d.mean():.1f}mm"
+        _log(line)
+    if any(k.endswith("_pos_xform") for k in payload):
+        _log("  注: *_xform 是 Xform 直读的静态对照值，训练时必须忽略")
     if has_cam:
         _log(f"  相机图像仍在 {d / 'frames'}（未并入 npz）")
     # 缺末端/物体时明确告警（否则 pack 只说「无」，看不出是采集没采还是

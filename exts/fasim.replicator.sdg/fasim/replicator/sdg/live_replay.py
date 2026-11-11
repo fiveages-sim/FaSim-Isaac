@@ -313,6 +313,7 @@ def play_episode(
                 _log(f"关节驱动源: joint_pos（实测）—— 显式指定 {drive_src}")
             qmat = episode.joint_pos
         ctx["qmat"] = np.asarray(qmat, dtype=np.float64)
+        ctx["joint_src"] = (drive_src if qmat is not episode.joint_pos else "actual")
 
         if len(source_idx):
             ok = np.isfinite(ctx["qmat"][:, source_idx]).any(axis=0)
@@ -1258,10 +1259,12 @@ def _finish() -> None:
                         dof_names=np.array(ctx.get("target_names", [])),
                         # 让离线 FK 能重建 world 系：录制里的静止帧 tcp 位姿
                         source_episode=np.array(str(ep_path or "")),
+                        # 回放用的哪套关节角（cmd/actual）—— 决定了对照怎么解读
+                        joint_src=np.array(str(ctx.get("joint_src", "cmd"))),
                     )
                     _log(f"  关节记录已导出: {traj_out}")
-                    _log("  → 算末端真值: python -m fasim.replicator.sdg.fk "
-                         f"{traj_out} --source {ep_path}")
+                    _log(f"  → 一键体检: ./scripts/sdg.sh fk-diag {traj_out} "
+                         f"--source {ep_path}")
                 except Exception as exc:  # noqa: BLE001
                     _log(f"WARN 导出关节记录失败: {exc}")
 

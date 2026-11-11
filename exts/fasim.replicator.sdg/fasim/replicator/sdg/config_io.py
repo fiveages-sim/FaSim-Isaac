@@ -64,6 +64,13 @@ def load_robot_config(robot_key: str, config_root: Path | None = None) -> RobotS
             base_prim=str(raw["base_prim"]),
             joint_state_topic=str(raw.get("joint_state_topic") or "/joint_states"),
             ee_prims={str(k): str(v) for k, v in (raw.get("ee_prims") or {}).items()},
+            ee_links={
+                str(k): {
+                    "link": str(v.get("link") or ""),
+                    "offset": [float(x) for x in (v.get("offset") or (0.0, 0.0, 0.0))],
+                }
+                for k, v in (raw.get("ee_links") or {}).items()
+            },
             gripper_joints=tuple(str(j) for j in (raw.get("gripper_joints") or ())),
             expected_dof_count=raw.get("expected_dof_count"),
         )

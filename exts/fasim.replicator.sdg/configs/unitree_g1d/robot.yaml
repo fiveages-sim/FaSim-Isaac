@@ -15,9 +15,35 @@ base_prim: /World/G1D/base_link
 joint_state_topic: /joint_states
 
 # 末端 prim（phase 1 也会记录它们的位姿，供训练时对齐 action）
+#
+# 注意：ee_prims 是**名义 tcp frame**，但它是纯 Xform（fixed joint 的子节点）。
+# newton kit 关了 PhysX→USD/Fabric 同步，所以直接读这个 prim 只会得到
+# authoring 静态值（实测 765 帧偏离 0.0mm）。真正的动态位姿要从 ee_links
+# 读 —— 见下。
 ee_prims:
   left: /World/G1D/G1_Arms/left_wrist_yaw_link/left_tcp
   right: /World/G1D/G1_Arms/right_wrist_yaw_link/right_tcp
+
+# 末端位姿的**动态**来源：读父刚体 + 叠固定偏移。
+#
+# tcp 相对手腕的固定变换来自 URDF（unitree_g1_description/xacro/arm.xacro）：
+#     <joint name="${prefix}tcp_joint" type="fixed">
+#         <origin xyz="0.0415 0 0"/>
+#         <parent link="${prefix}wrist_yaw_link"/>
+#         <child link="${prefix}tcp"/>
+#     </joint>
+# 也就是 tcp 在 wrist_yaw_link 系里沿 +X 平移 41.5mm，无旋转。
+#
+# 为什么这样能读到动态值：wrist_yaw_link 有 PhysicsRigidBodyAPI，是 articulation
+# 的 link，RigidPrim 走 tensor 后端直读 PhysX，不经过 USD/Fabric 同步管道。
+# （同一机制下物体位姿 RigidPrim 一直是对的，可作对照。）
+ee_links:
+  left:
+    link: /World/G1D/G1_Arms/left_wrist_yaw_link
+    offset: [0.0415, 0.0, 0.0]
+  right:
+    link: /World/G1D/G1_Arms/right_wrist_yaw_link
+    offset: [0.0415, 0.0, 0.0]
 
 gripper_joints:
   - left_gripper_joint

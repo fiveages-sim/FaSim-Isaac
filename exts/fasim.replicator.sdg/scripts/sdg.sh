@@ -45,6 +45,8 @@ usage() {
   fk          用 FK 算末端真值（需要 pinocchio）
               fk <episode.npz>                     体检采集：末端是不是真采到了
               fk <*.replay_fN.npz> --source <ep>   体检回放：手偏了几毫米、偏哪
+  diag        一键体检 episode（末端真伪/关节口径/时间轴/FK 交叉验证）
+  fk-diag     体检回放（回放手到的地方 vs 编排手到的地方，mm 级 + 方向）
 
 回放自检（需要 Isaac python，preview 的 --drive ee 还需要运控在跑）:
   preview     回放 episode 验证采集是否忠实
@@ -114,11 +116,11 @@ CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
 case "$CMD" in
-    fk)
-        # FK 需要 pinocchio —— Isaac 的 python 里没有，所以单独选解释器。
+    fk|diag|fk-diag)
+        # FK/体检需要 pinocchio —— Isaac 的 python 里没有，所以单独选解释器。
         PY="$(pick_fk_python)" || die "找不到带 pinocchio 的 python（设 SDG_FK_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-        exec "$PY" "${SCRIPT_DIR}/cli.py" fk "$@"
+        exec "$PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"
         ;;
     capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"

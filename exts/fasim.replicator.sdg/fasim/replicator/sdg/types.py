@@ -37,6 +37,16 @@ class RobotSpec:
     base_prim: str
     joint_state_topic: str = "/joint_states"
     ee_prims: dict[str, str] = field(default_factory=dict)
+    #: 末端位姿的读取来源：``{side: {"link": 刚体路径, "offset": [x,y,z]}}``。
+    #:
+    #: 为什么不能直接读 ``ee_prims`` 里的 tcp：tcp 是纯 Xform（fixed joint 的
+    #: 子 frame），而 newton kit 关了 PhysX→USD/Fabric 同步
+    #: （``updateToUsd=false`` / ``fabricUpdateTransformations=false``），
+    #: 所以 ``XformPrim.get_world_poses()`` 任何后端都读到 authoring 静态值。
+    #:
+    #: 解法：读 tcp 的**父刚体**（``RigidPrim`` 走 tensor 后端直读 PhysX，
+    #: 不经过同步管道），再叠一个 URDF 里的固定偏移（tcp_joint 是 fixed）。
+    ee_links: dict[str, dict[str, Any]] = field(default_factory=dict)
     gripper_joints: tuple[str, ...] = ()
     expected_dof_count: int | None = None
 
