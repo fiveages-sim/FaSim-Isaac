@@ -42,13 +42,13 @@ category,item,metric,unit,faSim_sdg,lerobot_ros2,advantage,confidence,status,not
 扩展,跟随Isaac新特性,isaac_features,-,直接用 annotators,需 ROS 桥先支持,SDG,高,confirmed,
 扩展,自定义数据字段,custom_field,-,改 live_capture payload,改 LeRobot schema,平手,中,confirmed,
 扩展,跨仿真器,cross_sim,-,绑死 Isaac,只要发 ROS 话题即可,lerobot,高,confirmed,
-部署,注册方式,deploy_method,-,init.sh 注册扩展,需建 OmniGraph+起进程,SDG,中,confirmed,
+部署,注册方式,deploy_method,-,init.sh 注册扩展,G1D 零成本；W2 需补 Torso ROS 变体,SDG,中,confirmed,W2 改动一次后所有挂载 W2 的场景受益（图在组件里）
 部署,终端需 source ROS,need_ros_env,-,不需要,需要,SDG,高,confirmed,
 部署,首采步骤数,first_capture_steps,步,待测,待测,待测,待测,pending,从零到第一次采到数据
-部署,G1D场景现成ROS相机,scene_ready,-,N/A,无(room.usda 只有 prim),SDG,高,confirmed,需自己加 OmniGraph
+部署,G1D相机ROS能力,g1d_cam_ready,-,N/A,已有(/head_camera 等 3 路，含 camera_info),平手,高,confirmed,早期调研有误：只搜顶层未追组件层；room.usda 的 Camera=enable 已开
 干扰,对运控影响,ctrl_interference,物理步速率降幅%,待测,待测,待测,待测,pending,
 干扰,是否写关节,write_joints,-,否(只读),否,平手,高,confirmed,
 容错,崩溃后数据可用,crash_data,-,frames 已落盘可抢救,LeRobot episode 可恢复,平手,中,confirmed,
 格式,格式类型,format,-,自定义 npz,LeRobot parquet+图像,-,高,confirmed,
-格式,可直接训练,ready_to_train,-,需自写 DataLoader,直接 LeRobotDataset,lerobot,高,confirmed,B 的重大优势
+格式,可直接训练,ready_to_train,-,需自写 DataLoader（已有 export 可转 LeRobot）,直接 LeRobotDataset,lerobot,高,confirmed,sdg.sh export 已实现：4.7GB→13MB，可被 LeRobotDataset 加载
 格式,元信息完整度,meta,-,robot/task/code_stamp/配置快照,meta/info.json 无采集参数,SDG,中,confirmed,

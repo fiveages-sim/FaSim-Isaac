@@ -34,25 +34,58 @@ Isaac Kit 进程                        采集进程（另一个 Python 进程�
 └── 运控节点（OCS2）
 ```
 
-- `ee_traj.py`：只收 `/joint_states`、`/left|right_current_pose`、
-  `/left|right_current_target`、夹爪话题。**不采相机**。
-- `demo_record.py` + `lerobot_camera_ros2`：采 `/joint_states` + 相机
-  `sensor_msgs/Image`，写入 LeRobot 数据集格式。
-- `ros2_robot_interface/record/record_playback.py`：按 Enter 逐点记 关节/末端
-  pose，存 JSON。**不采相机**。
+- `ee_traj.py`（**本项目自建，不计入 lerobot_ros2 原生能力**）：只收
+  `/joint_states`、`/left|right_current_pose`、`/left|right_current_target`、
+  夹爪话题，**不采相机**。
+- `demo_record.py` + `lerobot_camera_ros2`（**原生**）：采 `/joint_states` +
+  相机 `sensor_msgs/Image`，写入 LeRobot 数据集格式。
+- `ros2_robot_interface/record/record_playback.py`（**原生**）：按 Enter
+  逐点记 关节/末端 pose，存 JSON。**不采相机**。
+
+> **评测范围声明**：`examples/IsaacSim/robots/Unitree/G1D/tools/` 下的
+> `ee_traj.py` / `delay_probe.py` / `verify_after_restart.sh` 是本项目为话题
+> 采数试水新加的，**不代表 lerobot_ros2 的仓库原生能力**，评测中不计入其
+> 功能清单。原生采集能力以上述 `demo_record.py` 与 `record_playback.py` 为准。
 
 ### 关键前提差异（影响可比性）
 
 | 项目 | FaSim sdg | lerobot_ros2 |
 |---|---|---|
 | 运控运行位置 | Isaac 进程内（`ROS=fiveages`） | 可进程内或独立进程 |
-| 相机是否需 ROS 发布 | **不需要** | **需要**先建 OmniGraph |
-| G1D 场景现成 ROS 相机 | — | **无**（room.usda 只有相机 prim，无发布图） |
+| 相机是否需 ROS 发布 | **不需要** | **需要**场景里有 OmniGraph 发布图 |
+| G1D 场景现成 ROS 相机 | — | **已有**（见下） |
+| G1D 需额外准备 | 无 | 切 `Camera=enable`（room.usda 已切） |
+| W2 需额外准备 | 无 | 需加 Torso 的 `ROS=enable` 变体 |
 | 采集进程数 | 1（Isaac 内） | 2（Isaac + 采集） |
 
-> ⚠ **实测前提**：`room.usda` 里没有任何 `ROS2CameraHelper` 图节点，只有相机
-> prim 与曝光设置。要让方案 B 跑起来，必须先给场景加 OmniGraph 发布节点。
-> 这是方案 B 的**部署成本**，评测时要计入。
+**G1D 相机 ROS 能力（已实测确认）**
+
+早期调研结论「G1D 没有 ROS 相机发布」是**错的** —— 只搜了 `room.usda`
+顶层，没追组件层。实际是分层组装好的：
+
+```
+G1D/payloads/Camera/enable.usda              ← 纯开关，切子组件的 ROS=enable
+G1/components/G1_Body/payloads/ROS/enable.usda   ← 头相机图（2 处 ROS2CameraHelper）
+grippers/Unitree/Dex1/payloads/ROS/enable.usda   ← 腕部相机图（Side overlay 改 namespace）
+```
+
+`room.usda` 里 `Camera = "enable"` 已开启，所以**开箱即有话题**：
+
+```
+/head_camera/{rgb,depth,camera_info}
+/left_hand_camera/{rgb,depth,camera_info}
+/right_hand_camera/{rgb,depth,camera_info}
+```
+
+**而且带 `camera_info`（内参）** —— 这点很重要：虽然 `lerobot_camera_ros2`
+的 `ROS2Camera` 不订阅它，但话题存在，想采内参时自己加订阅即可。
+
+**W2 需要改资产**：`Gen2/components/Torso/` 原来没有 ROS 变体，需要加
+`Torso.usda` 的 `variantSet "ROS"` + `payloads/ROS/ros2.usda`（双身体相机
+发布图）。已按同一模式补好（未提交）。
+
+**这仍然是方案 B 的部署成本**，只是比原先估计的小：G1D 零成本，W2 一次改动
+之后所有挂载 W2 的场景都受益（图在组件里，不在场景里）。
 
 ---
 
@@ -223,9 +256,52 @@ tcp 位置投影」是否重合。偏差应 < 5 像素（约 1cm）。
 
 ## 4. 评测执行计划
 
+### 前置：Python 环境（uv）
+
+公司停用 conda，改用 uv。lerobot_ros2 仓库**原生支持 uv**（`.fa-env.toml`
+的 `backend = "uv"`，`venv = ".venv"`）。
+
+**但 `init.sh all` 不能直接用来做本评测**，因为它会装 PyPI `lerobot==0.5.1`
+并强制 `numpy>=2.0`，而仓库 README 自己也写明：
+
+> 编排和灵巧手共用父环境，NumPy 保持 1.x，这样才和 ROS 2 的系统 OpenCV 兼容。
+> 录制和策略推理会安装 NumPy 2，给 lerobot 0.5 使用，请另建环境。
+
+NumPy 2 会破坏 `cv_bridge` → **无法采头相机**，而本评测恰好需要采相机。
+
+**实测可用的组合**（原 conda 环境，已用于本项目的 export 验证）：
+
+```
+numpy 1.26.4  +  cv_bridge OK  +  lerobot 0.3.4(editable, submodule)  +  torch 2.7.1+cu128
+```
+
+所以 uv 迁移策略是**精确复制这一组合**，而不是跑 `init.sh all`：
+
+```bash
+cd ~/lerobot_ros2
+uv venv --python 3.12 --system-site-packages .venv
+# torch 从 PyTorch 官方 cu128 index
+uv pip install --python .venv/bin/python \
+   torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+   --index-url https://download.pytorch.org/whl/cu128
+# 其余依赖按 pip freeze 精确保版本
+uv pip install --python .venv/bin/python -r <(conda 的 pip freeze)
+# 5 个本地包用 editable，避免到 PyPI 去找 rclpy
+uv pip install --python .venv/bin/python --no-deps -e submodules/lerobot
+uv pip install --python .venv/bin/python --no-deps -e submodules/ros2_robot_interface
+uv pip install --python .venv/bin/python --no-deps -e submodules/robot_action_composer
+uv pip install --python .venv/bin/python --no-deps -e lerobot_robot_ros2
+uv pip install --python .venv/bin/python --no-deps -e lerobot_camera_ros2
+```
+
+**未来若需要 PyPI lerobot 0.5.1（推理/训练）**：另建 `.venv-lerobot`，
+按 README 的 `install-lerobot` 路径装（numpy 2），**不与编排共用**。
+
 ### 阶段 0：准备（预计 0.5 天）
-- [ ] 给 G1D 场景加 OmniGraph 相机发布（`/head_camera/image_raw` 等 3 路）
-- [ ] 确认 `lerobot_camera_ros2` 环境可跑（`demo_record.py`）
+- [x] ~~给 G1D 场景加 OmniGraph 相机发布~~ → **不需要**，G1D 已有且已启用
+- [x] W2 资产补 ROS 变体（已在 `Gen2/components/Torso/` 配好）
+- [ ] 验证 uv 环境（`import lerobot`、`cv_bridge`、`ros2-stack` 都可用）
+- [ ] 验证 W2 相机话题（起 W2 场景，`ros2 topic hz /body_camera1/rgb`）
 - [ ] 准备统一的测试任务与参数（同一轨迹、同一时长）
 
 ### 阶段 1：并行采集（预计 0.5 天）
@@ -304,7 +380,26 @@ tcp 位置投影」是否重合。偏差应 < 5 像素（约 1cm）。
 
 ## 7. 后续可做
 
-- [ ] `sdg.sh export --format lerobot`：把 A 的数据导出成 LeRobot 格式，
-      兼得两者优势（高质量采集 + 生态兼容）
+- [x] **`sdg.sh export --format lerobot`** —— <span>已实现</span>：
+      调官方 `LeRobotDataset`（子进程隔离依赖），把 npz 导出成 LeRobot v3.0。
+      实测 `run_03`（674 帧 3 相机）：**4.7GB → 13MB**（视频编码约 360×），
+      `LeRobotDataset(root=...)` 可正常加载，`action` 用 `joint_pos_cmd`（指令）。
+      **这样兼得两者优势**：高质量采集（内部对齐、内参完整）+ 生态兼容。
 - [ ] 与 data-collector-platform 对比（需先确认其部署与可用性）
 - [ ] 与纯 URDF/MuJoCo 离线渲染对比（无运控闭环场景）
+
+### 7.1 LeRobot 导出的字段映射（供核对）
+
+| LeRobot feature | 来源 | 语义 |
+|---|---|---|
+| `observation.state` | `joint_pos` | 实测关节角 |
+| `action` | `joint_pos_cmd` | **指令**关节角（非实测） |
+| `observation.ee` | `<side>_pos` + `<side>_quat` | 末端实测（左右各 7 维） |
+| `observation.images.<cam>` | `<cam>_rgb` | RGBA→RGB，编码成 mp4 |
+
+**为什么 action 用指令**：用实测会把运控跟踪误差学进策略（末端低 7~9mm），
+这正是"抓取位置稳定偏下"的成因。导出后实测 `max|action − obs.state| = 3.85mrad`，
+确认两者确实是「指令 vs 实测」。
+
+**未导出但可加**：相机内参 `<cam>_K`、深度图、物体位姿。LeRobot 的 image
+feature 只支持单通道 RGB，深度需另作 feature（改 dtype 与编码策略）。

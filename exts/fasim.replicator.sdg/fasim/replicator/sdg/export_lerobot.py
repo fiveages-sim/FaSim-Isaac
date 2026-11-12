@@ -74,19 +74,32 @@ def _log(msg: str) -> None:
 def find_lerobot_python() -> Path | None:
     """找能 import lerobot 的 python。
 
-    优先级：环境变量 → 已知 conda 环境 → 当前解释器。
+    优先级：
+      1. ``LE_ROBOT_PYTHON`` 环境变量
+      2. 本仓库约定：``~/lerobot_ros2/.venv``（uv 迁移后的位置）
+      3. 已知 conda 环境（过渡期保留，公司停用 conda 后可删）
+      4. 当前解释器
+
     找到后返回路径；都不行返回 None（调用方报错，不静默降级）。
     """
     cands: list[str] = []
     env = os.environ.get("LE_ROBOT_PYTHON", "").strip()
     if env:
         cands.append(env)
+    home = Path.home()
     cands += [
-        str(Path.home() / "miniconda3/envs/lerobot-ros2/bin/python"),
-        str(Path.home() / "miniconda3/envs/lerobot/bin/python"),
+        # uv 环境（迁移后主用这个；.venv 用 --system-site-packages，能拿到系统 rclpy）
+        str(home / "lerobot_ros2/.venv/bin/python"),
+        # 过渡期：公司停用 conda 前的老环境
+        str(home / "miniconda3/envs/lerobot-ros2/bin/python"),
+        str(home / "miniconda3/envs/lerobot/bin/python"),
         sys.executable,
     ]
+    seen: set[str] = set()
     for c in cands:
+        if not c or c in seen:
+            continue
+        seen.add(c)
         p = Path(c)
         if not p.is_file():
             continue

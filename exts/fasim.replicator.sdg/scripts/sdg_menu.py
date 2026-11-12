@@ -432,12 +432,26 @@ def menu_tools(robot: str, task: str, state: dict) -> None:
                 ("diag", "diag      一键体检 episode（7 项，需先 pack）"),
                 ("fkdiag", "fk-diag   回放体检（回放 vs 编排，需先 live 回放）"),
                 ("trim", "trim      切成任务片段（剔除待机段，需先 pack）"),
+                ("export", "export    导出成 LeRobot 数据集（可直接训练 / 体积小很多）"),
                 ("info", "info      看会话里有什么（不需要 pack）"),
             ],
             1, allow_back=True,
         )
         if tool == BACK or tool == "quit":
             return
+
+        if tool == "export":
+            sess = pick_session(state, robot, task, need_episode=False, kind="会话")
+            if sess is None:
+                continue
+            out = ask("输出目录（回车=默认 ~/lerobot_datasets/<会话名>）", "")
+            args = ["export", str(sess)]
+            if out:
+                args += ["--out", out]
+            if ask_yes("输出目录已存在时覆盖", False):
+                args.append("--overwrite")
+            run([str(SDG_SH)] + args)
+            continue
 
         if tool == "fkdiag":
             rec = ask("回放记录路径（*.replay_fN.npz，live 回放后生成，回车=返回）", "")
