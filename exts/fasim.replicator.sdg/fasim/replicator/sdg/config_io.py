@@ -106,6 +106,49 @@ def _parse_camera(raw: dict[str, Any]) -> CameraSpec:
     )
 
 
+def _parse_physics_hz(record: dict) -> float | None:
+    """从 ``record`` 段取物理步频（Hz）。
+
+    两种写法都支持，``physics_hz`` 优先（语义明确）：
+
+        record:
+          physics_hz: 200        # 推荐：直接写频率
+          physics_dt: 0.005      # 兼容：写步长，换算 1/dt
+
+    都没有则返回 None —— 交给采集器用场景实测值兜底。
+    """
+    if (hz := record.get("physics_hz")) is not None:
+        try:
+            hz = float(hz)
+            return hz if hz > 0 else None
+        except (TypeError, ValueError):
+            return None
+    dt = record.get("physics_dt")
+    if dt is not None:
+        try:
+            dt = float(dt)
+            return 1.0 / dt if dt > 0 else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _parse_wall_baseline(record: dict) -> float | None:
+    """取本机墙钟物理步频实测基线（Hz），用于日志预估，不参与换算。
+
+    ``record.physics_hz_wall_baseline``：本机实测值（如 177）。
+    留空（或 <=0）返回 None —— 采集器会退回模块常量。
+    """
+    v = record.get("physics_hz_wall_baseline")
+    if v is None:
+        return None
+    try:
+        v = float(v)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def load_task_config(
     robot_key: str,
     task_key: str,
@@ -135,6 +178,8 @@ def load_task_config(
             output_dir=out_dir / robot_key / str(raw.get("task_key") or task_key),
             capture_fps=int(record.get("capture_fps", 30)),
             physics_dt=float(record.get("physics_dt", 0.005)),
+            physics_hz=_parse_physics_hz(record),
+            physics_hz_wall_baseline=_parse_wall_baseline(record),
             max_frames=int(record.get("max_frames", 2000)),
             variant_selection={str(k): str(v) for k, v in (raw.get("variant_selection") or {}).items()},
         )

@@ -52,7 +52,7 @@ usage() {
   pack        采集会话 → episode npz（层2 能读的格式）
               pack <session> [--robot <key>]   反算末端指令位姿需要 robot
   trim        切成任务片段，剔除待机段（ACT 训练必需）
-  fk          用 FK 算末端真值（需要 pinocchio）
+  fk          用 FK 算末端真值（纯 numpy，系统 python3 即可）
               fk <episode.npz>                     体检采集
               fk <*.replay_fN.npz> --source <ep>   体检回放
   diag        一键体检 episode（末端/关节/时间轴/物体/相机）
@@ -97,26 +97,22 @@ pick_python() {
     for cand in "${SDG_PYTHON:-}" "$(command -v python3)" /usr/bin/python3; do
         [ -n "$cand" ] || continue
         [ -x "$cand" ] || continue
-        if "$cand" -c "import yaml" >/dev/null 2>&1; then
+        if "$cand" -c "import yaml, numpy" >/dev/null 2>&1; then
             echo "$cand"; return 0
         fi
-    done
-    for cand in /home/fiveages/miniconda3/envs/lerobot-ros2/bin/python; do
-        [ -x "$cand" ] && "$cand" -c "import yaml" >/dev/null 2>&1 && { echo "$cand"; return 0; }
     done
     return 1
 }
 
-# 带 pinocchio 的 python：`fk` 做正解需要它（Isaac 的 python 里没有，
-# 系统 python3 通常也没有）。按优先级找一个能 import pinocchio 的。
+# FK/诊断用的 python：纯 numpy 实现（fasim/replicator/sdg/fk.py），
+# 只需要 numpy + PyYAML。Isaac 的 python 也能跑，但启动慢，优先用系统 python3。
+# pinocchio 只有 `fk --self-test` 对拍时才需要，属于可选依赖。
 pick_fk_python() {
     local cand
-    for cand in "${SDG_FK_PYTHON:-}" \
-                /home/fiveages/miniconda3/envs/lerobot-ros2/bin/python \
-                "$(command -v python3)" /usr/bin/python3; do
+    for cand in "${SDG_FK_PYTHON:-}" "$(command -v python3)" /usr/bin/python3; do
         [ -n "$cand" ] || continue
         [ -x "$cand" ] || continue
-        if "$cand" -c "import pinocchio, numpy, yaml" >/dev/null 2>&1; then
+        if "$cand" -c "import numpy, yaml" >/dev/null 2>&1; then
             echo "$cand"; return 0
         fi
     done
@@ -132,8 +128,8 @@ CMD="${1:-}"
 
 case "$CMD" in
     fk|diag|fk-diag)
-        # FK/体检需要 pinocchio —— Isaac 的 python 里没有，所以单独选解释器。
-        PY="$(pick_fk_python)" || die "找不到带 pinocchio 的 python（设 SDG_FK_PYTHON）"
+        # FK/体检是纯 numpy 实现，系统 python3 就够（不用 Isaac 的 python，启动快）。
+        PY="$(pick_fk_python)" || die "找不到带 numpy+yaml 的 python（设 SDG_FK_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"
         ;;

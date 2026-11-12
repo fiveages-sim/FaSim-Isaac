@@ -165,6 +165,7 @@ def export_session(
     use_videos: bool = True,
     overwrite: bool = False,
     lerobot_python: str | Path | None = None,
+    action_space: str = "absolute",
 ) -> dict:
     """把一个采集会话导出成 LeRobot 数据集。
 
@@ -179,6 +180,17 @@ def export_session(
             纯调试可设 False，但 LeRobot v3 要求有 video 或 image feature。
         overwrite: 输出目录已存在时是否清空。
         lerobot_python: 指定 python；默认自动找。
+        action_space: ``action`` 字段的语义（默认 ``absolute``）：
+            **absolute** —— ``joint_pos_cmd``（绝对关节指令）。部署直接输出
+                目标角，无累积误差。**推荐用于自训练**。
+            **delta** —— ``joint_pos[t+1] - joint_pos[t]``（相邻**实测**位移）。
+                满足 ``state[t] + action[t] == state[t+1]``（误差 0），与同事
+                data-collector-platform 语义一致，便于对拍/混训。
+                ⚠ 不是 ``cmd - 实测``：那是控制器修正量，实测比位移大 7.4 倍
+                （修正里绝大部分被稳态误差吃掉）。
+                代价：最后一帧无 t+1，action 填 0；部署需积分，长序列会漂。
+            **ee_delta** —— 末端位姿相邻增量（pos3+dquat4 × 左右 = 14 维），
+                与同事 pose 模式完全对齐。同样用实测值而非 cmd。
 
     Returns:
         ``{"ok", "out", "frames", "features", "python"}``
@@ -200,9 +212,13 @@ def export_session(
     n = len(frames)
     cams = _discover_cameras(frames)
 
-    # fps：优先 session.json 的 physics_dt×every
+    # fps：优先 session.json 的 physics_dt×every。
+    # physics_dt 是**设定值**（场景 physxScene:timeStepsPerSecond → 仿真时间口径），
+    # 不是墙钟实际步长 —— 用后者会让 fps 偏低（本机 177 vs 200Hz，差 13%）。
     if fps is None:
         pdt = float(meta.get("physics_dt", 0) or 0)
+        if pdt <= 0 and (meta.get("physics_hz_setting") or 0) > 0:
+            pdt = 1.0 / float(meta["physics_hz_setting"])
         every = int(meta.get("every", 1) or 1)
         fps = 1.0 / (pdt * every) if pdt > 0 else 20.0
     fps_i = max(1, int(round(float(fps))))
@@ -241,14 +257,38 @@ def export_session(
                 img_hw = a.shape[:2]
                 break
 
+    asp = str(action_space or "absolute").lower()
+    if asp not in ("absolute", "delta", "ee_delta"):
+        raise ValueError(
+            f"action_space 必须是 absolute / delta / ee_delta，收到 {action_space!r}"
+        )
+
     features: dict[str, Any] = {
         "observation.state": {
             "dtype": "float32", "shape": [nj], "names": jn or None,
         },
-        "action": {
-            "dtype": "float32", "shape": [nj], "names": jn or None,
-        },
     }
+    # action 的形状随语义变：
+    #   absolute / delta → 关节维（nj）
+    #   ee_delta         → 左右各 pos3+dquat4 = 14
+    if asp == "ee_delta":
+        features["action"] = {
+            "dtype": "float32",
+            "shape": [14],
+            "names": [f"{s}_{k}" for s in ("left", "right")
+                      for k in ("dpos_x", "dpos_y", "dpos_z",
+                                "dquat_x", "dquat_y", "dquat_z", "dquat_w")],
+        }
+    else:
+        a_names = None
+        if jn:
+            if asp == "delta":
+                a_names = [f"d{n}" for n in jn]
+            else:
+                a_names = jn
+        features["action"] = {
+            "dtype": "float32", "shape": [nj], "names": a_names,
+        }
     # 末端实测位姿（pos3+quat4 × 左右）—— observation
     if ee_dim:
         features["observation.ee"] = {"dtype": "float32", "shape": [ee_dim]}
@@ -294,6 +334,7 @@ def export_session(
         "features": features,
         "obj_labels": obj_labels,
         "use_videos": bool(use_videos),
+        "action_space": asp,
         "meta": {
             "seed": {
                 "source_session": str(session),

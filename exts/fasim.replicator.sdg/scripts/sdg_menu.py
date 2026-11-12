@@ -351,10 +351,13 @@ def menu_capture(robot: str, task: str, state: dict) -> None:
     state["what"] = what
 
     camera = ""
+    try:
+        task_cfg = load_task_config(robot, task)
+    except Exception:  # noqa: BLE001
+        task_cfg = None
     if "camera" in what:
         try:
-            task_cfg = load_task_config(robot, task)
-            cams = [c.name for c in (task_cfg.cameras or ())]
+            cams = [c.name for c in (task_cfg.cameras or ())] if task_cfg else []
         except Exception:  # noqa: BLE001
             cams = []
         if not cams:
@@ -370,13 +373,32 @@ def menu_capture(robot: str, task: str, state: dict) -> None:
             if camera == "quit":
                 return
 
-    every = pick(
-        "采集频率（每 N 个物理步采一帧）",
-        [("5", "5   约 40fps 仿真时间（最细，开销大）"),
-         ("10", "10  约 20fps 仿真时间（推荐）"),
-         ("20", "20  约 10fps 仿真时间（省开销）")],
-        2, allow_back=True,
-    )
+    # every 的实际帧率 = 物理步频 / every；步频来自任务配置（对应场景资产）
+    phys_hz = getattr(task_cfg, "physics_hz", None) if task_cfg else None
+    if phys_hz:
+        opts = []
+        seen = set()
+        for tgt in (30, 20, 15, 10, 5):
+            ev = max(1, int(round(phys_hz / tgt)))
+            if ev in seen:
+                continue
+            seen.add(ev)
+            fps = phys_hz / ev
+            exact = abs(phys_hz / tgt - ev) < 1e-6
+            opts.append((str(ev), f"{ev:3d}  约 {fps:5.1f} fps 仿真时间"
+                                  f"{'' if exact else f'  (目标 {tgt}fps 取整)'}"))
+        every = pick(
+            f"采集频率（每 N 个物理步采一帧；本任务步频 {phys_hz:g} Hz）",
+            opts, min(2, len(opts) - 1), allow_back=True,
+        )
+    else:
+        every = pick(
+            "采集频率（每 N 个物理步采一帧；步频未知，帧率取决于场景）",
+            [("5", "5   每 5 个物理步 1 帧"),
+             ("10", "10  每 10 个物理步 1 帧  (常用)"),
+             ("20", "20  每 20 个物理步 1 帧")],
+            2, allow_back=True,
+        )
     if every in (BACK, "quit"):
         return
 

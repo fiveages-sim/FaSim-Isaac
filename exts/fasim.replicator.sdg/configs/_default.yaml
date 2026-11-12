@@ -11,8 +11,26 @@ output:
 
 record:
   capture_fps: 30        # 录制采样率（与物理步解耦，由 EpisodeRecorder 按物理步记录）
-  physics_dt: 0.005      # 200 Hz 物理步（与场景 PhysicsScene timeStepsPerSecond 一致）
+  # ---------------------------------------------------------------------------
+  # 物理步频（**设定值**，Hz）—— 必须与所用场景 USD 的
+  # physxScene:timeStepsPerSecond 一致。不同任务用不同场景就是不同步频，
+  # 所以在 tasks/<task>.yaml 里按任务覆盖。
+  #
+  # 时间轴只用这个值换算：每帧仿真时长 = every / physics_hz
+  #
+  # ⚠ 别和"实际步频"混了。本机（fiveages 工作站）受性能限制，墙钟只能到
+  #   约 177Hz（RTF≈0.89，开 3 相机时约 130Hz）。那只是"跑得快慢"，
+  #   **不改时间轴**；拿它换算会让数据整体慢 13%。
+  #   采集时会把设定值、实际值分别记进 session.json（physics_hz_setting /
+  #   physics_hz_wall），启动日志也分行打印。
+  # ---------------------------------------------------------------------------
+  physics_hz: 200
+  physics_dt: 0.005      # 兼容写法，等价于 physics_hz: 200（physics_hz 优先）
   max_frames: 2000       # 单 episode 上限，防止跑飞
+
+  # 本机墙钟物理步频实测基线（Hz）—— 仅作诊断/预估打印，绝不参与换算。
+  # 换机器请重新实测后更新；填 0 表示不打印预估。
+  physics_hz_wall_baseline: 177
 
 replay:
   render_interval: 1     # 每 N 帧渲染一次（1 = 每帧）

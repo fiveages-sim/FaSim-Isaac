@@ -79,20 +79,30 @@ def load_tracks(session_dir: str | Path) -> dict[str, Any]:
         raise ValueError("没有 joint_pos（采集时关了 record_joints？trim 需要关节角）")
 
     steps = np.asarray(sim_steps, dtype=np.int64)
-    # 帧间隔（秒）：sim_step 差值 × **真实**物理步长。
-    # 不能假设 5ms —— 实测这台机器 5.876ms（177Hz），按 5ms 算会让时间轴
-    # 偏快 15%。优先用 session.json 的 physics_dt，其次墙钟反推。
+    # 帧间隔（秒）：sim_step 差值 × **设定**物理步长。
+    #
+    # 注意 physics_dt 是**设定值**（场景 physxScene:timeStepsPerSecond 决定，
+    # 试管场景 200Hz=5ms），不是墙钟实际步长。墙钟受机器性能限制（本机约
+    # 177Hz），但它只影响跑多快，**不影响仿真时间轴** —— 拿它换算会整体偏。
     phys_dt = 0.0
     try:
         sj = d / "session.json"
         if sj.is_file():
             meta = json.loads(sj.read_text(encoding="utf-8"))
             phys_dt = float(meta.get("physics_dt", 0) or 0)
-            if phys_dt <= 0:
-                n_phys = float(meta.get("physics_steps", 0) or 0)
-                dur = float(meta.get("duration_sec", 0) or 0)
-                if n_phys > 0 and dur > 0:
-                    phys_dt = dur / n_phys
+            # 次选：任务配置声明的设定值（physics_hz → dt）
+            if phys_dt <= 0 and (meta.get("physics_hz_setting") or 0) > 0:
+                phys_dt = 1.0 / float(meta["physics_hz_setting"])
+            if phys_dt <= 0 and meta.get("robot_key") and meta.get("task_key"):
+                try:
+                    from .config_io import load_task_config
+
+                    hz = load_task_config(meta["robot_key"], meta["task_key"]).physics_hz
+                    phys_dt = 1.0 / float(hz) if hz else 0.0
+                except Exception:  # noqa: BLE001
+                    pass
+            # **不要**用 duration_sec / physics_steps 反推：那算的是墙钟实际
+            # 步长（本机约 177Hz），而时间轴要用设定值（200Hz），差 13%。
     except Exception:  # noqa: BLE001
         pass
     if phys_dt <= 0:

@@ -292,15 +292,38 @@ def cmd_capture(args: argparse.Namespace) -> int:
         camera = "all" if sel == "all" else sel
 
     # --- 频率 ---
+    # every 的语义是"每 N 个物理步采一帧"，实际帧率 = 物理步频 / every。
+    # 物理步频由**场景资产**决定（physxScene:timeStepsPerSecond），任务配置里
+    # 用 record.physics_hz 声明。所以这里必须按任务的步频换算档位，
+    # 不能写死 "10 ≈ 17fps"（那是某个特定场景的经验值）。
+    phys_hz = getattr(cfg, "physics_hz", None)
     if args.every:
         every = args.every
     else:
-        sel = _pick(
-            "采集频率（每 N 个物理步采一帧）",
-            [("10", "10  ≈ 17fps  (推荐)"),
-             ("20", "20  ≈  9fps  (省开销)"),
-             ("40", "40  ≈  4fps  (最省)")],
-        )
+        if phys_hz:
+            hz_note = f"物理步频 {phys_hz:g} Hz（任务配置 record.physics_hz）"
+            # 生成档位：按目标帧率反推 every，只保留能整除的（帧率才精确），
+            # 整除不了就标注实际帧率 —— 避免出现 "every=7 才能 28.6fps" 这种
+            # 反直觉的数字。
+            opts = []
+            for tgt in (30, 20, 15, 10, 5):
+                ev_exact = phys_hz / tgt
+                ev = int(round(ev_exact))
+                if ev < 1 or ev in {int(o[0]) for o in opts}:
+                    continue
+                fps = phys_hz / ev
+                exact = abs(ev_exact - ev) < 1e-6
+                tag = "" if exact else f"  (目标 {tgt}fps 取整)"
+                opts.append((str(ev), f"{ev:3d}  约 {fps:5.1f} fps 仿真时间{tag}"))
+            if not opts:
+                opts = [("1", "1  每个物理步都采")]
+        else:
+            hz_note = "物理步频未知（任务配置没写 record.physics_hz，帧率取决于场景）"
+            opts = [("5", "5   每 5 个物理步 1 帧"),
+                    ("10", "10  每 10 个物理步 1 帧  (常用)"),
+                    ("20", "20  每 20 个物理步 1 帧")]
+        _log(hz_note)
+        sel = _pick("采集频率（每 N 个物理步采一帧）", opts)
         every = int(sel) if sel.isdigit() else 0
         if every == 0:
             while True:
@@ -345,7 +368,9 @@ def cmd_capture(args: argparse.Namespace) -> int:
     else:
         cam_desc = str(camera)
     print(f"  相机     : {cam_desc}")
-    print(f"  频率     : every={every}")
+    print(f"  频率     : every={every}"
+          + (f"（{phys_hz:g} Hz / {every} ≈ {phys_hz/every:.1f} fps 仿真时间）"
+             if phys_hz and every else ""))
     print(f"  分辨率   : {f'{width}x{height}' if width else '配置默认（仅相机）'}")
     print(f"  深度     : {'是' if depth else '否'}")
     print(f"  输出     : {out_dir}")
@@ -693,6 +718,11 @@ def cmd_bench(args: argparse.Namespace) -> int:
         "physics": {
             "physics_steps": int(meta.get("physics_steps", 0) or 0),
             "physics_dt": pdt,
+            # 设定值（场景 timeStepsPerSecond）—— 决定时间轴
+            "physics_hz_setting": meta.get("physics_hz_setting"),
+            "physics_hz_declared": meta.get("physics_hz_declared"),
+            # 实际值（墙钟每秒物理步数）—— 只反映性能，不参与时间轴换算
+            "physics_hz_wall": meta.get("physics_hz_wall"),
             "steps_per_frame": int(np.median(phys)) if phys.size else None,
             "rtf": round(float(meta.get("physics_steps", 0) or 0) * pdt / duration, 3)
             if (pdt and duration > 0) else None,
@@ -732,6 +762,10 @@ def cmd_bench(args: argparse.Namespace) -> int:
     ph = metrics["physics"]
     print(f"物理        : {ph['physics_steps']} 步  dt={ph['physics_dt']}s  "
           f"每帧 {ph['steps_per_frame']} 步  RTF={ph['rtf']}")
+    hz_set, hz_wall = ph.get("physics_hz_setting"), ph.get("physics_hz_wall")
+    if hz_set or hz_wall:
+        print(f"  ├ 设定值  : {hz_set or '?'} Hz（场景 timeStepsPerSecond，决定时间轴）")
+        print(f"  └ 实际值  : {hz_wall or '?'} Hz（墙钟，受机器性能限制，不参与换算）")
     print(f"对齐间距    : 0 ms（同一物理步回调，天然同刻）")
     sz = metrics["size"]
     print(f"单帧体积    : 图像 {sz['camera_bytes_per_frame']/1e6:.2f}MB + 关节 {sz['joint_bytes_per_frame']/1e3:.1f}KB")
@@ -765,6 +799,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             use_videos=not args.no_videos,
             overwrite=bool(args.overwrite),
             lerobot_python=args.lerobot_python or None,
+            action_space=getattr(args, "action_space", "absolute") or "absolute",
         )
     except Exception as exc:  # noqa: BLE001
         _log(f"ERROR {exc}")
@@ -1614,6 +1649,13 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("--overwrite", action="store_true", help="输出目录已存在时清空")
     ex.add_argument("--lerobot-python", default="",
                     help="能 import lerobot 的 python；留空自动找")
+    ex.add_argument(
+        "--action-space", dest="action_space", default="absolute",
+        choices=["absolute", "delta", "ee_delta"],
+        help="action 语义：absolute=关节指令（默认，部署无累积误差）"
+             " / delta=关节单步增量（对齐同事语义，state[t]+action[t]==state[t+1]）"
+             " / ee_delta=末端位姿增量 14 维（与同事 pose 模式完全对齐）",
+    )
     ex.set_defaults(func=cmd_export)
 
     exc = sub.add_parser(

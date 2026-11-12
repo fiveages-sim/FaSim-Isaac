@@ -229,7 +229,10 @@ def pack_episode(
         med = float(np.median(dsteps)) if dsteps.size else float(every or 10)
 
         phys_dt = float(meta.get("physics_dt", 0) or 0)
-        src = "session.json physics_dt（仿真步长）"
+        src = "session.json physics_dt（设定值，仿真时间步长）"
+        if phys_dt <= 0 and (meta.get("physics_hz_setting") or 0) > 0:
+            phys_dt = 1.0 / float(meta["physics_hz_setting"])
+            src = "session.json physics_hz_setting（设定值）"
         if phys_dt <= 0:
             phys_dt = 0.005
             src = "兜底 5ms（老会话没记 physics_dt）"

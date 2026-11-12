@@ -72,6 +72,24 @@ class TaskSpec:
     output_dir: Path = Path(".")
     capture_fps: int = 30
     physics_dt: float = 0.005
+    physics_hz: float | None = None
+    """本任务期望的**物理步频**（Hz），来自场景 PhysicsScene 的
+    ``physxScene:timeStepsPerSecond``。
+
+    为什么需要显式写：物理步频定义在**场景资产**里，不同任务用不同场景就会用
+    不同步频。采集器挂的是物理步回调，``every``（每 N 个物理步采一帧）的实际
+    帧率 = ``physics_hz / every`` —— 不知道 physics_hz 就没法从"我要 30fps"
+    反推 every，只能给用户几个猜出来的档位。
+
+    采集开始时还会拿它与场景实测值对账（``SimulationManager.get_physics_dt()``），
+    不一致会告警 —— 声明与资产不符时，时间轴会整体偏。
+    """
+    physics_hz_wall_baseline: float | None = None
+    """本机**墙钟**物理步频实测基线（Hz），仅用于启动日志的落盘帧率预估。
+
+    本机约 177（RTF≈0.89）。**绝不参与时间轴换算** —— 只回答"这台机器
+    跑得动多少"。换机器要重新实测后改 ``configs/_default.yaml``。
+    """
     max_frames: int = 2000
     variant_selection: dict[str, str] = field(default_factory=dict)
     """Variant switches applied to the robot prim before play, e.g. {"ROS": "fiveages"}."""

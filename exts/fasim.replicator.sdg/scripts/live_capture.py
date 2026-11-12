@@ -47,6 +47,36 @@ from typing import Any
 
 import numpy as np
 
+# ===========================================================================
+# 物理步频：设定值（setting） vs 实际值（actual）
+# ===========================================================================
+#
+# 这两个概念必须分清，混用会让整条数据的时间轴系统性偏掉：
+#
+#   **设定值** = 场景 USD 里 ``physxScene:timeStepsPerSecond``（本仓试管场景
+#   等绝大多数场景都是 200，即 dt=5ms）。这是**仿真时间**每步推进多少，
+#   决定帧率与时间轴：``每帧仿真时长 = every / PHYSICS_HZ_SETTING``。
+#   这个值由**场景资产**决定，每个任务可能不同 → 任务 yaml 里用
+#   ``record.physics_hz`` 声明，采集时与场景实测值对账。
+#
+#   **实际值** = 墙钟每秒真正跑过多少物理步。受**机器性能**限制：
+#   本机（fiveages 工作站）实测约 **177 Hz**（即 5.65ms/步，RTF≈0.89），
+#   开 3 相机采集时会掉到约 130 Hz。它只影响"跑得多快"，**不改时间轴**。
+#   绝不能拿它换算帧间隔 —— 差 177/200 = 13%，回放会整体偏。
+#
+# 为什么 177 要写在这里而不是忽略：它是判断"这台机器跑得动多少相机/多大
+# 分辨率"的实测基线，也是 pack/trim 里那段"别用墙钟反推"注释的来源依据
+# （commit 5c75702 曾误用 5.876ms 当真值，被 fix01 反证）。
+# 但它**不是**配置项 —— 换机器就变，只作参考与诊断。
+# ===========================================================================
+
+#: 物理步频默认设定值（Hz）。场景里没有显式配置、或读不到时的兜底。
+#: 与 ``configs/_default.yaml`` 的 ``record.physics_hz`` 保持一致。
+PHYSICS_HZ_SETTING_DEFAULT = 200.0
+
+#: 本机实测墙钟物理步频基线（Hz），仅作诊断参考，不参与任何换算。
+PHYSICS_HZ_WALL_BASELINE = 177.0
+
 #: 模块级句柄，供 stop_capture() 找到已挂载的会话
 _S: dict[str, Any] = {
     "armed": False,
@@ -366,7 +396,8 @@ def arm_capture(
     Args:
         out_dir: 输出目录。留空 → ``<data_root>/<robot>/<task>/<时间戳>/``，
             其中 ``data_root`` 由 ``FASIM_SDG_DATA`` 决定（默认 ``~/fasim_data``）。
-        every: 每多少个**物理步**采一帧。177Hz 下 every=10 ≈ 17.7fps。
+        every: 每多少个**物理步**采一帧。实际帧率 = 物理步频(设定值) / every。
+            试管任务 200Hz、every=10 → 20fps（仿真时间口径）。
             渲染越频繁物理越慢；控制受影响就调大（20 / 40）。
         camera: 相机名，逗号分隔多个；空字符串=**不采相机**。
         robot_key / task_key: 选 ``configs/<robot>/`` 与 ``tasks/<task>.yaml``。
@@ -573,18 +604,57 @@ def arm_capture(
 
     import time
 
-    # 记录**真实**物理步长 —— pack 用它算帧间隔，假设 5ms 会导致速度偏差。
-    # 实测这台机器物理步长 5.876ms（177Hz 而非 200Hz），若按 5ms 换算，
-    # 回放会快 15%，手到得早、位置偏。
+    # ===================== 物理步频：设定值 vs 实际值 =====================
+    #
+    # 必须分清两个概念，混在一起会让时间轴整体偏：
+    #
+    #   1) **设定值**（setting）—— 场景 USD 里 `physxScene:timeStepsPerSecond`
+    #      定义的值（试管场景是 200，即 dt=5ms）。这是**仿真时间**每步推进多少，
+    #      决定帧率与时间轴：每帧仿真时长 = every / physics_hz_setting。
+    #      任务配置用 `record.physics_hz` 声明它，两边对账。
+    #
+    #   2) **实际值**（actual）—— 墙钟每秒真正跑过多少物理步，受机器性能限制
+    #      （本机约 177Hz，3 相机时 RTF≈0.65 只有 130Hz）。它只影响"跑得多快"，
+    #      **不影响仿真时间轴**，不能用来换算帧间隔。
+    #
+    # 所以：physics_dt 取设定值（get_physics_dt 读的就是场景配置），
+    # 实际步频只作诊断记录。
     physics_dt = 0.0
+    physics_src = "unavailable"
     try:
         from isaacsim.core.simulation_manager import SimulationManager
 
         physics_dt = float(SimulationManager.get_physics_dt())
         if physics_dt <= 0:
             physics_dt = 0.0
+        else:
+            physics_src = "scene: physxScene:timeStepsPerSecond"
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN 读物理步长失败（pack 将回退假设 5ms）: {exc}")
+
+    setting_hz = (1.0 / physics_dt) if physics_dt > 0 else 0.0
+    declared_hz = getattr(task, "physics_hz", None)  # 任务配置声明值
+
+    # 对账：任务配置声明 vs 场景设定
+    if declared_hz and setting_hz > 0:
+        if abs(declared_hz - setting_hz) / max(setting_hz, 1e-9) > 0.01:
+            _log(
+                f"WARN 物理步频不一致：{robot_key}/{task_key} 声明 "
+                f"{declared_hz:g} Hz，场景设定 {setting_hz:.2f} Hz。"
+                f"**以场景为准** —— 该任务的 record.physics_hz 需要更新，"
+                f"否则 every 换算出的帧率会错 {setting_hz / declared_hz:.2f}x"
+            )
+    # 读不到场景设定值时：任务配置 > 模块默认常量
+    if setting_hz <= 0:
+        fallback_hz = declared_hz or PHYSICS_HZ_SETTING_DEFAULT
+        physics_dt = 1.0 / float(fallback_hz)
+        setting_hz = float(fallback_hz)
+        physics_src = (
+            "task config record.physics_hz (场景读取失败)"
+            if declared_hz
+            else f"模块默认 PHYSICS_HZ_SETTING_DEFAULT={PHYSICS_HZ_SETTING_DEFAULT:g}"
+        )
+        _log(f"WARN 读不到场景物理步长，按 {setting_hz:g} Hz 记（{physics_src}）")
 
     _S.update(
         armed=True, cameras=cams, out=out, every=max(1, int(every)),
@@ -594,29 +664,39 @@ def arm_capture(
         obj_views=obj_views, what=what,
         code_stamp=_code_stamp(),
         physics_dt=physics_dt,
+        # 设定值：决定时间轴（每帧仿真时长 = every * physics_dt）
+        physics_hz_setting=setting_hz,
+        physics_hz_declared=declared_hz,
+        physics_src=physics_src,
+        # 实际值：墙钟每秒物理步数，受机器性能限制（本机约 177Hz）。
+        # 只作诊断 —— 它不影响仿真时间轴，别拿它换算帧间隔。
+        physics_hz_wall=None,
+        _wall_t0=time.monotonic(),
+        _wall_steps=0,
         # 供 session.json 记录，下游 pack/fk 靠它定位 planning URDF
         robot_key=str(robot_key), task_key=str(task_key),
     )
     if physics_dt > 0:
-        _log(f"物理步长 {physics_dt*1000:.3f} ms（{1/physics_dt:.1f} Hz）"
-             f"→ 每帧 {physics_dt*max(1,int(every))*1000:.2f} ms")
+        fps_sim = 1.0 / (physics_dt * max(1, int(every)))
+        # 墙钟基线：优先用配置里的 record.physics_hz_wall_baseline（换机器要实测后改）
+        wall_hz = getattr(task, "physics_hz_wall_baseline", None)
+        if wall_hz is None:
+            wall_hz = PHYSICS_HZ_WALL_BASELINE
+        rtf_est = min(1.0, wall_hz / setting_hz) if setting_hz > 0 else 1.0
+        _log("=" * 60)
+        _log(f"物理步频（设定值）: {setting_hz:.1f} Hz  dt={physics_dt*1000:.3f}ms")
+        _log(f"                    [{physics_src}] 本任务 every={every}")
+        _log(f"→ 每帧仿真时间 {physics_dt*max(1,int(every))*1000:.2f} ms"
+             f" = {fps_sim:.2f} fps（仿真时间口径，时间轴以它为准）")
+        if wall_hz > 0:
+            _log(f"物理步频（实际值）: 本机基线约 {wall_hz:.0f} Hz "
+                 f"(RTF≈{rtf_est:.2f})")
+            _log(f"→ 预计落盘 {fps_sim * rtf_est:.1f} fps 墙钟"
+                 f"（相机越多越低；只影响跑多快，不改时间轴）")
+        _log("=" * 60)
 
-    def _on_physics_step(dt: float) -> None:
-        """物理步进回调：按 every 降采样，取最近渲染的一帧落盘。必须快速返回。
-
-        **不要调 ``rep.orchestrator.step()``** —— 在 Kit 进程内它会抛
-        ``OrchestratorError: Synchronous call to step can only be performed in
-        a standalone workflow and may not be made from within Kit``。
-        （层2 能调是因为 ``SimulationApp(headless=True)`` 属于 standalone。）
-
-        Kit 里渲染由 Replicator 的 tick 图跟着 ``app.update()`` 自动驱动，
-        所以这里只要 ``get_data()`` 取最近一帧即可。实测 33/33 帧互不相同，
-        不存在重复缓冲问题。
-        """
-        _S["step"] += 1
-        if _S["step"] % _S["every"] != 0:
-            _S["skipped"] += 1
-            return
+    def _emit_frame(reason: str = "physics") -> None:
+        """落一帧。必须快速返回。"""
         try:
             idx = _S["saved"]
             payload: dict[str, Any] = {
@@ -769,6 +849,30 @@ def arm_capture(
                 _log("!" * 60)
             carb.log_warn(f"[capture] 采帧失败: {exc}")
 
+    def _on_physics_step(dt: float) -> None:
+        """物理步进回调：按 every 降采样，取最近渲染的一帧落盘。必须快速返回。
+
+        **不要调 ``rep.orchestrator.step()``** —— 在 Kit 进程内它会抛
+        ``OrchestratorError: Synchronous call to step can only be performed in
+        a standalone workflow and may not be made from within Kit``。
+        （层2 能调是因为 ``SimulationApp(headless=True)`` 属于 standalone。）
+
+        Kit 里渲染由 Replicator 的 tick 图跟着 ``app.update()`` 自动驱动，
+        所以这里只要 ``get_data()`` 取最近一帧即可。
+
+        **重复帧复核（2026-11-12）**：曾用"全图 mean|diff| < 0.5"判据说这里
+        有 45.7% 重复帧，那是**错的** —— 机器人只占画面一小块，大部分静态
+        背景把均值稀释了。用"逐位相同"这个硬判据复核：run_04 的 650 对
+        相邻帧里 **0 对**逐位相同，甚至最大像素差最小也有 5。因此本路线
+        **不存在重复帧**，无需改挂渲染回调。
+        """
+        _S["step"] += 1
+        _S["_wall_steps"] += 1
+        if _S["step"] % _S["every"] != 0:
+            _S["skipped"] += 1
+            return
+        _emit_frame("physics")
+
     sub = omni.physx.get_physx_interface().subscribe_physics_step_events(_on_physics_step)
     _S["sub"] = sub
 
@@ -785,7 +889,11 @@ def arm_capture(
                 "robot_key": str(robot_key),
                 "task_key": str(task_key),
                 "status": "capturing",       # stop 时改为 written
+                # 设定值（决定时间轴）
                 "physics_dt": physics_dt,
+                "physics_hz_setting": _S.get("physics_hz_setting", 0.0),
+                "physics_hz_declared": _S.get("physics_hz_declared"),
+                "physics_src": _S.get("physics_src", ""),
                 "every": max(1, int(every)),
                 "cameras": [
                     {"name": c["name"], "prim": c["prim"], "size": c["size"]}
@@ -839,6 +947,8 @@ def stop_capture() -> dict:
         _log("未挂载")
         return {}
 
+    import time
+
     try:
         if _S["sub"] is not None:
             _S["sub"].unsubscribe()
@@ -878,7 +988,22 @@ def stop_capture() -> dict:
         "ee_xform_control": sorted(_S.get("ee_prims", {}).keys()),
         "objects_captured": sorted(_S.get("obj_views", {}).keys()),
         "code_stamp": _S.get("code_stamp", "unknown"),
+        # ===== 物理步频：务必区分设定值与实际值 =====
+        # 设定值：场景 physxScene:timeStepsPerSecond（仿真时间口径，决定时间轴）
         "physics_dt": _S.get("physics_dt", 0.0),
+        "physics_hz_setting": _S.get("physics_hz_setting", 0.0),
+        "physics_hz_declared": _S.get("physics_hz_declared"),
+        "physics_src": _S.get("physics_src", ""),
+        # 实际值：墙钟每秒物理步数（受机器性能限制，本机约 177Hz）。
+        # **不要用它换算帧间隔** —— 仿真时间轴只看设定值。
+        "physics_hz_wall": round(
+            _S["_wall_steps"] / max(time.monotonic() - _S["_wall_t0"], 1e-9), 2
+        ) if _S.get("_wall_t0") else None,
+        # 目标帧率（仿真时间口径）= physics_hz_setting / every
+        "target_fps": (
+            round(float(_S.get("physics_hz_setting") or 0.0)
+                  / max(1, int(_S.get("every", 1))), 3) or None
+        ),
         # 采集期逐帧自检（不落盘，只在内存里累计）—— 收工时一次看清
         "ee_health": _S.get("ee_health", {}),
         "camera_health": _S.get("cam_health", {}),

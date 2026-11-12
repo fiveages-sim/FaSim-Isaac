@@ -355,17 +355,89 @@ pinocchio 只用于可选的对拍自检。
 
 ---
 
-## 采集频率
+## 采集频率与物理步频
 
-| `every` | 仿真时间帧率 | 说明 |
+`every` 的语义是**每 N 个物理步采一帧**，所以帧率不是独立参数，而是：
+
+```
+每帧仿真时长 = every / physics_hz      （physics_hz 是"设定值"）
+```
+
+### 设定值 vs 实际值（务必分清）
+
+| | 是什么 | 本机值 | 影响什么 |
+|---|---|---|---|
+| **设定值** `physics_hz` | 物理步长配置，`dt = 1/hz` | **200 Hz**（场景 `physxScene:timeStepsPerSecond`） | **仿真时间轴**、帧率换算、export 的 fps |
+| **实际值** `physics_hz_wall` | 墙钟每秒真跑多少物理步 | **约 177 Hz**（RTF≈0.89；3 相机采集时约 130 Hz） | 只影响"跑得多快"，**不改时间轴** |
+
+**时间轴一律用设定值换算。** 用实际值会让数据整体偏 13%（177 vs 200），
+表现是回放时手"到得早/晚"，很难查 —— commit `5c75702` 曾把 5.876ms
+（177Hz 的步长）当真值"修正"5ms 硬编码，被 `fix01` 反证。
+
+两者都显式落在配置和代码里：
+
+```yaml
+# configs/_default.yaml
+record:
+  physics_hz: 200              # 设定值：与场景 timeStepsPerSecond 一致
+  physics_hz_wall_baseline: 177 # 实际值：本机实测基线，只用于日志预估
+```
+
+```python
+# scripts/live_capture.py 模块级常量（配置留空时的兜底）
+PHYSICS_HZ_SETTING_DEFAULT = 200.0   # 设定值
+PHYSICS_HZ_WALL_BASELINE   = 177.0   # 实际值基线（诊断用，不参与换算）
+```
+
+按 177 基线，`every=10` 的 20 fps 仿真时间在墙钟上只能跑到约 **17.7 fps**
+—— 这正是旧文档里 "every=10 ≈ 17.7fps" 的来历：那个数字是**墙钟帧率**，
+不是仿真时间帧率。两个都合理，但不能混着说。
+
+### 按任务配置
+
+物理步频定义在**场景资产**里，不同任务用不同场景就可能是不同步频，
+所以它是任务级配置：
+
+```yaml
+# configs/<robot>/tasks/<task>.yaml
+record:
+  physics_hz: 200      # 与场景 physxScene:timeStepsPerSecond 一致
+```
+
+采集开始时会读场景的实际配置值与之对账，不一致打 WARN（**以场景为准**）：
+
+```
+WARN 物理步频不一致：unitree_g1d/xxx 声明 100 Hz，场景设定 200.00 Hz。
+     **以场景为准** —— 该任务的 record.physics_hz 需要更新，否则
+     every 换算出的帧率会错 2.00x
+```
+
+启动时会分三行打印清楚：
+
+```
+物理步频（设定值）: 200.0 Hz  dt=5.000ms
+                    [scene: physxScene:timeStepsPerSecond] 本任务 every=10
+→ 每帧仿真时间 50.00 ms = 20.00 fps（仿真时间口径，时间轴以它为准）
+物理步频（实际值）: 本机基线约 177 Hz (RTF≈0.89)
+→ 预计落盘 17.7 fps 墙钟（相机越多越低；只影响跑多快，不改时间轴）
+```
+
+没写 `physics_hz` 也能跑（用场景实测值），只是菜单里的帧率档位会标"未知步频"。
+
+### 常用档位（200Hz 场景）
+
+| `every` | 每帧仿真时长 | 帧率（仿真时间） |
 |---|---|---|
-| 5 | 40 fps | 最细，开销最大 |
-| 10 | 20 fps | **推荐** |
-| 20 | 10 fps | 省开销 |
+| 5 | 25 ms | 40 fps |
+| 7 | 35 ms | 28.6 fps |
+| **10** | **50 ms** | **20 fps** ← 推荐 |
+| 20 | 100 ms | 10 fps |
+| 40 | 200 ms | 5 fps |
 
-实际墙钟速度受 RTF 限制（实测本机 3 相机时 RTF≈0.65，约 13 fps 墙钟）。
-**跨采集方式比较时用 `physics_steps / duration_sec`**（物理步/秒），
-那是与渲染开销无关的真实仿真速度。
+实际墙钟帧率会低于这个值（受 RTF 限制，实测 3 相机时约 13 fps 墙钟）。
+**跨方案比较时用 `physics_steps / duration_sec`**（物理步/秒），
+那是与渲染开销无关的真实仿真速度。注意它量的是"实际值"，
+不要拿它做时间轴换算。
 
 ---
 
@@ -374,6 +446,12 @@ pinocchio 只用于可选的对拍自检。
 ```
 exts/fasim.replicator.sdg/
 ├── configs/                      机器人/任务配置（唯一需要改的地方）
+├── docs/                         调试记录 / 方案评测 / 外部数据集分析
+│   ├── DEBUG_LOG.md
+│   ├── TOPIC_CAPTURE_SETUP.md
+│   ├── benchmark-vs-topic-capture.md
+│   ├── colleague-dataset-analysis.md      ← 同事 data-collector-platform 数据体检
+│   └── analysis_dcp_dataset.py            上文的复现脚本
 ├── fasim/replicator/sdg/
 │   ├── live_capture.py           ← 实际采集逻辑（由扩展调用）
 │   ├── live_replay.py            同实例回放（joints / ee）
