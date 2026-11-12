@@ -1,0 +1,54 @@
+category,item,metric,unit,faSim_sdg,lerobot_ros2,advantage,confidence,status,notes
+规模,采集帧数,frames,-,待测,待测,待测,待测,pending,同一条轨迹同一时长
+规模,物理步数,physics_steps,-,待测,待测,待测,待测,pending,跨方案可比的真实仿真速度
+规模,墙钟时长,duration,s,待测,待测,待测,待测,pending,
+规模,仿真时间帧率,framerate_sim,fps,20 (every=10),待测,取决于参数,高,pending,不要直接比 fps
+规模,墙钟帧率,framerate_wall,fps,待测,待测,待测,待测,pending,
+规模,物理步速率,steps_per_sec,步/秒,待测,待测,待测,待测,pending,核心公平指标
+规模,实时率,RTF,-,0.65 (3相机),待测,待测,中,pending,run_03 实测 0.65
+规模,帧间抖动,jitter,max|dt-median| ms,0.00 已知,待测,SDG 可能优,中,pending,SDG run_03 抖动 0
+体积,总包体积,total_size,GB,4.7 (674帧3相机),待测,待测,待测,pending,run_03 实测
+体积,单帧体积,per_frame,MB/帧,7.0,-,待测,待测,pending,4.7GB/674
+体积,关闭深度后,no_depth,GB,待测,待测,待测,待测,pending,
+体积,320x240 后,low_res,GB,待测,待测,待测,待测,pending,约 1/4
+体积,仅episode无图像,episode_only,MB,0.25 已知,-,SDG 可压缩至此,高,pending,episode.npz 仅 256K
+体积,压缩方式,compression,-,npz 无压缩,parquet+图像,待测,高,pending,SDG 可切 savez_compressed 但拖慢物理
+配置,采集项可配,what_config,-,支持 camera/joint/ee/object,硬编码需改代码,SDG,高,confirmed,--what 参数
+配置,频率可配,rate_config,-,支持 --every 任意,硬编码 FPS=30,SDG,高,confirmed,demo_record.py 里 FPS 常量
+配置,分辨率可配,res_config,-,支持 --width/--height,ROS2CameraConfig 可配,平手,高,confirmed,两边都支持
+配置,相机选择, camera_select,-,支持 --camera all|name,需改 camera_config dict,SDG,高,confirmed,
+相机,图像来源,image_source,-,annotator 直读渲染缓冲,ros2 Image 经 DDS,待测,高,confirmed,SDG 少一次传输
+相机,内参是否落盘,intrinsics_saved,-,是 <cam>_K 逐帧,否,SDG,高,confirmed,ROS2Camera 只订 Image
+相机,内参来源,intrinsics_src,-,cameraProjection 反推,N/A,SDG,高,confirmed,
+相机,相机位姿是否落盘,cam_pose_saved,-,是 cam/<cam>_pos/_quat 逐帧,否,SDG,高,confirmed,camera_params.cameraViewTransform 求逆
+相机,内参校验误差,intrinsics_err,mm/px,待测,N/A,SDG,待测,pending,点云尺寸 vs USD 实际尺寸
+对齐,图像-关节对齐,img_joint_align,-,同一物理步回调,跨进程需插值,SDG,高,confirmed,架构决定
+对齐,关节-末端对齐,joint_ee_align,-,同一回调,不同话题,SDG,高,confirmed,
+对齐,关节-物体对齐,joint_obj_align,-,同一回调,需 get_entity_state 服务,SDG,高,confirmed,
+对齐,时间基准,time_base,-,sim_step+tl.get_current_time,ROS 时间戳,SDG,中,confirmed,ROS 时钟未必同步
+对齐,FK投影vs图像偏差,proj_error,px,待测,待测,待测,待测,pending,理想 <5px
+功能,数据采集,capture,-,支持,支持,平手,高,confirmed,
+功能,数据体检,diag,-,7 项一键,无,SDG,高,confirmed,
+功能,相机联络图,shots,-,支持,无(SDG独有),SDG,高,confirmed,
+功能,切任务片段,trim,-,支持,无,SDG,高,confirmed,
+功能,回放-关节,replay_joint,-,支持,支持(record_playback),平手,高,confirmed,
+功能,回放-末端,replay_ee,-,支持,支持(ee_traj),平手,高,confirmed,
+功能,回放精度量化,replay_metric,-,mm级+方向,仅 inspect 看差值,SDG,高,confirmed,
+功能,采集进度查询,status,-,支持,无,SDG,高,confirmed,
+功能,交互式菜单,menu,-,支持,部分脚本 input(),SDG,中,confirmed,
+功能,崩溃恢复,crash_recovery,-,session 边写可抢救,依赖 LeRobot episode 保存,SDG,中,confirmed,
+扩展,新机器人接入,new_robot,-,新建 configs/<robot>/ 纯配置,robot.yaml + 改采集脚本,SDG,中高,confirmed,
+扩展,新相机接入,new_camera,-,改 task.yaml,改 camera_config dict,SDG,中,confirmed,
+扩展,跟随Isaac新特性,isaac_features,-,直接用 annotators,需 ROS 桥先支持,SDG,高,confirmed,
+扩展,自定义数据字段,custom_field,-,改 live_capture payload,改 LeRobot schema,平手,中,confirmed,
+扩展,跨仿真器,cross_sim,-,绑死 Isaac,只要发 ROS 话题即可,lerobot,高,confirmed,
+部署,注册方式,deploy_method,-,init.sh 注册扩展,需建 OmniGraph+起进程,SDG,中,confirmed,
+部署,终端需 source ROS,need_ros_env,-,不需要,需要,SDG,高,confirmed,
+部署,首采步骤数,first_capture_steps,步,待测,待测,待测,待测,pending,从零到第一次采到数据
+部署,G1D场景现成ROS相机,scene_ready,-,N/A,无(room.usda 只有 prim),SDG,高,confirmed,需自己加 OmniGraph
+干扰,对运控影响,ctrl_interference,物理步速率降幅%,待测,待测,待测,待测,pending,
+干扰,是否写关节,write_joints,-,否(只读),否,平手,高,confirmed,
+容错,崩溃后数据可用,crash_data,-,frames 已落盘可抢救,LeRobot episode 可恢复,平手,中,confirmed,
+格式,格式类型,format,-,自定义 npz,LeRobot parquet+图像,-,高,confirmed,
+格式,可直接训练,ready_to_train,-,需自写 DataLoader,直接 LeRobotDataset,lerobot,高,confirmed,B 的重大优势
+格式,元信息完整度,meta,-,robot/task/code_stamp/配置快照,meta/info.json 无采集参数,SDG,中,confirmed,
