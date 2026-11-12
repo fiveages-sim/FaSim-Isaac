@@ -147,7 +147,7 @@ case "$CMD" in
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/sdg_menu.py" "$@"
         ;;
-    capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume|list)
+    capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume|list|export)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"

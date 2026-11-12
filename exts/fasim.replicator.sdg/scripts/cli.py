@@ -596,6 +596,38 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """把采集会话导出成 LeRobot 数据集（v3.0）。"""
+    from fasim.replicator.sdg import export_lerobot as ex
+
+    session = Path(args.session).expanduser()
+    if not session.is_dir():
+        _log(f"ERROR 会话目录不存在: {session}")
+        _explain_missing_path(session, want="session.json")
+        return 1
+    out = Path(args.out).expanduser() if args.out else (
+        Path.home() / "lerobot_datasets" / session.name
+    )
+    try:
+        res = ex.export_session(
+            session, out,
+            repo_id=args.repo_id or None,
+            fps=args.fps or None,
+            robot_type=args.robot_type or None,
+            task=args.task or None,
+            use_videos=not args.no_videos,
+            overwrite=bool(args.overwrite),
+            lerobot_python=args.lerobot_python or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR {exc}")
+        return 1
+    _log(f"导出完成: {res['out']}")
+    _log(f"  {res['frames']} 帧  features={res['features']}")
+    _log(f"  加载方式: LeRobotDataset(repo_id='{session.name}', root='{res['out']}')")
+    return 0
+
+
 def cmd_diag(args: argparse.Namespace) -> int:
     """一键体检一个 episode：末端真伪 + 关节口径 + 时间轴 + FK 交叉验证。
 
@@ -1359,6 +1391,24 @@ def main(argv: list[str] | None = None) -> int:
                     help="只列已 pack 出 episode.npz 的")
     ls.add_argument("--limit", type=int, default=50)
     ls.set_defaults(func=cmd_list)
+
+    ex = sub.add_parser(
+        "export",
+        help="采集会话 → LeRobot 数据集（v3.0，可直接用 LeRobotDataset 加载）",
+    )
+    ex.add_argument("session", help="采集会话目录")
+    ex.add_argument("--out", default="", help="输出目录（默认 ~/lerobot_datasets/<会话名>）")
+    ex.add_argument("--repo-id", default="", help="LeRobot repo_id（默认用会话名）")
+    ex.add_argument("--fps", type=float, default=0.0,
+                    help="帧率；留空由 physics_dt×every 推")
+    ex.add_argument("--robot-type", default="", help="写进 info.json 的机器人类型")
+    ex.add_argument("--task", default="", help="任务文本（LeRobot 的 task 字段）")
+    ex.add_argument("--no-videos", dest="no_videos", action="store_true",
+                    help="图像不编码成 mp4（需 v3 允许 image feature；一般不用）")
+    ex.add_argument("--overwrite", action="store_true", help="输出目录已存在时清空")
+    ex.add_argument("--lerobot-python", default="",
+                    help="能 import lerobot 的 python；留空自动找")
+    ex.set_defaults(func=cmd_export)
 
     i = sub.add_parser("info", help="看采集会话里有什么")
     i.add_argument("session", help="会话目录，如 ~/fasim_data/.../20261110-1121")
