@@ -1,286 +1,287 @@
-# ACT 训练路线（sdg 数据）
+# ACT 训练与推理路线（sdg 数据）
 
 日期：2026-11-12
-目标：用 sdg 采集的 G1D 试管插拔数据训 ACT，并建立可复现的评测闭环。
+适用：lerobot **v0.5.1**（submodule，2026-04-07）
 
 ---
 
-## 0. 前置检查（本机实测状态）
+## 0. 环境划分（重要）
 
-| 项 | 状态 | 说明 |
-|---|---|---|
-| GPU | ✅ RTX 4090 / 24GB | ACT（~50M 参数）足够，单卡可训 |
-| `lerobot` | ✅ 0.3.4（submodule editable） | `lerobot_ros2/submodules/lerobot` |
-| `torch` | ✅ 2.7.1+cu128 | 在 `lerobot_ros2/.venv` |
-| `numpy` | ⚠️ 1.26.4 | **ACT 训练要在 numpy 2.x 环境下**（`lerobot 0.5.x`）；当前 1.26 是为 `cv_bridge` 兼容 |
-| `.venv-train` | ❌ **不存在** | 之前规划过但没建 |
+仓库用两个 venv，**numpy 版本冲突**是拆分的唯一原因：
 
-> **重要**：`.venv` 里 numpy 1.26.4 是为了系统 `cv_bridge`（ROS 采图）。训练不需要
-> ROS，应该单独建一个 numpy 2.x 环境，避免污染采集环境。
+| 环境 | numpy | lerobot | 用途 |
+|---|---|---|---|
+| `.venv` | **1.26.4** | 0.3.4（旧 submodule editable） | 编排 / 采集 / 导出 / 数据处理 |
+| `.venv-train` | **2.0~2.2** | **0.5.1（PyPI）** | 只跑训练与推理 |
 
-### 导入路径注意
+`lerobot 0.5.x` 强制 `numpy>=2.0.0,<2.3.0`；而系统 `cv_bridge` 按 numpy 1.x ABI
+编译，升 2.x 会破坏头相机采集。所以：
 
-lerobot 0.3.4 的 ACT **没有** `ACTPolicy` 这个导出名，实际是：
+- **采集/导出用 `.venv`**（要 ROS）
+- **训练/推理用 `.venv-train`**（不要 ROS）
 
-```python
-from lerobot.policies.act.modeling_act import ACT          # 模型
-from lerobot.policies.act.configuration_act import ACTConfig
-```
+> ⚠️ `.venv-train` **不要** `source /opt/ros/jazzy/setup.bash` ——
+> 那会把系统 numpy 1.26 塞进 PYTHONPATH，污染训练环境。
 
----
-
-## 1. 环境准备
+### 创建训练环境
 
 ```bash
 cd ~/lerobot_ros2
-uv venv .venv-train --python 3.12
-source .venv-train/bin/activate
+./init.sh setup-train-env          # 等价于菜单 t
+```
 
-# 训练侧依赖（不装 ROS 相关）
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-uv pip install -e submodules/lerobot
-uv pip install av pyarrow datasets
+**如果在 Cursor 内置终端执行**，必须先覆盖 `UV_CACHE_DIR`，否则 uv 会把包写到
+`/tmp/cursor-sandbox-cache/...`，`.venv-train` 永远只有 100K 空壳（已实测踩坑两次）：
+
+```bash
+env UV_CACHE_DIR="$HOME/.cache/uv" ./init.sh setup-train-env
 ```
 
 验证：
 
 ```bash
-python -c "
-import torch, numpy
-print('torch', torch.__version__, 'cuda', torch.cuda.is_available())
-print('numpy', numpy.__version__)
-from lerobot.policies.act.modeling_act import ACT
-print('ACT OK')
+.venv-train/bin/python -c "
+import numpy, torch, lerobot
+print('numpy', numpy.__version__)      # 期望 2.0~2.2
+print('lerobot', lerobot.__version__)  # 期望 0.5.1
+print('cuda', torch.cuda.is_available())
 "
 ```
 
-**要求**：`torch.cuda.is_available()` 必须是 `True`、`numpy` 应是 2.x。
-
 ---
 
-## 2. 数据准备
+## 1. 数据准备
 
-### 2.1 采集
+### 1.1 采集
 
 ```bash
-cd ~/FaSim-Isaac && ./run.sh          # 终端 A：起 Isaac + 运控
-cd ~/FaSim-Isaac
+cd ~/FaSim-Isaac && ./run.sh          # 终端 A：Isaac + 运控
 ./exts/fasim.replicator.sdg/scripts/sdg.sh capture
 ```
 
-关键选择（菜单里）：
+菜单选择建议：
 
 | 项 | 建议 | 原因 |
 |---|---|---|
-| 采集项 | `camera,joint,ee,object` 全选 | ACT 需要图像 + 关节；ee/object 用于校验 |
-| 相机 | `all`（3 路） | 单相机在遮挡时会瞎 |
-| 频率 | 取决于目标 fps（见下） | **不是硬件上限，是 `every` 决定的** |
-| 深度 | 要（虽然 ACT 不用，但后续换 DP3 需要） | 省得重采 |
+| 采集项 | `camera,joint,ee,object` 全选 | ACT 用图像+关节；ee/object 供校验与成功判定 |
+| 相机 | `all`（3 路） | 单相机遮挡时会瞎 |
+| 频率 | `every=10`（20fps 仿真时间） | ACT 通常 10~30Hz，够用。见下方调参 |
+| 深度 | 要 | ACT 不用，但后续 DP3/点云需要，省得重采 |
 
-**帧率可以调高**（实测推论，待验证）：
+**帧率可调**（`every` 决定，不是硬件上限）：
 
 ```
-落盘帧率 = 墙钟物理步频 / every
-当前 every=10 → 13 fps 墙钟（20 fps 仿真时间）
-every=1  → 理论 130 fps 墙钟（200 fps 仿真）
+落盘帧率(仿真时间) = 200Hz / every
+  every=10 → 20 fps   ← 默认
+  every=5  → 40 fps
+  every=2  → 100 fps
+
+落盘帧率(墙钟) = 墙钟物理步频(约130Hz) / every
+  every=10 → 13 fps
+  every=2  → 65 fps   ← 想接近同事的 57Hz 用这个
 ```
 
-`every` 越小，物理步进越频繁调用 `np.savez`（1.3ms/帧），会拖慢物理。
-**建议先试 `every=2`（约 65fps 墙钟）**，看机器人运动是否还顺滑、RTF 掉多少。
+`every` 越小，`np.savez` 调用越频繁（1.3ms/帧），会拖慢物理。**先跑通再调**。
 
-### 2.2 pack（会话 → episode.npz）
+### 1.2 pack → trim → export
 
 ```bash
-./exts/fasim.replicator.sdg/scripts/sdg.sh pack <会话目录> --robot unitree_g1d
-```
+cd ~/FaSim-Isaac/exts/fasim.replicator.sdg
+S=~/fasim_data/unitree_g1d/sinopec_test_tube/run_04
 
-### 2.3 trim（去掉静止段）
-
-我们数据开头常有 5~8 秒静止（等运控稳定）。训练前必须切掉，否则策略学到"先发呆"：
-
-```bash
-./exts/fasim.replicator.sdg/scripts/sdg.sh trim <会话目录>
-```
-
-### 2.4 export（episode → LeRobot）
-
-```bash
-./exts/fasim.replicator.sdg/scripts/sdg.sh export <会话目录> \
+./scripts/sdg.sh pack   $S --robot unitree_g1d     # 会话 → episode.npz
+./scripts/sdg.sh trim   $S                          # 切掉静止段（可选）
+./scripts/sdg.sh export $S \
     --out ~/lerobot_datasets/tube_v1 \
-    --action-space delta        # 或 absolute
+    --action-space absolute                         # 或 delta / ee_delta
 ```
 
-**`action-space` 怎么选**：
+### 1.3 `action-space` 怎么选
 
-| 选项 | 适用 | 理由 |
+| 选项 | 内容 | 什么时候用 |
 |---|---|---|
-| `absolute`（默认） | **先跑这个** | 部署时策略直接输出目标关节角，无累积误差；G1D 用 ros2_control 位置控制，天然吃绝对值 |
-| `delta` | 对齐同事数据 / 混训 | 与 data-collector-platform 同语义，便于横向对比 |
-| `ee_delta` | 想学任务空间 | 与同事 pose 模式同构，但需要 IK 执行 |
+| `absolute`（默认） | `joint_pos_cmd` 绝对关节指令 | **先跑这个**。部署时策略直接输出目标角，无累积误差；G1D 是位置控制，天然吃绝对值 |
+| `delta` | `joint_pos[t+1] - joint_pos[t]` | 对齐同事 data-collector-platform（他们用 delta），便于混训/横向对比。实测自洽误差 1.86e-09 |
+| `ee_delta` | 末端相邻增量 14 维 | 想学任务空间（与同事 pose 模式同构） |
 
-> 我们的 `absolute` 是 `joint_pos_cmd`（**指令**），不是实测值。
-> 这点很关键：部署时策略只能输出命令，训练目标就该是命令。
+> 注意 `delta` **不是** `cmd - 实测`。后者是控制器修正量，实测比真实位移大
+> **7.43 倍**（0.0092 vs 0.0012 rad），会让策略学到「每步都要大修正」，部署时抖。
 
-### 2.5 校验（必做）
+### 1.4 校验（必做）
 
 ```bash
-./exts/fasim.replicator.sdg/scripts/sdg.sh export-check ~/lerobot_datasets/tube_v1
+./scripts/sdg.sh export-check ~/lerobot_datasets/tube_v1
+# 必须看到 ✅ 数据集可被 LeRobotDataset 正常加载
 ```
-
-必须看到 `✅ 数据集可被 LeRobotDataset 正常加载`。
 
 ---
 
-## 3. 训练
+## 2. 训练
 
-### 3.1 最小可用命令
+### 2.1 启动命令（lerobot 0.5.1）
 
 ```bash
 cd ~/lerobot_ros2
 source .venv-train/bin/activate
 
-python -m lerobot.scripts.train \
-    --dataset.repo_id tube_v1 \
-    --dataset.root ~/lerobot_datasets/tube_v1 \
-    --policy.type act \
-    --output_dir ~/act_runs/tube_v1 \
-    --batch_size 8 \
-    --steps 20000 \
-    --policy.chunk_size 100 \
-    --policy.n_action_steps 1
+python -m lerobot.scripts.lerobot_train \
+    --dataset.repo_id=tube_v1 \
+    --dataset.root=$HOME/lerobot_datasets/tube_v1 \
+    --policy.type=act \
+    --output_dir=$HOME/act_runs/tube_v1 \
+    --batch_size=8 \
+    --steps=20000 \
+    --save_freq=5000
 ```
 
-> `--dataset.root` 指向本地目录（不走 HF hub）。若 lerobot 版本参数名不同，
-> 用 `python -m lerobot.scripts.train --help` 确认。
+> **0.5.1 与旧版差异**：训练脚本名从 `train.py` 改成 **`lerobot_train.py`**
+> （`python -m lerobot.scripts.lerobot_train`）。参数用 `--key=value` 形式。
 
-### 3.2 关键超参（针对我们的数据）
+### 2.2 关键参数
 
-| 参数 | 建议 | 为什么 |
+| 参数 | 默认 | 我们数据上的建议 | 原因 |
+|---|---|---|---|
+| `batch_size` | 8 | 8~16 | 4090 24GB，3 路 640×480 |
+| `steps` | 100000 | 20000~50000 | 数据少易过拟合，多存 ckpt |
+| `save_freq` | 20000 | 5000 | 数据少，想早点看到 ckpt |
+| `eval_freq` | 20000 | 关闭或留大 | 我们没 test split |
+| `num_workers` | 4 | 8 | 3 路视频解码是瓶颈 |
+| `policy.chunk_size` | 100 | 100 | ACT 论文默认 |
+| `policy.n_action_steps` | 100 | **1**（闭环最稳）或 chunk_size/2（提速） | 每步重预测，避免开环漂 |
+
+### 2.3 数据量警告
+
+ACT 论文用 **50~200 条**轨迹。我们目前：
+
+| 会话 | 帧数 | 条数 |
 |---|---|---|
-| `chunk_size` | 100 | ACT 论文默认；我们 20fps → 5 秒预测窗口 |
-| `n_action_steps` | 1 | 每步都重新预测（闭环最稳）；要提速可设 chunk_size/2 |
-| `batch_size` | 8~16 | 4090 24GB，图像 640×480 ×3 路 |
-| `steps` | 20000~50000 | 数据量小（几百帧/条），易过拟合，多存 checkpoint |
-| `lr` | 1e-5（默认） | 先用默认 |
-| `vision_backbone` | `resnet18`（默认） | 24GB 够，可试 `resnet34` |
+| `run_03` | 674 | 1 |
+| `run_04` | 651 | 1 |
 
-**数据量警告**：ACT 通常要 50+ 条轨迹。我们现在只有 1~2 条
-（`run_03` 674 帧、`run_04` 651 帧）。**先跑通流水线，别期待效果**。
+**1~2 条只能验证流水线，训不出可用策略。** 20k 步后 loss 会很低，但那是对
+这一条路径的过拟合 —— 换个初始位置就失败。
 
-### 3.3 过拟合自检（数据量小的时候必做）
+判断是否「只是流水线验证」：用同一会话训练 + 同一会话评测，loss 能收敛
+说明代码没问题，但**不能说明策略可用**。
+
+---
+
+## 3. 推理（仓库里已经有）
+
+**有，而且是完整的。** 关键文件：
+
+| 路径 | 作用 |
+|---|---|
+| `examples/IsaacSim/inference.py` | 统一推理启动器（LeRobot + ROS2） |
+| `examples/IsaacSim/online_infer/core.py` | 策略循环 + ROS2 发送 |
+| `examples/IsaacSim/robots/Unitree/G1D/` | **G1D 的任务配置已在** |
+
+推理内部走标准 LeRobot API（已核对 0.5.1 都还在）：
+
+```python
+# online_infer/core.py
+from lerobot.policies.factory import make_policy          # :36
+train_cfg = TrainPipelineConfig.from_pretrained(...)      # :372
+policy = make_policy(cfg.policy, ds_meta=meta_obj)        # :420
+action = policy.select_action(batch)                      # :532
+```
+
+### 3.1 启动方式
 
 ```bash
-# 用同一条数据训练 + 评测，loss 应该能降到很低
-# 若 20k 步后 loss 仍 > 0.01，说明是流水线问题，不是数据问题
+cd ~/lerobot_ros2/examples/IsaacSim
+source ~/lerobot_ros2/.venv-train/bin/activate   # 推理要 0.5.1 环境
+
+python inference.py --robot g1d --task <task_key> \
+    --policy-path ~/act_runs/tube_v1/checkpoints/last/pretrained_model
+```
+
+> 参数以 `python inference.py --help` 为准（我没跑过完整推理，只核对了代码结构）。
+
+### 3.2 推理链路
+
+```
+Isaac 渲染相机 + 关节状态
+    ↓（ROS2 话题，由 lerobot_camera_ros2 / lerobot_robot_ros2 订阅）
+obs 张量 → policy.select_action() → action
+    ↓（反归一化，转成关节目标）
+/joint_states 目标 → OCS2 追踪 → PhysX
 ```
 
 ---
 
-## 4. 评测（这是难点）
+## 4. 三层评测（从便宜到贵）
 
-### 4.1 三层评测，从便宜到贵
-
-| 层 | 做什么 | 成本 | 能回答什么 |
+| 层 | 做什么 | 成本 | 能回答 |
 |---|---|---|---|
-| **L1 离线** | 在留出帧上算 MSE / 动作相似度 | 秒级 | 拟合好坏（**不能说明能不能用**） |
-| **L2 开环回放** | 把预测 action 喂给 `sdg.sh live` | 分钟级 | 动作序列是否合理、会不会发散 |
-| **L3 闭环仿真** | 策略输出 → 运控执行 → 观察新状态 | 小时级 | **真实成功率** |
+| **L1 离线** | 留出帧上算 MSE | 秒 | 拟合好坏（**不能说明能用**） |
+| **L2 开环回放** | 预测 action 序列 → `sdg.sh live` 逐帧执行，**不闭环** | 分钟 | 动作是否发散/饱和/量级错 |
+| **L3 闭环** | 策略出 action → 运控执行 → 新观测 → 循环 | 小时 | **真实成功率** |
 
-### 4.2 L2：开环回放（最优先做）
+**建议顺序**：先 L2（能立刻发现低级错误），再 L3。
 
-我们已经有 `live_replay.py`，需要加一个"策略推理"入口：
+L3 需要一个**成功判定**，我们目前没有。可用 `sdg` 的 `tracked_prims`：
 
-```
-sdg.sh policy <episode.npz> --checkpoint <ckpt> --mode openloop
-```
-
-流程：加载 obs → 策略出 action → 写进 `joint_pos_cmd` → 推进物理 → 循环。
-这能立刻发现"策略输出量级不对/全部饱和/抖"这类低级错误，**不用等闭环**。
-
-### 4.3 L3：闭环仿真
-
-需要打通三件事：
-
-1. **策略服务**：把 ACT 包成一个 ROS2 节点或 socket 服务，输入 obs（图像+关节），输出 action。
-2. **执行链路**：action → `/joint_states` 目标 → OCS2 追踪 → 物理。
-3. **成功判定**：试管是否插进目标孔位。可以用 `tracked_prims` 的位姿判断
-   （`test_tube` 相对 `test_tube_rack` 的位置/姿态阈值）。
-
-我们现在**缺 1 和 3**，2 已经通（`sdg.sh live` 证明回放链路可用）。
-
-### 4.4 建议顺序
-
-```
-采集 2~3 条 → pack → trim → export → export-check
-    ↓
-训练 20k 步 → L1 离线 loss 可接受？
-    ↓ 是
-加 policy 推理入口 → L2 开环回放（看图像+动作）
-    ↓ 动作合理
-加成功判定 → L3 闭环跑 20 次算成功率
-    ↓
-再决定：加数据？改 action_space？改相机？
+```python
+# 试管是否进孔：位置 + 姿态双阈值
+d = ||test_tube_pos - target_hole_pos||
+ok = d < 0.02 and tube_z < rack_top_z and grip_closed
 ```
 
 ---
 
-## 5. 与同事数据的横向对比（可选，但有价值）
+## 5. 与同事数据横向对比（可选）
 
-一旦 L3 通了，可以做对照实验：
+等 L3 通了再做：
 
-| 组 | 数据 | 训练 | 评测 |
+| 组 | 数据 | 训练 | 注意 |
 |---|---|---|---|
-| A | 我们 3 条（absolute） | 同配置 | 同一套 L3 |
-| B | 我们 3 条（delta） | 同配置 | 同一套 L3 |
-| C | 同事 11 条（delta/pose） | 同配置 | 同一套 L3（**需注意他们的 fps 是 57Hz 但声明 30**） |
+| A | 我们 3 条（absolute） | 同配置 | — |
+| B | 我们 3 条（delta） | 同配置 | 验证 delta 是否更好 |
+| C | 同事 11 条（pose delta） | 同配置 | **他们 fps 声明 30 但实际 57Hz**，视频按 30fps 编码 → 时间轴错 2 倍。直接混训会让策略学到慢一倍的动作 |
 
-C 组有个坑：他们的视频按 30fps 编码但真实时长只有一半，
-直接训会让策略学到"慢一倍的动作"。**必须先重采样到同一时间基准**，
-或者干脆只用 parquet 里的数据 + 自己按真实时间戳抽帧。
-
-> 同事那边"机器人抽搐"——很可能是他们的 action 在部署时语义不对
-> （delta 被当成绝对值发），或时间轴 2x 错导致控制频率不匹配。
+> 同事那边「机器人抽搐」很可能是这个时间轴问题，或 delta 被当成绝对值发。
 > 这正是我们平台在 fps 自洽性上的价值。
 
 ---
 
-## 6. 当前缺口（按优先级）
+## 6. 当前缺口
 
-| 缺口 | 影响 | 工作量 |
+| 缺口 | 影响 | 优先级 |
 |---|---|---|
-| `.venv-train` 未建 | 训不了 | 10 分钟 |
-| 数据量太少（1~2 条） | 学不出东西 | 每条 1 小时录 + 标注 |
-| 无策略推理入口 | L2/L3 都做不了 | 半天 |
-| 无成功判定 | 无法量成功率 | 半天 |
-| `intervention` 标记缺失 | 做不了 DAgger / 人工纠偏 | 需要设计 |
+| 数据量（1~2 条） | 训不出可用策略 | **最高** |
+| 闭环成功判定 | 无法量成功率 | 高 |
+| `intervention` 人工干预标记 | 做不了 DAgger / 只学纠偏片段 | 中（对方有，我们没有） |
+| `.venv-train` 未装完 | 训不了 | 你正在装 |
 
 ---
 
 ## 7. 快速开始（复制粘贴）
 
 ```bash
-# 1) 建训练环境
+# ---- 一次性：装训练环境 ----
 cd ~/lerobot_ros2
-uv venv .venv-train --python 3.12
-source .venv-train/bin/activate
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-uv pip install -e submodules/lerobot av pyarrow datasets
+env UV_CACHE_DIR="$HOME/.cache/uv" ./init.sh setup-train-env
+.venv-train/bin/python -c "import numpy, lerobot; print(numpy.__version__, lerobot.__version__)"
 
-# 2) 验证
-python -c "import torch,numpy;print(torch.cuda.is_available(),numpy.__version__)"
-
-# 3) 用已有会话跑通流水线（不采集）
+# ---- 数据（已有 run_04 的话可跳过前两步）----
 cd ~/FaSim-Isaac/exts/fasim.replicator.sdg
-./scripts/sdg.sh pack ~/fasim_data/unitree_g1d/sinopec_test_tube/run_04 --robot unitree_g1d
-./scripts/sdg.sh export ~/fasim_data/unitree_g1d/sinopec_test_tube/run_04 \
-    --out ~/lerobot_datasets/tube_smoke --action-space absolute --overwrite
+S=~/fasim_data/unitree_g1d/sinopec_test_tube/run_04
+./scripts/sdg.sh export $S --out ~/lerobot_datasets/tube_smoke \
+    --action-space absolute --overwrite
 ./scripts/sdg.sh export-check ~/lerobot_datasets/tube_smoke
 
-# 4) 试训（数据少，只看能否跑起来）
+# ---- 试训（数据少，只看能否跑起来）----
 cd ~/lerobot_ros2 && source .venv-train/bin/activate
-python -m lerobot.scripts.train \
-    --dataset.repo_id tube_smoke \
-    --dataset.root ~/lerobot_datasets/tube_smoke \
-    --policy.type act --output_dir ~/act_runs/smoke \
-    --batch_size 4 --steps 2000
+python -m lerobot.scripts.lerobot_train \
+    --dataset.repo_id=tube_smoke \
+    --dataset.root=$HOME/lerobot_datasets/tube_smoke \
+    --policy.type=act \
+    --output_dir=$HOME/act_runs/smoke \
+    --batch_size=4 --steps=2000 --save_freq=1000
 ```
+
+跑通后再：
+1. 录 5~10 条 → 重训 → 看 L1 loss 是否收敛
+2. 做 L2 开环回放
+3. 加成功判定 → L3 闭环
