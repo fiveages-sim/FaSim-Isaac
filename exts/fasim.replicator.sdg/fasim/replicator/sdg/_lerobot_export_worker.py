@@ -131,6 +131,15 @@ def main(req_path: str) -> int:
                         im = _img(z[rk])
                         if im is not None:
                             frame[f"observation.images.{c}"] = im
+                # 交互物体位姿（pos3 + quat4）
+                for lab in (req.get("obj_labels") or []):
+                    pk, qk = f"obj/{lab}_pos", f"obj/{lab}_quat"
+                    if pk in keys and qk in keys:
+                        v = np.concatenate([
+                            np.asarray(z[pk], dtype=np.float32).reshape(-1)[:3],
+                            np.asarray(z[qk], dtype=np.float32).reshape(-1)[:4],
+                        ])
+                        frame[f"observation.objects.{lab}"] = v
                 frame["task"] = task
                 ds.add_frame(frame)
                 n_ok += 1

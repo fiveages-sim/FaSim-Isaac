@@ -84,6 +84,36 @@ grippers/Unitree/Dex1/payloads/ROS/enable.usda   ← 腕部相机图（Side over
 `Torso.usda` 的 `variantSet "ROS"` + `payloads/ROS/ros2.usda`（双身体相机
 发布图）。已按同一模式补好（未提交）。
 
+### ⚠️ 重大发现：`ROS=fiveages` 会静默破坏腕部相机话题
+
+2026-11-12 空状态重启实测（详见 `docs/DEBUG_LOG.md` 问题 9）：
+
+| ROS 变体 | `/head_camera/rgb` | `/left_hand_camera/rgb` | `/right_hand_camera/rgb` |
+|---|---|---|---|
+| `enable` | ~56 Hz | **~56 Hz** | **~56 Hz** |
+| `fiveages` | 53.6 Hz | **0 条** | **0 条** |
+
+**不报任何错误，静默失效。**
+
+排查逐层排除了静态配置（变体全对、图节点齐全、exec 连线全通、cameraPrim
+目标存在、图实例有效），最终定位到：`fiveages.usda` 的 `ROS_Control` 图里
+有自定义节点 `fasim.ros2.nodes.ROS2ControlLaunch`，它在 Play 时进程内启动
+full_body 运控，**争用 ROS2 context**，使相机图拿不到有效 context →
+`IsaacCreateRenderProduct` 不执行。
+
+**影响**：话题采集（含相机）**必须**用 `ROS=enable` + 外部 `ros2-stack` 起运控。
+G1D 的配置已按此调整（`robot.yaml` 的 `motion.required: true`、
+`.meta/ros2_stack.yaml` 放开外部运控、room.usda 的 `ROS` 改 `enable`）。
+操作流程见 `docs/TOPIC_CAPTURE_SETUP.md`。
+
+**这条本身就是评测结论**：
+
+| 维度 | 内部直采（sdg） | 话题采集（lerobot_ros2） |
+|---|---|---|
+| 相机话题可用性 | ✅ 不依赖 ROS 发布 | ⚠️ **依赖资产变体正确，且失败静默** |
+| 配置复杂度 | 只需 prim 路径 | 变体全对 + 图不冲突 + 外部运控 |
+| 故障可观测性 | 高（帧里直接看有没有值） | **低（话题 0 条，无报错）** |
+
 **这仍然是方案 B 的部署成本**，只是比原先估计的小：G1D 零成本，W2 一次改动
 之后所有挂载 W2 的场景都受益（图在组件里，不在场景里）。
 

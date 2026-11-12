@@ -1,13 +1,14 @@
 [package]
-version = "0.1.0"
+version = "1.0.0"
 category = "Simulation"
 title = "FaSim Replicator SDG"
-description = "Offline synthetic data capture for FaSim robots via Isaac Replicator. Records articulation/rigid-body state with EpisodeRecorder (ROS2-side trajectory source), then replays it headlessly with RGB-D annotators — no ROS2 needed for capture."
+description = "Bypass synthetic-data capture for FaSim robots: while a task orchestration runs in Isaac Sim, records camera RGB-D (with intrinsics/pose), joint angles (measured + commanded), end-effector poses (measured + commanded) and rigid-body object poses on the physics-step callback. Does not take over control and adds no threads. Includes a 7-point data health check, camera contact sheets, LeRobot dataset export, and same-instance replay (joints or end-effector -> OCS2)."
 authors = ["FiveAges"]
-keywords = ["isaac", "replicator", "sdg", "synthetic-data", "dataset"]
+keywords = ["isaac", "replicator", "sdg", "synthetic-data", "dataset", "lerobot", "imitation-learning"]
 
 [dependencies]
 "omni.replicator.core" = {}
+# 层2 离线录制（sdg.sh record）用到 EpisodeRecorder；实时旁路采集（capture）不需要。
 "isaacsim.replicator.episode_recorder" = {}
 "isaacsim.core.prims" = {}
 "isaacsim.core.utils" = {}
@@ -15,9 +16,10 @@ keywords = ["isaac", "replicator", "sdg", "synthetic-data", "dataset"]
 [[python.module]]
 name = "fasim.replicator.sdg"
 
-# 随 Isaac Sim 自动加载：起一个 update 回调监听控制文件，实现
-# "echo start > ~/fasim_live/control.txt" 即开始旁路采集。
+# 随 Isaac Sim 自动加载：起一个 app-update 回调，通过 Unix domain socket
+# （<runtime>/capture.sock）接受终端侧 sdg.sh 的指令，实现"仿真跑编排时旁路采数"。
 # 见 fasim/replicator/sdg/scripts/extension.py。
+
 [[python.module]]
 name = "fasim.replicator.sdg.scripts.extension"
 

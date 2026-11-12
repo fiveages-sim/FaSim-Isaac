@@ -268,6 +268,19 @@ def export_session(
     if cmd_dim:
         features["observation.ee_cmd"] = {"dtype": "float32", "shape": [cmd_dim]}
 
+    # 交互物体位姿（obj/<label>_pos + _quat，每个物体 7 维，按名字排序保证顺序稳定）
+    obj_labels: list[str] = []
+    with np.load(frames[0], allow_pickle=False) as z:
+        obj_labels = sorted(
+            k[len("obj/"):-len("_pos")] for k in z.files
+            if k.startswith("obj/") and k.endswith("_pos")
+            and f"obj/{k[len('obj/'):-len('_pos')]}_quat" in z.files
+        )
+    for lab in obj_labels:
+        features[f"observation.objects.{lab}"] = {
+            "dtype": "float32", "shape": [7],
+        }
+
     # 交给子进程跑（因为 lerobot 依赖在另一个 python 里）
     req = {
         "session": str(session),
@@ -279,6 +292,7 @@ def export_session(
         "frames": [str(f) for f in frames],
         "cams": cams,
         "features": features,
+        "obj_labels": obj_labels,
         "use_videos": bool(use_videos),
         "meta": {
             "seed": {

@@ -596,6 +596,153 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """把 sdg 采集会话算成与话题方案**同口径**的评测指标。
+
+    为什么需要：评测要横向比"内部直采 vs 话题采集"。两边若各算各的，
+    数字没法放一起看。本命令输出与
+    ``lerobot_ros2/.../bench_record.py`` 的 ``bench_metrics.json`` **同名同义**
+    的字段，直接对比。
+
+    对应关系：
+        规模     frames / duration_sec / wall_fps / frame_interval_ms
+        对齐     align_spread_ms（sdg 天然≈0，因为是同一物理步回调）
+        体积     camera_bytes_per_frame / joint_bytes_per_frame / total_mb_raw
+        完整性   nan_joint_frames / camera_shapes / joint_count
+        发布率   topic_rates_hz —— 话题方案特有，sdg 不适用（记为 null）
+    """
+    import numpy as np
+
+    session = Path(args.session).expanduser()
+    if not session.is_dir():
+        _log(f"ERROR 会话目录不存在: {session}")
+        _explain_missing_path(session, want="session.json")
+        return 1
+    frames_dir = session / "frames"
+    files = sorted(frames_dir.glob("frame_*.npz")) if frames_dir.is_dir() else []
+    if not files:
+        _log(f"ERROR 没有帧文件: {frames_dir}")
+        return 1
+
+    meta: dict = {}
+    sj = session / "session.json"
+    if sj.is_file():
+        try:
+            meta = json.loads(sj.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    wall: list[float] = []
+    steps: list[int] = []
+    cam_bytes: list[int] = []
+    joint_bytes: list[int] = []
+    nan_joint = 0
+    cams: list[str] = []
+    joint_names: list[str] = []
+    shapes: dict[str, set[str]] = {}
+
+    for f in files:
+        try:
+            with np.load(f, allow_pickle=False) as z:
+                keys = set(z.files)
+                if "wall_time" in keys:
+                    wall.append(float(z["wall_time"]))
+                if "sim_step" in keys:
+                    steps.append(int(z["sim_step"]))
+                if not cams:
+                    cams = sorted(k[:-4] for k in keys if k.endswith("_rgb"))
+                if not joint_names and "joint_names" in keys:
+                    joint_names = [str(x) for x in z["joint_names"]]
+                cb = 0
+                for c in cams:
+                    k = f"{c}_rgb"
+                    if k in keys:
+                        a = np.asarray(z[k])
+                        cb += int(a.nbytes)
+                        shapes.setdefault(c, set()).add(str(tuple(a.shape)))
+                cam_bytes.append(cb)
+                if "joint_pos" in keys:
+                    q = np.asarray(z["joint_pos"])
+                    joint_bytes.append(int(q.nbytes))
+                    if not np.all(np.isfinite(q)):
+                        nan_joint += 1
+        except Exception:  # noqa: BLE001
+            continue
+
+    duration = (wall[-1] - wall[0]) if len(wall) >= 2 else float(
+        meta.get("duration_sec", 0) or 0)
+    interval = np.diff(wall) if len(wall) >= 2 else np.array([0.0])
+    phys = np.diff(steps) if len(steps) >= 2 else np.array([0])
+    pdt = float(meta.get("physics_dt", 0) or 0)
+
+    metrics = {
+        "scheme": "isaac-internal (sdg)",
+        "session": str(session),
+        "source_config": str(session / "session.json"),
+        "task": meta.get("task_key") or "",
+        "target_fps": round(1.0 / (pdt * int(meta.get("every", 1) or 1)), 2) if pdt else None,
+        "duration_sec": round(float(duration), 3),
+        "frames": len(files),
+        "wall_fps": round(len(files) / float(duration), 2) if duration > 0 else None,
+        "frame_interval_ms": {
+            "median": round(float(np.median(interval)) * 1000, 2),
+            "p95": round(float(np.percentile(interval, 95)) * 1000, 2),
+            "max": round(float(interval.max()) * 1000, 2),
+            "jitter_max_ms": round(float(np.abs(interval - np.median(interval)).max()) * 1000, 2),
+        },
+        "physics": {
+            "physics_steps": int(meta.get("physics_steps", 0) or 0),
+            "physics_dt": pdt,
+            "steps_per_frame": int(np.median(phys)) if phys.size else None,
+            "rtf": round(float(meta.get("physics_steps", 0) or 0) * pdt / duration, 3)
+            if (pdt and duration > 0) else None,
+        },
+        # **关键对比项**：sdg 在同一物理步回调内取全部字段，所以是 0。
+        # 话题方案（bench_record.py）会给出实际的毫秒数。
+        "align_spread_ms": {
+            "median": 0.0, "p95": 0.0, "max": 0.0,
+            "note": "内部采集在同一 physics step 回调内取全部字段，天然同刻",
+        },
+        "topic_rates_hz": None,
+        "size": {
+            "camera_bytes_per_frame": int(np.mean(cam_bytes)) if cam_bytes else 0,
+            "joint_bytes_per_frame": int(np.mean(joint_bytes)) if joint_bytes else 0,
+            "total_mb_raw": round((sum(cam_bytes) + sum(joint_bytes)) / 1e6, 2),
+            "note": "原始 RGB 未压缩；含 depth 时实际体积更大（本项只算 _rgb）",
+        },
+        "integrity": {
+            "nan_joint_frames": int(nan_joint),
+            "camera_shapes": {k: sorted(v) for k, v in shapes.items()},
+            "joint_count": len(joint_names),
+        },
+        "camera_names": cams,
+        "joint_names": joint_names,
+    }
+
+    out = Path(args.out).expanduser() if args.out else session / "bench_metrics.json"
+    out.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print()
+    print("=" * 62)
+    print("评测指标（内部直采）")
+    print("=" * 62)
+    print(f"帧数        : {metrics['frames']}  ({metrics['duration_sec']}s, {metrics['wall_fps']} fps)")
+    fi = metrics["frame_interval_ms"]
+    print(f"帧间隔      : median {fi['median']}ms  p95 {fi['p95']}ms  抖动 {fi['jitter_max_ms']}ms")
+    ph = metrics["physics"]
+    print(f"物理        : {ph['physics_steps']} 步  dt={ph['physics_dt']}s  "
+          f"每帧 {ph['steps_per_frame']} 步  RTF={ph['rtf']}")
+    print(f"对齐间距    : 0 ms（同一物理步回调，天然同刻）")
+    sz = metrics["size"]
+    print(f"单帧体积    : 图像 {sz['camera_bytes_per_frame']/1e6:.2f}MB + 关节 {sz['joint_bytes_per_frame']/1e3:.1f}KB")
+    print(f"总原始体积  : {sz['total_mb_raw']} MB")
+    print(f"完整性      : NaN 关节帧 {nan_joint}  关节数 {len(joint_names)}")
+    print()
+    print(f"指标已写入: {out}")
+    print("=" * 62)
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     """把采集会话导出成 LeRobot 数据集（v3.0）。"""
     from fasim.replicator.sdg import export_lerobot as ex
@@ -626,6 +773,65 @@ def cmd_export(args: argparse.Namespace) -> int:
     _log(f"  {res['frames']} 帧  features={res['features']}")
     _log(f"  加载方式: LeRobotDataset(repo_id='{session.name}', root='{res['out']}')")
     return 0
+
+
+def cmd_export_check(args: argparse.Namespace) -> int:
+    """校验导出的 LeRobot 数据集能否被官方 LeRobotDataset 正确加载。
+
+    为什么需要：导出成功 ≠ 数据可用。常见问题：
+      - 特征 shape/dtype 不匹配 → 加载时报错
+      - stats 缺失 → 训练时归一化出错
+      - 图像编码失败 → 帧数为 0
+    本命令用**官方 loader** 实际读一遍，并抽查若干帧。
+    """
+    from fasim.replicator.sdg import export_lerobot as ex
+
+    root = Path(args.dataset).expanduser().resolve()
+    if not root.exists():
+        _log(f"ERROR 数据集不存在: {root}")
+        return 1
+    py = Path(args.lerobot_python) if args.lerobot_python else ex.find_lerobot_python()
+    if py is None:
+        _log("ERROR 找不到能 import lerobot 的 python（设 LE_ROBOT_PYTHON）")
+        return 1
+
+    script = f"""
+import sys
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+except Exception as exc:
+    print(f"IMPORT_FAIL {{exc}}"); sys.exit(3)
+import numpy as np
+try:
+    ds = LeRobotDataset(repo_id={args.repo_id!r}, root={str(root)!r})
+except Exception as exc:
+    print(f"LOAD_FAIL {{type(exc).__name__}}: {{exc}}"); sys.exit(4)
+print(f"OK frames={{len(ds)}}")
+print(f"features={{sorted(ds.features)}}")
+# 抽查首/中/末帧
+idxs = [0, len(ds)//2, len(ds)-1]
+bad = 0
+for i in idxs:
+    try:
+        f = ds[i]
+        for k, v in f.items():
+            if hasattr(v, "shape") and v.shape and not np.isfinite(
+                np.asarray(v, dtype=np.float32)).all():
+                print(f"NaN {{k}} @{{i}}"); bad += 1
+    except Exception as exc:
+        print(f"FRAME_FAIL {{i}}: {{exc}}"); bad += 1
+print(f"CHECKED {{len(idxs)}} frames, bad={{bad}}")
+sys.exit(0 if bad == 0 else 5)
+"""
+    import subprocess
+
+    _log(f"用 {py} 加载 {root} …")
+    r = subprocess.run([str(py), "-c", script])
+    if r.returncode == 0:
+        _log("✅ 数据集可被 LeRobotDataset 正常加载")
+        return 0
+    _log(f"❌ 校验失败（退出码 {r.returncode}）")
+    return 1
 
 
 def cmd_diag(args: argparse.Namespace) -> int:
@@ -1409,6 +1615,24 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("--lerobot-python", default="",
                     help="能 import lerobot 的 python；留空自动找")
     ex.set_defaults(func=cmd_export)
+
+    exc = sub.add_parser(
+        "export-check",
+        help="校验导出的 LeRobot 数据集能否被官方 LeRobotDataset 加载",
+    )
+    exc.add_argument("dataset", help="LeRobot 数据集根目录")
+    exc.add_argument("--repo-id", default="check", help="repo_id（加载时任意值即可）")
+    exc.add_argument("--lerobot-python", default="",
+                     help="能 import lerobot 的 python；留空自动找")
+    exc.set_defaults(func=cmd_export_check)
+
+    bn = sub.add_parser(
+        "bench",
+        help="把采集会话算成评测指标（与话题方案同口径，便于横向对比）",
+    )
+    bn.add_argument("session", help="采集会话目录")
+    bn.add_argument("--out", default="", help="输出 json；默认 <session>/bench_metrics.json")
+    bn.set_defaults(func=cmd_bench)
 
     i = sub.add_parser("info", help="看采集会话里有什么")
     i.add_argument("session", help="会话目录，如 ~/fasim_data/.../20261110-1121")

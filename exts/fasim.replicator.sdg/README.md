@@ -32,20 +32,78 @@ cd ~/FaSim-Isaac/exts/fasim.replicator.sdg
 
 ## 部署
 
+### 前置
+
+| 项 | 要求 |
+|---|---|
+| Isaac Sim | 6.2（其他 6.x 大概率可用，6.0/6.1 未验证） |
+| Python（终端侧） | 3.10+，需 `numpy` + `PyYAML` |
+| Python（导出 LeRobot） | 需 `lerobot` + `pyarrow` + `av`（见下） |
+| ROS 2 | **可选**。只有 `live --drive ee` 和 `fk` 的诊断需要对 rclpy；采集本身不需要。 |
+
+### 1. 让 Isaac 加载扩展
+
+扩展目录放在 `<repo>/exts/fasim.replicator.sdg`，随 Isaac 启动自动加载。
+如果 Isaac 没自动发现它，把路径加到 Kit 的扩展搜索路径：
+
 ```bash
-./init.sh          # 或按仓库既有流程注册扩展
+# 方式 A：启动时追加（临时）
+./run.sh --ext-path ~/FaSim-Isaac/exts
+
+# 方式 B：写进 Kit 配置（持久）
+# ~/isaacsim/apps/isaacsim.exp.full.kit 里加：
+#   [settings.app.exts]
+#   folders = ["...", "/home/<user>/FaSim-Isaac/exts"]
 ```
 
-扩展 `fasim.replicator.sdg` 随 Isaac 启动自动加载，通过
-`<runtime>/capture.sock`（Unix domain socket）接受指令。终端侧的
-`sdg.sh` 只是在跟这个 socket 说话，**不需要 source 任何环境**
-（`fk` / `shots` 等离线命令同理，只依赖 numpy/PyYAML）。
+**验证加载成功**：Isaac 终端应打印：
 
-部署检查：
+```
+[sdg] ========================================================
+[sdg] 数采扩展已就绪
+[sdg]   扩展根目录 : .../exts/fasim.replicator.sdg
+[sdg]   数据根目录 : /home/<user>/fasim_data
+[sdg]   指令 socket: /home/<user>/fasim_data/.runtime/capture.sock
+```
+
+或者跑 `./scripts/sdg.sh doctor`，`Isaac 进程` 与 `指令 socket` 都正常即可。
+
+### 2. 终端侧（无需 source 环境）
+
+`sdg.sh` 通过 Unix socket 与 Isaac 内的扩展通信，**不需要 source ROS 或 conda**：
+
+- 采集/状态/停止：只需 python3 + PyYAML
+- `pack` / `diag` / `shots` / `bench` / `export`：python3 + numpy（`export` 还要 lerobot）
+- `fk` / `fk-diag`：pinocchio（本项目自带纯 numpy FK，装 pinocchio 只为对拍）
+
+`sdg.sh` 会自动挑合适的解释器；也可显式指定：
+
+```bash
+export SDG_PYTHON=/path/to/python3        # 主 CLI
+export SDG_FK_PYTHON=/path/to/python      # fk / diag（需要 numpy+pinocchio+yaml）
+export LE_ROBOT_PYTHON=/path/to/python    # export（需要 lerobot）
+```
+
+### 3. LeRobot 导出（可选）
+
+`sdg.sh export` 需要能 `import lerobot` 的 python。默认按以下顺序找：
+
+1. `$LE_ROBOT_PYTHON`
+2. `~/lerobot_ros2/.venv/bin/python`
+3. `~/miniconda3/envs/lerobot-ros2/bin/python`
+4. 当前解释器
+
+找不到会明确报错（不静默降级）。若你没有 lerobot 环境，`export` 用不了，
+但**采集和体检完全不受影响**。
+
+### 4. 自检
 
 ```bash
 ./scripts/sdg.sh doctor
 ```
+
+检查项：扩展根目录、数据根目录、Isaac 进程、指令 socket、崩溃残留
+（残留 socket / `status=capturing` 的会话 / 0 帧空目录）。
 
 ---
 
@@ -254,13 +312,17 @@ cx = 320.0     cy = 240.0      主点（光轴打在图像上的位置）
 | `sdg.sh` | 交互式主菜单 | 否（采集时需 Isaac 在跑） |
 | `capture` | 开始采集 | Isaac 需在跑 |
 | `status` / `stop` | 查看/结束采集 | Isaac 需在跑 |
+| `list` | 列出已有会话（帧数/相机/是否已 pack） | 否 |
 | `pack` | 会话 → `episode.npz`（含指令位姿反算） | 否 |
 | `diag` | 一键体检（7 项） | 否 |
 | `shots` | 相机联络图 | 否 |
+| `bench` | 评测指标（帧率/对齐/体积/完整性） | 否 |
 | `trim` | 切任务片段 | 否 |
+| **`export`** | **导出 LeRobot 数据集** | 否（需 lerobot 环境） |
+| **`export-check`** | **校验导出产物能否被官方 loader 加载** | 否（需 lerobot 环境） |
 | `fk` / `fk-diag` | FK 对拍 / 回放体检 | 否 |
 | `live` | 同实例回放（joints / ee） | 是 |
-| `doctor` | 环境自检 | 否 |
+| `doctor` | 环境自检 + 崩溃残留检查 | 否 |
 
 `fk` / `diag` / `fk-diag` 会优先找带 pinocchio 的 python
 （`SDG_FK_PYTHON` 可指定）；找不到也能跑 —— 本项目的 FK 是**纯 numpy** 实现，
