@@ -986,6 +986,54 @@ for i in idxs:
     except Exception as exc:
         print(f"FRAME_FAIL {{i}}: {{exc}}"); bad += 1
 print(f"CHECKED {{len(idxs)}} frames, bad={{bad}}")
+
+# ---- 数值健全性：action 不能全零/常数 ----
+# 曾经出过事故：ee_absolute 从错误的来源取数据 → 全部填零，
+# export-check 依然通过（只验证"能加载"），训练白跑一轮。
+# 这里检查 action 的方差，全零/常数直接判失败。
+import json as _json
+from pathlib import Path as _P
+try:
+    _info = _json.loads((_P({str(root)!r}) / "meta/info.json").read_text())
+    _asp = (_info.get("seed") or {{}}).get("action_space")
+except Exception:
+    _asp = None
+try:
+    _acts = []
+    for _i in range(min(len(ds), 2000)):
+        _a = ds[_i].get("action")
+        if _a is not None:
+            _acts.append(np.asarray(_a, dtype=np.float32).reshape(-1))
+    if _acts:
+        _A = np.stack(_acts)
+        _std = float(_A.std())
+        _absmax = float(np.abs(_A).max())
+        print(f"ACTION_STATS n={{len(_A)}} dim={{_A.shape[1]}} "
+              f"std={{_std:.6f}} absmax={{_absmax:.6f}}")
+        if _absmax < 1e-9:
+            print("ACTION_ALL_ZERO —— action 全是 0，训练只会学到输出零！")
+            bad += 1
+        elif _std < 1e-9:
+            print("ACTION_CONSTANT —— action 是常数，没有变化")
+            bad += 1
+        # 状态也查一下（同样可能采空）
+        _obs = []
+        for _i in range(min(len(ds), 500)):
+            _s = ds[_i].get("observation.state")
+            if _s is not None:
+                _obs.append(np.asarray(_s, dtype=np.float32).reshape(-1))
+        if _obs:
+            _O = np.stack(_obs)
+            print(f"STATE_STATS  std={{float(_O.std()):.6f}} "
+                  f"absmax={{float(np.abs(_O).max()):.6f}}")
+            if float(np.abs(_O).max()) < 1e-9:
+                print("STATE_ALL_ZERO —— observation.state 全是 0！")
+                bad += 1
+    else:
+        print("WARN 无法读取 action 列（feature 名不是 action？）")
+except Exception as exc:
+    print(f"WARN 数值检查跳过: {{exc}}")
+
 sys.exit(0 if bad == 0 else 5)
 """
     import subprocess
@@ -1886,10 +1934,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="批量合并时允许采集参数不一致（危险：时间轴/feature 会错乱）")
     ex.add_argument(
         "--action-space", dest="action_space", default="absolute",
-        choices=["absolute", "delta", "ee_delta"],
+        choices=["absolute", "delta", "ee_delta", "ee_absolute"],
         help="action 语义：absolute=关节指令（默认，部署无累积误差）"
              " / delta=关节单步增量（对齐同事语义，state[t]+action[t]==state[t+1]）"
-             " / ee_delta=末端位姿增量 14 维（与同事 pose 模式完全对齐）",
+             " / ee_delta=末端位姿增量 14 维（与同事 pose 模式完全对齐）"
+             " / ee_absolute=末端位姿绝对值 14 维（供 inference.py 发运控）",
     )
     ex.set_defaults(func=cmd_export)
 

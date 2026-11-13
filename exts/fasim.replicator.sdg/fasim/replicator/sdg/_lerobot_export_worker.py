@@ -197,6 +197,26 @@ def main(req_path: str) -> int:
                         else:
                             frame["action"] = np.zeros(14, dtype=np.float32)
                             n_missing_cmd += 1
+                    elif asp == "ee_absolute":
+                        # 14 维末端**绝对**位姿，供 inference.py 直接发运控：
+                        #   left_ee.pos.xyz + left_ee.quat.xyzw（右侧同理）
+                        #
+                        # 数据来自 **episode.npz 的 *_cmd_pos/_cmd_quat**（FK 反算
+                        # 的指令位姿），由主进程预先算好放进 req["ee_actions"]。
+                        # 原始 frames/*.npz 里**没有**这些字段 —— 曾经在这里读
+                        # 帧文件，导致 1.7 万帧 action 全零、训练白跑一轮。
+                        #
+                        # 不用 *_pos/_quat（实测值）：实测与指令有 6.7mm 稳态
+                        # 误差，拿实测当目标发运控会叠加两次。
+                        acts = (req.get("ee_actions") or [])
+                        ep_acts = acts[ep_i] if ep_i < len(acts) else []
+                        if i < len(ep_acts):
+                            frame["action"] = np.asarray(
+                                ep_acts[i], dtype=np.float32
+                            )
+                        else:
+                            frame["action"] = np.zeros(14, dtype=np.float32)
+                            n_missing_cmd += 1
                     else:  # absolute
                         akey = "joint_pos_cmd" if "joint_pos_cmd" in keys else "joint_pos"
                         if akey in keys:

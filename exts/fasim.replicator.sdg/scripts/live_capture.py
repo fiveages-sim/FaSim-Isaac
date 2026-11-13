@@ -1025,6 +1025,10 @@ def stop_capture() -> dict:
     # 所以这里只解绑 annotator（我们自己的消费端），render product 本身
     # 交给 Isaac 在 stage 关闭时统一释放。代价是每次采集会多留几个 render
     # product（几百 KB 级），但只要不 destroy 就不会产生悬空引用。
+    # **注意顺序**：这里不能立刻 `_S["cameras"] = []` —— 下面的 session.json
+    # 还要读它写 cameras 字段。曾经提前清空导致 run_26~29 的 session.json
+    # 里 cameras=[]（数据本身没问题，但 capture_profile 会误判为"相机不一致"
+    # 而拒绝批量合并）。清理放到写完 info 之后。
     for cam in _S["cameras"]:
         for key in ("rgb", "depth", "cparams"):
             ann = cam.get(key)
@@ -1036,7 +1040,6 @@ def stop_capture() -> dict:
                     ann.detach(rp)          # 解绑我们的消费端
             except Exception as exc:  # noqa: BLE001
                 _log(f"WARN annotator detach 失败（{cam.get('name')}/{key}）: {exc}")
-    _S["cameras"] = []
 
     out = _S["out"]
     info = {

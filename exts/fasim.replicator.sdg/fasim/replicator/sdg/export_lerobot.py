@@ -154,6 +154,53 @@ def _image_to_hwc_u8(arr: Any) -> np.ndarray | None:
 # ---------------------------------------------------------------- 主流程
 
 
+def _load_ee_actions(ep_npz: Path, n_frames: int) -> list[list[float]]:
+    """从 episode.npz 读 14 维末端**绝对**位姿作为 action。
+
+    字段顺序必须与 features["action"]["names"] 一致：
+        left_ee.pos.{x,y,z}, left_ee.quat.{x,y,z,w},
+        right_ee.pos.{x,y,z}, right_ee.quat.{x,y,z,w}
+
+    用 ``*_cmd_pos/_cmd_quat``（**FK 反算的指令位姿**），不是 ``*_pos/_quat``
+    （实测值）：实测与指令有 6.7mm 稳态误差，拿实测当目标发运控会让误差叠加
+    两次。这与「回放必须先发指令」是同一条原则。
+
+    帧数对齐：episode.npz 与 frames/*.npz 由同一个 pack 生成，应逐帧对应。
+    若长度不符则按最短对齐并告警（宁可少几帧也不要错位）。
+    """
+    import numpy as np
+
+    out: list[list[float]] = []
+    with np.load(ep_npz, allow_pickle=False) as z:
+        keys = set(z.files)
+        need = [f"{s}_cmd_{k}" for s in ("left", "right") for k in ("pos", "quat")]
+        missing = [k for k in need if k not in keys]
+        if missing:
+            raise ValueError(
+                f"episode.npz 缺字段 {missing} —— 它可能是旧版 pack 产物。"
+                f"重跑 sdg.sh pack 即可（会用 FK 反算末端指令位姿）"
+            )
+        lp = np.asarray(z["left_cmd_pos"], dtype=np.float32).reshape(-1, 3)
+        lq = np.asarray(z["left_cmd_quat"], dtype=np.float32).reshape(-1, 4)
+        rp = np.asarray(z["right_cmd_pos"], dtype=np.float32).reshape(-1, 3)
+        rq = np.asarray(z["right_cmd_quat"], dtype=np.float32).reshape(-1, 4)
+    n = min(len(lp), len(lq), len(rp), len(rq))
+    if n != n_frames:
+        _log(f"WARN {ep_npz.parent.name}: episode.npz 有 {n} 帧，"
+             f"frames 有 {n_frames} 帧 —— 按 {min(n, n_frames)} 对齐")
+        n = min(n, n_frames)
+    for i in range(n):
+        # 转成 Python float —— numpy.float32 不能直接 JSON 序列化。
+        # 下游 worker 通过 json 传参，这里是唯一出口，统一转一次。
+        out.append([
+            float(lp[i, 0]), float(lp[i, 1]), float(lp[i, 2]),
+            float(lq[i, 0]), float(lq[i, 1]), float(lq[i, 2]), float(lq[i, 3]),
+            float(rp[i, 0]), float(rp[i, 1]), float(rp[i, 2]),
+            float(rq[i, 0]), float(rq[i, 1]), float(rq[i, 2]), float(rq[i, 3]),
+        ])
+    return out
+
+
 def export_session(
     session_dir: str | Path,
     out_dir: str | Path,
@@ -221,6 +268,7 @@ def export_session(
     # 逐会话收集帧 —— 每个会话是一个独立 episode
     episodes_frames: list[list[Path]] = []
     metas: list[dict] = []
+    used_sessions: list[Path] = []
     for s in sessions:
         fs, m = _load_frames(s)
         if not fs:
@@ -228,8 +276,35 @@ def export_session(
             continue
         episodes_frames.append(fs)
         metas.append(m)
+        used_sessions.append(s)
     if not episodes_frames:
         raise ValueError("所有会话都没有帧")
+
+    # ``ee_absolute`` 需要 FK 反算的末端指令位姿（``left_cmd_pos`` 等），
+    # 那些字段**只存在于 episode.npz**（pack 时由纯 numpy FK 算出），
+    # 原始 frames/*.npz 里没有。所以这里先从 episode.npz 读出来，按
+    # 每个 episode 一组传给 worker。
+    #
+    # 为什么不在 worker 里读：worker 只拿到帧文件路径清单，不认识会话目录
+    # 结构；而且 episode 与 frames 的帧数/顺序需要用同一个来源保证一致。
+    ee_actions: list[list[list[float]]] | None = None
+    asp_pre = str(action_space or "absolute").lower()
+    if asp_pre == "ee_absolute":
+        ee_actions = []
+        for s, fs in zip(used_sessions, episodes_frames):
+            ep_npz = s / "episode.npz"
+            if not ep_npz.is_file():
+                raise ValueError(
+                    f"{s.name} 缺 episode.npz —— ee_absolute 需要 FK 反算的末端指令位姿。\n"
+                    f"  先跑: sdg.sh pack {s}  （或对任务目录跑一次批量 pack）"
+                )
+            acts = _load_ee_actions(ep_npz, len(fs))
+            ee_actions.append(acts)
+        bad = sum(1 for a in ee_actions for r in a if not any(r))
+        if bad:
+            _log(f"WARN {bad} 帧的 ee action 全零（episode.npz 里缺 cmd 字段？）")
+        else:
+            _log(f"ee action 已从 episode.npz 读取（{len(ee_actions)} 个 episode）")
     frames = [f for ep in episodes_frames for f in ep]   # 扁平（用于探测 feature）
     meta = metas[0]
     n = len(frames)
@@ -284,9 +359,9 @@ def export_session(
                 break
 
     asp = str(action_space or "absolute").lower()
-    if asp not in ("absolute", "delta", "ee_delta"):
+    if asp not in ("absolute", "delta", "ee_delta", "ee_absolute"):
         raise ValueError(
-            f"action_space 必须是 absolute / delta / ee_delta，收到 {action_space!r}"
+            f"action_space 必须是 absolute / delta / ee_delta / ee_absolute，收到 {action_space!r}"
         )
 
     features: dict[str, Any] = {
@@ -296,7 +371,8 @@ def export_session(
     }
     # action 的形状随语义变：
     #   absolute / delta → 关节维（nj）
-    #   ee_delta         → 左右各 pos3+dquat4 = 14
+    #   ee_delta         → 左右各 pos3+dquat4 = 14（**增量**）
+    #   ee_absolute      → 左右各 pos3+quat4 = 14（**绝对**，对齐 inference.py）
     if asp == "ee_delta":
         features["action"] = {
             "dtype": "float32",
@@ -304,6 +380,18 @@ def export_session(
             "names": [f"{s}_{k}" for s in ("left", "right")
                       for k in ("dpos_x", "dpos_y", "dpos_z",
                                 "dquat_x", "dquat_y", "dquat_z", "dquat_w")],
+        }
+    elif asp == "ee_absolute":
+        # 名字必须与 lerobot_robot_ros2 的 send_action 对得上：
+        #   LEFT_EE_PREFIX = "left_ee" → 它读 left_ee.pos.x / left_ee.quat.x ...
+        # 所以这里用 left_ee.pos.x 这种**带下划线**的写法，而不是 left_pos_x。
+        features["action"] = {
+            "dtype": "float32",
+            "shape": [14],
+            "names": [f"{s}_ee.{kind}.{axis}"
+                      for s in ("left", "right")
+                      for kind, axes in (("pos", "xyz"), ("quat", "xyzw"))
+                      for axis in axes],
         }
     else:
         a_names = None
@@ -359,7 +447,9 @@ def export_session(
         # 多 episode：每个子列表导出成数据集里的一个 episode。
         # worker 优先用这个；没有时回落到上面的扁平 frames（单 episode）。
         "episodes": [[str(f) for f in ep] for ep in episodes_frames],
-        "episode_names": [s.name for s in sessions],
+        # ee_absolute 专用：每个 episode 一组 14 维绝对位姿动作
+        "ee_actions": ee_actions,
+        "episode_names": [s.name for s in used_sessions],
         "cams": cams,
         "features": features,
         "obj_labels": obj_labels,
