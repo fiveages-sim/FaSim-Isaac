@@ -265,20 +265,106 @@ obs 张量 → policy.select_action() → action
 
 ## 4. 三层评测（从便宜到贵）
 
-| 层 | 做什么 | 成本 | 能回答 |
-|---|---|---|---|
-| **L1 离线** | 留出帧上算 MSE | 秒 | 拟合好坏（**不能说明能用**） |
-| **L2 开环回放** | 预测 action 序列 → `sdg.sh live` 逐帧执行，**不闭环** | 分钟 | 动作是否发散/饱和/量级错 |
-| **L3 闭环** | 策略出 action → 运控执行 → 新观测 → 循环 | 小时 | **真实成功率** |
+| 层 | 做什么 | 成本 | 能回答 | 命令 |
+|---|---|---|---|---|
+| **L1 离线** | 留出帧上算 MSE | 秒 | 拟合好坏（**不能说明能用**） | 训练日志的 loss |
+| **L2 开环** | 逐帧预测 action 与真值对比，**不驱动** | 分钟 | 动作方向/量级/抖动对不对 | `l2_openloop.py` |
+| **L3 闭环** | 策略实时算 → 驱动关节 → 新观测 → 循环 | 分钟 | **能不能真的做任务** | `sdg.sh policy` |
 
-**建议顺序**：先 L2（能立刻发现低级错误），再 L3。
+### 4.1 L2 离线（已验证，25 条数据）
 
-L3 需要一个**成功判定**，我们目前没有。可用 `sdg` 的 `tracked_prims`：
+```bash
+cd ~/lerobot_ros2
+source .venv-train/bin/activate        # ← 必须先激活，才有 python
+
+python ~/FaSim-Isaac/exts/fasim.replicator.sdg/scripts/l2_openloop.py \
+    --dataset ~/lerobot_datasets/tube_25eps \
+    --checkpoint ~/act_runs/tube25/checkpoints/020000/pretrained_model \
+    --episode 0 --start 300 --max-frames 200
+```
+
+**`--start 300` 很重要**：跳过开头静止段。静止段所有动作接近 0，
+预测再准也说明不了问题（第一次跑没加，得到"真值 med=0、相关性 NaN"）。
+
+实测（25 条 / 20k 步 / loss 0.044）：
+
+| 指标 | 值 | 说明 |
+|---|---|---|
+| MAE | **0.0057 rad** | ≈0.33°，精度高 |
+| 量级 | 真值 0.1564 / 预测 0.1595 | 一致 |
+| **逐维相关性** | **mean 0.996，中位 0.998** | **20/20 维 > 0.8** |
+| 抖动比 | 0.94x | 预测略平滑，合理 |
+
+相关性是更关键的指标 —— 它说明**动作曲线形状**对上了，而非数值巧合。
+
+**归一化陷阱（踩过）**：lerobot 0.5.x 把归一化抽到 `PolicyProcessorPipeline`，
+`policy.select_action()` 只做前向、不归一化也不反归一化。漏掉后预测值
+是真值的 **1000 倍**、21.9% 饱和到 ±1。必须：
 
 ```python
-# 试管是否进孔：位置 + 姿态双阈值
+batch = preprocessor(batch)          # 归一化输入
+a = policy.select_action(batch)      # 前向
+a = postprocessor({"action": a})["action"]   # 反归一化输出
+```
+
+### 4.2 L3 闭环（在 GUI 里看机器人实时动）
+
+```bash
+# 终端 A：起 Isaac（场景加载完）
+cd ~/FaSim-Isaac && ./run.sh
+
+# 终端 B：装载策略（非阻塞，立刻返回）
+./exts/fasim.replicator.sdg/scripts/sdg.sh policy \
+    ~/act_runs/tube25/checkpoints/020000/pretrained_model \
+    --robot unitree_g1d --task sinopec_test_tube \
+    --max-frames 600
+
+# → 在 Isaac 窗口点 ▶ Play，机器人就动起来了
+```
+
+**每帧的循环**（在 `app.update()` 回调里，不阻塞）：
+
+```
+读 3 路 RGB + 32 关节角
+    → 归一化 → policy.select_action() → 反归一化
+    → set_dof_position_targets()
+    → 物理推进一步 → 下一帧
+```
+
+与 `live`（回放）的区别：**动作不是预存的，是策略根据当前画面现算的**。
+所以它能应对偏差（真的闭环），而回放只是照着演。
+
+其他命令：`sdg.sh policy-status` / `sdg.sh policy-stop`。
+
+**为什么不在回调里跑 for 循环**：在 socket 回调或 Script Editor 里调
+`app.update()` 会**重入 Kit 主循环**，画面卡死或崩溃。所以只「装载 +
+注册回调」，逐步驱动交给 Kit 自己的 update 循环（与 `live_replay` 同一套机制）。
+
+### 4.3 EE 驱动（走 OCS2 IK）
+
+采集时用 FK 从 `joint_pos_cmd` 反算了 `*_cmd_pos/_cmd_quat`（`robot.yaml`
+的 `planning` 段），那些是**末端指令位姿**。推理若输出位姿，可直接发
+
+```
+/left_target  /right_target  (geometry_msgs/Pose) → OCS2 做 IK → 关节
+```
+
+`live_replay` 的 `drive="ee"` 已经这么做了（`live_replay.py:22`）。
+所以 **EE 推理不需要自己写 IK**，复用这条链路即可。
+
+| 驱动 | 精度 | 依赖 |
+|---|---|---|
+| `joints`（当前 `sdg.sh policy` 默认） | 精确（直接给关节目标） | 无 |
+| `ee` | 取决于 IK 收敛 | 需 OCS2 在跑（`ROS=fiveages`） |
+
+### 4.4 成功判定（L3 量化还缺这个）
+
+目前 L3 只能肉眼观察。要算成功率需要自动判定，可用 `tracked_prims`：
+
+```python
+# 试管是否进孔：位置 + 高度双阈值
 d = ||test_tube_pos - target_hole_pos||
-ok = d < 0.02 and tube_z < rack_top_z and grip_closed
+ok = d < 0.02 and tube_z < rack_top_z
 ```
 
 ---

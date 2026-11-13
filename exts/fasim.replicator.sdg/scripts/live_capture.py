@@ -274,11 +274,34 @@ def _extract_camera_params(data: Any, width: int, height: int) -> dict[str, Any]
         view = np.asarray(data.get("cameraViewTransform"), dtype=np.float64).reshape(-1)
         if proj.size < 16 or view.size < 16:
             return None
-        # 行主序 4x4
+
+        # ---- 矩阵布局：**两个矩阵不一样，必须分别处理** ----
+        #
+        # ``cameraProjection`` 是 **row-major**（实测平移项在 [3],[7],[11] 位置，
+        # 即第 4 列），直接 reshape(4,4) 就对。
+        #
+        # ``cameraViewTransform`` 是 **column-major**（实测平移在**第 4 行**）。
+        # 探针 probe_camera_params.py 的实测证据（Isaac 6.2）：
+        #   raw 16 个数 reshape(4,4) 后：
+        #       [[ 0,     -0.739,  0.6737, -0    ],
+        #        [ 1,      0,     -0,      0    ],
+        #        [-0,      0.6737, 0.739,  0    ],
+        #        [-0.1003, 0.8428,-2.4801, 1    ]]   ← 平移在最后一行
+        #   按 column-major 解（转置）后反解相机世界位置 = [2.2937, 0.1003, 1.2650]
+        #   USD 真实值 = [2.2937, 0.1003, 1.2649]  → 误差 **0.1 mm**
+        #
+        # 曾经的 bug：把 view 也按 row-major 解，t_v = V[:3,3] 取到的是
+        # 第 4 **列**（全零），于是所有相机 pos 都是 [0,0,0]，
+        # 而旋转部分恰好转了置仍近似正交，quat 看起来正确 —— 很难发现。
         P = proj.reshape(4, 4)
-        V = view.reshape(4, 4)
+        V = view.reshape(4, 4).T     # ← column-major：转置成标准 view matrix
 
         # --- 内参：用投影矩阵反推，保证 fx/fy 与真实渲染一致 ---
+        #
+        # **不要用 cameraFocalLength / cameraAperture 算**：本机 aperture 是
+        # 24.95x13.936（16:9），而渲染 640x480 是 4:3，Isaac 会把画面拉伸。
+        # 用 focal/aperture 得到 fy=625.06，比真实的 465.51 大 34%，
+        # 点云会纵向压缩。投影矩阵里已经包含了这个缩放（P[5]/P[0] = 4/3）。
         fx = 0.5 * abs(float(P[0, 0])) * width
         fy = 0.5 * abs(float(P[1, 1])) * height
         # 主点（正常应为 W/2, H/2；带上非对称 aperture 偏移时也能覆盖）
@@ -288,7 +311,7 @@ def _extract_camera_params(data: Any, width: int, height: int) -> dict[str, Any]
             return None
         K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
 
-        # --- 位姿：view matrix 求逆 ---
+        # --- 位姿：view matrix 是**世界→相机**，求逆得相机在世界 ---
         R_vw = V[:3, :3]
         t_v = V[:3, 3]
         R_cw = R_vw.T
@@ -471,7 +494,17 @@ def arm_capture(
             w = int(width or (spec.resolution[0] if spec.resolution else 640))
             h = int(height or (spec.resolution[1] if spec.resolution else 480))
             try:
-                rp = rep.create.render_product(spec.prim_path, (w, h))
+                # 复用同名 render product（避免多次采集不断累积）。
+                # ``rep.create.render_product`` 每次新建；但我们在 stop 时
+                # 不 destroy（见 stop_capture 里的说明），所以这里先查缓存。
+                cache = _S.setdefault("_rp_cache", {})
+                key = f"{spec.name}@{w}x{h}@{spec.prim_path}"
+                rp = cache.get(key)
+                if rp is None:
+                    rp = rep.create.render_product(spec.prim_path, (w, h))
+                    cache[key] = rp
+                else:
+                    _log(f"相机 {spec.name}: 复用已有 render product")
             except Exception as exc:  # noqa: BLE001
                 _log(f"WARN 相机 {spec.name} 创建失败 ({spec.prim_path}): {exc}")
                 continue
@@ -968,11 +1001,42 @@ def stop_capture() -> dict:
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN 退订失败: {exc}")
 
+    # ---- 相机清理：**只 detach annotator，不 destroy render product** ----
+    #
+    # 为什么不能 destroy（实测 + 读 Isaac 源码确认）：
+    #
+    # 场景 assets 里挂了 ROS 相机发布图（Dex1 的 `ROS_Dex1Camera`、
+    # G1_Body 的 `ROS_G1BodyCamera`）。它们用 OmniGraph 的
+    # `IsaacCreateRenderProduct` 节点自己建 render product，下游 3 个
+    # writer 节点（CameraInfo / RGB / Depth）通过
+    # `RenderProduct.outputs:renderProductPath` 连接。
+    #
+    # 我们在采集时另外 `rep.create.render_product()` 建了一批，stop 时
+    # `rp.destroy()` 会破坏 Replicator 内部的全局注册状态，导致 ROS 图里
+    # 那些 writer 的 `renderProductPath` 变成悬空引用。之后停仿真时
+    # `base_writer_node._process_activation_requests` 尝试
+    # `writer.attach(path)` 就报：
+    #   Could not process writer attach request (..., None), Accessed invalid null prim
+    # 而且 ROS 图节点状态已坏，**只能重开 room.usda** 才能恢复。
+    #
+    # 实测佐证：只跑 motion-generation（不经采集）完全不报错；跑过采集
+    # 之后必报，且报 4 条（Dex1 左右各 1 组 RGB+Depth+Info → 加上头相机）。
+    #
+    # 所以这里只解绑 annotator（我们自己的消费端），render product 本身
+    # 交给 Isaac 在 stage 关闭时统一释放。代价是每次采集会多留几个 render
+    # product（几百 KB 级），但只要不 destroy 就不会产生悬空引用。
     for cam in _S["cameras"]:
-        try:
-            cam["rp"].destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        for key in ("rgb", "depth", "cparams"):
+            ann = cam.get(key)
+            if ann is None:
+                continue
+            try:
+                rp = cam.get("rp")
+                if rp is not None:
+                    ann.detach(rp)          # 解绑我们的消费端
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN annotator detach 失败（{cam.get('name')}/{key}）: {exc}")
+    _S["cameras"] = []
 
     out = _S["out"]
     info = {
