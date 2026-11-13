@@ -189,27 +189,6 @@ def _dispatch(req: dict) -> dict:
 
             return {"ok": True, **live_replay.status()}
 
-        # ---- 闭环推理（策略实时算动作，机器人真的动）----
-        if verb == "policy_start":
-            from fasim.replicator.sdg import live_infer
-
-            ckpt = str(req.pop("checkpoint", "") or "")
-            if not ckpt:
-                return {"ok": False, "error": "缺少 checkpoint 路径"}
-            req.pop("cmd", None)
-            return live_infer.start(ckpt, **req)
-
-        if verb == "policy_stop":
-            from fasim.replicator.sdg import live_infer
-
-            live_infer.stop()
-            return {"ok": True}
-
-        if verb == "policy_status":
-            from fasim.replicator.sdg import live_infer
-
-            return {"ok": True, **live_infer.status()}
-
         return {"ok": False, "error": f"未知指令 {verb!r}（支持 start/stop/status）"}
     except Exception as exc:  # noqa: BLE001
         import traceback

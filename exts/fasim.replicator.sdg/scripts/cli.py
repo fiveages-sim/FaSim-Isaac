@@ -1704,98 +1704,6 @@ def cmd_live(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_policy(args: argparse.Namespace) -> int:
-    """闭环推理：策略实时算动作，机器人在 GUI 里真的动起来。
-
-    与 ``live``（回放）的区别：动作不是预存的，而是**每帧由策略根据当前
-    画面和关节角现算** —— 这是真正跑策略，能应对偏差（闭环）。
-    """
-    import time
-    from pathlib import Path as _P
-
-    ckpt = _P(args.checkpoint).expanduser()
-    if not (ckpt / "model.safetensors").is_file():
-        _log(f"ERROR 不是有效的 checkpoint 目录（缺 model.safetensors）: {ckpt}")
-        _log("  应指向 <run>/checkpoints/<step>/pretrained_model")
-        return 1
-
-    # 默认用当前上下文（与 capture 一致）
-    robot = args.robot or os.environ.get("SDG_ROBOT", "")
-    task = args.task or os.environ.get("SDG_TASK", "")
-    if not robot or not task:
-        _log("ERROR 需要 --robot / --task（或用环境变量 SDG_ROBOT/SDG_TASK）")
-        return 1
-
-    req = {
-        "cmd": "policy_start",
-        "checkpoint": str(ckpt),
-        "robot_key": robot,
-        "task_key": task,
-        "camera": args.camera,
-        "max_frames": int(args.max_frames),
-        "every_n_updates": int(args.every),
-    }
-    if args.width and args.height:
-        req["width"], req["height"] = args.width, args.height
-
-    resp = _request(req, timeout=180)
-    if not resp.get("ok"):
-        _log(f"ERROR {resp.get('error', '未知错误')}")
-        return 1
-    _log(f"推理已装载（{resp.get('device')}）")
-    _log(f"  相机: {resp.get('cameras')}  最多 {resp.get('max_frames')} 帧")
-    _log("")
-    _log("=" * 62)
-    _log("在 Isaac 窗口里点 ▶ Play（或已 Play 的话直接看）")
-    _log("机器人会实时动起来 —— 动作由策略根据当前画面现算")
-    _log("=" * 62)
-
-    if args.no_wait:
-        return 0
-
-    _log("等待推理结束（Ctrl+C 中断）…")
-    try:
-        while True:
-            time.sleep(0.5)
-            st = _request({"cmd": "policy_status"}, timeout=5)
-            if not st.get("ok"):
-                kind = st.get("kind", "")
-                if kind in ("refused", "no_socket", "empty_reply", "timeout"):
-                    _log("推理中断：与 Isaac 的连接已断开")
-                break
-            if not st.get("playing"):
-                _log(f"推理结束 —— 共 {st.get('frame', 0)} 帧，"
-                     f"错误 {st.get('errors', 0)} 次")
-                break
-    except KeyboardInterrupt:
-        _log("")
-        _log("已中断，请求停止…")
-        _request({"cmd": "policy_stop"}, timeout=10)
-    return 0
-
-
-def cmd_policy_status(args: argparse.Namespace) -> int:
-    resp = _request({"cmd": "policy_status"}, timeout=10)
-    if not resp.get("ok"):
-        _log(f"ERROR {resp.get('error', '未知错误')}")
-        return 1
-    if not resp.get("playing"):
-        _log("当前没有在推理")
-        return 0
-    _log(f"推理中: {resp['frame']}/{resp['max_frames']} 帧  "
-         f"错误 {resp.get('errors', 0)}  设备 {resp.get('device')}")
-    return 0
-
-
-def cmd_policy_stop(args: argparse.Namespace) -> int:
-    resp = _request({"cmd": "policy_stop"}, timeout=10)
-    if not resp.get("ok"):
-        _log(f"ERROR {resp.get('error', '未知错误')}")
-        return 1
-    _log("已请求停止推理")
-    return 0
-
-
 def cmd_live_status(args: argparse.Namespace) -> int:
     resp = _request({"cmd": "live_status"}, timeout=10)
     if not resp.get("ok"):
@@ -2115,26 +2023,6 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("live-pause", help="暂停回放").set_defaults(func=cmd_live_pause)
     sub.add_parser("live-resume", help="继续回放").set_defaults(func=cmd_live_resume)
 
-    # ---- 闭环推理：机器人在 GUI 里实时动起来 ----
-    pol = sub.add_parser(
-        "policy",
-        help="闭环推理：策略实时算动作驱动关节（Isaac GUI 里能看到机器人动）",
-    )
-    pol.add_argument("checkpoint", help="pretrained_model 目录")
-    pol.add_argument("--robot", default="", help="机器人 key；留空用当前上下文")
-    pol.add_argument("--task", default="", help="任务 key；留空用当前上下文")
-    pol.add_argument("--camera", default="all", help="相机名 / all")
-    pol.add_argument("--max-frames", type=int, default=600,
-                     help="最多推理 N 帧后自动停（默认 600 ≈ 30s@20fps）")
-    pol.add_argument("--every", type=int, default=1,
-                     help="每 N 次 update 推理一次（降频缓解算力竞争，默认 1）")
-    pol.add_argument("--width", type=int, default=0)
-    pol.add_argument("--height", type=int, default=0)
-    pol.add_argument("--no-wait", dest="no_wait", action="store_true",
-                     help="不等结束，装载后立即返回")
-    pol.set_defaults(func=cmd_policy)
-    sub.add_parser("policy-status", help="推理进度").set_defaults(func=cmd_policy_status)
-    sub.add_parser("policy-stop", help="停止推理").set_defaults(func=cmd_policy_stop)
 
     fkp = sub.add_parser(
         "fk",
