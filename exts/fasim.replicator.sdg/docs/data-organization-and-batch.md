@@ -282,21 +282,92 @@ TASK=~/fasim_data/unitree_g1d/sinopec_test_tube
 
 强制合并（危险，仅用于排查）：`--allow-mismatch`。
 
-### 3.3 实测
+### 3.3 实测（25 条真实数据，2026-11-13）
+
+采集：G1D 试管任务（右手取右架4号孔 → 递左手 → 插左架3号孔），
+随机化试管架位置，**25 条全部成功**。
 
 ```
-2 个 run（run_03 674 帧 + run_04 651 帧）
-→ export 合并
-→ 1325 帧 / 2 episode
-
-info.json:  codebase_version=v3.0  total_episodes=2  total_frames=1325  fps=20
-parquet:    ep0 index 0..673（连续）  ep1 index 674..1324（连续）
-export-check: ✅ 可被官方 LeRobotDataset 加载
+原始 raw:  106 G   (15,326 帧, 每帧 7.38MB)
+                ↓ 批量 export
+LeRobot:   310 M   (15,350 帧 / 25 episode, fps=20, v3.0)
+压缩比:    342x
 ```
 
-关键验证点：**跨 episode 不串**。`delta` 模式下 `action[t] = pos[t+1] - pos[t]`，
-如果不小心用了全局帧列表，episode 边界会取到下一个 episode 的第一帧 ——
-worker 里显式用 `ep_frames`（本 episode 内）避免了这个坑。
+**为什么压缩比这么高**：每帧 npz 存了 3 路 RGB + 3 路 depth，各 1.23MB：
+
+| 字段 | 单帧 | 是否进 LeRobot |
+|---|---|---|
+| `head_rgb` | 1.23 MB | ✅（h264 编码） |
+| `head_depth` | 1.23 MB | ❌ **丢弃** |
+| `wrist_left_rgb` | 1.23 MB | ✅ |
+| `wrist_left_depth` | 1.23 MB | ❌ |
+| `wrist_right_rgb` | 1.23 MB | ✅ |
+| `wrist_right_depth` | 1.23 MB | ❌ |
+
+深度图占一半体积，但 ACT 不用。LeRobot 用 h264 编码 RGB（每帧 ~20KB），
+所以 5.1G 的 raw → 15M 的数据集。
+
+**完整性质检**（不看帧数，看物理结果）：
+
+| 判据 | 25 条结果 |
+|---|---|
+| 起点距右架 | 2.43cm（全部） |
+| 终点距左架 | 1.62 ~ 4.10cm（中位 2.4cm） |
+| 试管抬起高度 | 18.8 ~ 19.1cm |
+| 终点落架高度误差 | 0.8 ~ 1.2cm |
+| 左右爪是否都动过 | ✅ 25/25 |
+| 关节跳变（>0.8 rad/采样） | 0 次 |
+
+**25 / 25 全部合格。**
+
+### 3.4 批量处理命令（实测）
+
+```bash
+TASK=~/fasim_data/unitree_g1d/sinopec_test_tube
+
+# 1) 参数一致性检查（export 会自动跑，也可单独看）
+#    25 条全部一致 → 可以合并
+
+# 2) 一次性导出（约 6 分钟 / 25 条）
+./scripts/sdg.sh export $TASK \
+    --out ~/lerobot_datasets/tube_25eps -y
+
+# 3) 校验
+./scripts/sdg.sh export-check ~/lerobot_datasets/tube_25eps
+```
+
+**注意**：导出是单进程串行，25 条约 6 分钟（h264 编码是瓶颈）。
+进程结束前不要读 `meta/info.json` —— 它是边写边更新的，
+中途读到的是不完整值（实测中途读到 `episodes=13`，实际是 25）。
+
+判断是否真的结束：
+
+```bash
+pgrep -f _lerobot_export_worker    # 空 = 结束
+grep '完成:' /tmp/export.log        # 应看到 "(N 帧 / M episode)"
+```
+
+### 3.5 关于「随机化」的实际范围（重要）
+
+25 条虽然随机化了试管架位置，但**范围偏小**：
+
+| 对象 | x 范围 | y 范围 |
+|---|---|---|
+| 右架（起点） | 1.17 cm | **4.56 cm** |
+| 左架（目标） | 0.00 cm | **3.06 cm** |
+| 试管 | 跟随右架（相对位置固定） | — |
+
+**影响泛化**：策略学到的是「在 y 方向 ±4cm 范围内抓取」。如果部署时试管
+偏得更远，成功率会下降。想提升泛化，下一批建议：
+
+1. **加大 y 方向随机范围**（现在只有 4.6cm，可到 15~20cm）
+2. **引入 x 方向变化**（现在几乎为 0）
+3. **改变试管的初始姿态**（现在完全竖直，可加倾斜）
+4. **改变左右架距离**（现在固定）
+
+这比单纯增加条数更有价值 —— 25 条同分布数据的边际收益远小于
+25 条覆盖更大范围的数据。
 
 ---
 
