@@ -801,6 +801,45 @@ _CACHE_FILES = (
 )
 
 
+def _iter_planning_urdf_paths(controllers_yaml: str) -> list[str]:
+    """Collect planning_urdf_path values from a controllers YAML (line scan)."""
+    paths: list[str] = []
+    try:
+        with open(controllers_yaml, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped.startswith("planning_urdf_path:"):
+                    continue
+                value = stripped.split(":", 1)[1].strip().strip("\"'")
+                if value:
+                    paths.append(value)
+    except OSError:
+        return []
+    return paths
+
+
+def _embed_planning_urdfs(staging: str, final: str, controllers_yaml: str) -> None:
+    """Copy planning URDFs into the emit cache and rewrite controllers.yaml paths.
+
+    ``/tmp/ocs2_ros2/.../planning_urdf`` is often wiped independently of
+    ``/tmp/fasim/emit_control``; embedding keeps cache hits valid. YAML paths
+    point at ``final/`` (post-rename); bytes are written under ``staging/``.
+    """
+    refs = _iter_planning_urdf_paths(controllers_yaml)
+    if not refs:
+        return
+    with open(controllers_yaml, encoding="utf-8") as handle:
+        text = handle.read()
+    for index, src in enumerate(refs):
+        if not os.path.isfile(src):
+            raise RuntimeError(f"emit cache: planning_urdf missing: {src}")
+        name = "planning_urdf.urdf" if index == 0 else f"planning_urdf_{index}.urdf"
+        shutil.copyfile(src, os.path.join(staging, name))
+        text = text.replace(src, os.path.join(final, name))
+    with open(controllers_yaml, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def _read_cache(cache_dir: str, key: str) -> dict | None:
     final = os.path.join(cache_dir, key)
     payload_path = os.path.join(final, "payload.json")
@@ -820,6 +859,11 @@ def _read_cache(cache_dir: str, key: str) -> dict | None:
                 return None
             continue
         if not os.path.isfile(path):
+            return None
+    # Stale hit: controllers.yaml still points at a wiped /tmp/ocs2_ros2 planning URDF.
+    yaml_path = payload.get("yaml_path") or ""
+    for plan_path in _iter_planning_urdf_paths(yaml_path):
+        if not os.path.isfile(plan_path):
             return None
     return payload
 
@@ -878,6 +922,9 @@ def _write_cache(cache_dir: str, key: str, payload: dict) -> dict:
                 continue
             shutil.copyfile(src, os.path.join(staging, name))
             rewritten[field] = os.path.join(final, name)
+        staged_yaml = os.path.join(staging, "controllers.yaml")
+        if os.path.isfile(staged_yaml):
+            _embed_planning_urdfs(staging, final, staged_yaml)
         with open(os.path.join(staging, "payload.json"), "w", encoding="utf-8") as handle:
             json.dump(rewritten, handle)
         try:
@@ -898,6 +945,10 @@ def _write_cache(cache_dir: str, key: str, payload: dict) -> dict:
                         raise RuntimeError(f"emit cache: missing {field}")
                     continue
                 shutil.copyfile(src, os.path.join(staging, name))
+                rewritten[field] = os.path.join(final, name)
+            staged_yaml = os.path.join(staging, "controllers.yaml")
+            if os.path.isfile(staged_yaml):
+                _embed_planning_urdfs(staging, final, staged_yaml)
             with open(os.path.join(staging, "payload.json"), "w", encoding="utf-8") as handle:
                 json.dump(rewritten, handle)
             _rename_cache_dir(staging, final)
