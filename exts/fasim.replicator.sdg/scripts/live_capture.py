@@ -662,6 +662,13 @@ def arm_capture(
 
     _S.update(
         armed=True, cameras=cams, out=out, every=max(1, int(every)),
+        # **每次 arm 必须重置逐帧自检状态**。`_S` 是模块级字典，跨会话存活；
+        # 若不重置，第二次采集的 samples 会从上次的累计继续涨
+        # （实测：run_01 739 帧 + run_02 596 帧 → 第二个会话报 samples=1335），
+        # 且 travel 会沿用上次的首帧参考值，自检结论完全失真。
+        ee_health={}, cam_health={}, joint_cmd_ok=False,
+        _ee_err=0, _qt_err=0, _obj_err=0, errors=0,
+        _last_emit_step=None,
         step=0, saved=0, skipped=0, t0=time.monotonic(), records=[],
         size=cams[0]["size"] if cams else (0, 0),
         ee_links=ee_links, ee_offsets=ee_offsets, ee_prims=ee_prims,
