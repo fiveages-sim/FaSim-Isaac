@@ -6,8 +6,14 @@
 
 output:
   # 数据不放在仓库内（仓库要能干净克隆/移植）。
-  # 换机器时改这一行，或用 --output 覆盖。
-  dir: /home/fiveages/fasim_sdg
+  #
+  # ⚠ 注意：**live 采集（sdg.sh capture）不用这里的 dir** ——
+  # 它走 runtime.data_root()，默认 `~/fasim_data`，可用环境变量覆盖：
+  #     FASIM_SDG_DATA=/data/fasim ./scripts/sdg.sh capture ...
+  # 这里的 dir 只被旧版 recorder（离线录制 / gui_record）使用。
+  # 两者历史上不一致过（一个指 ~/fasim_sdg、一个指 ~/fasim_data），
+  # 曾导致数据分散在两个根目录。现在以 runtime.data_root() 为准。
+  dir: /home/fiveages/fasim_data
 
 record:
   capture_fps: 30        # 录制采样率（与物理步解耦，由 EpisodeRecorder 按物理步记录）
