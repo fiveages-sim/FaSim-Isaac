@@ -118,34 +118,74 @@ S=~/fasim_data/unitree_g1d/sinopec_test_tube/run_04
 
 ## 2. 训练
 
-### 2.1 启动命令（lerobot 0.5.1）
+### 2.0 实测跑通的命令（2026-11-13，lerobot 0.5.1 / numpy 2.2.6 / torch 2.7.1+cu128）
 
 ```bash
 cd ~/lerobot_ros2
 source .venv-train/bin/activate
 
 python -m lerobot.scripts.lerobot_train \
-    --dataset.repo_id=tube_v1 \
-    --dataset.root=$HOME/lerobot_datasets/tube_v1 \
-    --policy.type=act \
-    --output_dir=$HOME/act_runs/tube_v1 \
-    --batch_size=8 \
-    --steps=20000 \
-    --save_freq=5000
+  --dataset.repo_id=tube_smoke \
+  --dataset.root=$HOME/lerobot_datasets/tube_smoke \
+  --dataset.video_backend=pyav \
+  --policy.type=act \
+  --policy.chunk_size=100 --policy.n_action_steps=1 \
+  --policy.push_to_hub=false \
+  --output_dir=$HOME/act_runs/tube_v1 \
+  --batch_size=8 --num_workers=4 \
+  --steps=3000 --save_freq=1000 --eval_freq=0 \
+  --wandb.enable=false
 ```
 
-> **0.5.1 与旧版差异**：训练脚本名从 `train.py` 改成 **`lerobot_train.py`**
-> （`python -m lerobot.scripts.lerobot_train`）。参数用 `--key=value` 形式。
+**两个必需的参数**（不加会失败，都是实机踩出来的）：
+
+| 参数 | 不加会怎样 |
+|---|---|
+| `--policy.push_to_hub=false` | `ValueError: 'policy.repo_id' argument missing`（默认 true，想推 HF Hub） |
+| `--dataset.video_backend=pyav` | DataLoader worker 崩溃：`torchcodec` 加载 `libavutil.so.59` 失败 |
+
+> **FFmpeg 坑**：`torchcodec` 需要匹配的系统 FFmpeg 共享库（libavutil 56/57/59）。
+> 本机系统 FFmpeg 版本不匹配 → 加载失败。lerobot 支持 `pyav` 后端（纯 Python 绑定的
+> FFmpeg），`--dataset.video_backend=pyav` 绕开即可。日志里那串
+> `OSError: libavutil.so.59` 是探测噪音，只要最终用 pyav 就不影响。
+
+### 2.1 实测结果
+
+```
+cfg.steps=3000    dataset.num_frames=651    dataset.num_episodes=1
+num_learnable_params=51650464 (52M)
+```
+
+| step | loss | 备注 |
+|---|---|---|
+| 200 | 6.319 | 起始（smoke 200 步测试是 7.058） |
+| 800 | 2.016 | |
+| 2000 | 1.049 | |
+| 3000 | **0.598** | 37 epoch，5:53 分钟，8.48 step/s |
+
+产物：`~/act_runs/tube_v1/checkpoints/{001000,002000,003000,last}/pretrained_model/`
+（1.8G，含 `model.safetensors` + `train_config.json` + 归一化 stats）
+
+**推理端可加载**（已验证）：
+
+```python
+from lerobot.policies.act.modeling_act import ACTPolicy
+p = ACTPolicy.from_pretrained("~/act_runs/tube_v1/checkpoints/003000/pretrained_model")
+# ✅ loaded, chunk_size=100, n_action_steps=1
+```
+
+> loss 0.598 看着不错，但**这只说明拟合了这 1 条轨迹**（37 个 epoch 反复看同一条）。
+> 换个初始位置大概率失败。别被数字骗了 —— 见 §2.3。
 
 ### 2.2 关键参数
 
 | 参数 | 默认 | 我们数据上的建议 | 原因 |
 |---|---|---|---|
-| `batch_size` | 8 | 8~16 | 4090 24GB，3 路 640×480 |
+| `batch_size` | 8 | 8~16 | 4090 24GB，3 路 640×480（实测 8 够用） |
 | `steps` | 100000 | 20000~50000 | 数据少易过拟合，多存 ckpt |
-| `save_freq` | 20000 | 5000 | 数据少，想早点看到 ckpt |
-| `eval_freq` | 20000 | 关闭或留大 | 我们没 test split |
-| `num_workers` | 4 | 8 | 3 路视频解码是瓶颈 |
+| `save_freq` | 20000 | 1000~5000 | 数据少，想早点看到 ckpt |
+| `eval_freq` | 20000 | **0（关闭）** | 没有 test split |
+| `num_workers` | 4 | 4~8 | 3 路视频解码是瓶颈 |
 | `policy.chunk_size` | 100 | 100 | ACT 论文默认 |
 | `policy.n_action_steps` | 100 | **1**（闭环最稳）或 chunk_size/2（提速） | 每步重预测，避免开环漂 |
 
@@ -176,7 +216,7 @@ ACT 论文用 **50~200 条**轨迹。我们目前：
 | `examples/IsaacSim/online_infer/core.py` | 策略循环 + ROS2 发送 |
 | `examples/IsaacSim/robots/Unitree/G1D/` | **G1D 的任务配置已在** |
 
-推理内部走标准 LeRobot API（已核对 0.5.1 都还在）：
+推理内部走标准 LeRobot API（已在 0.5.1 核对）：
 
 ```python
 # online_infer/core.py
@@ -185,6 +225,19 @@ train_cfg = TrainPipelineConfig.from_pretrained(...)      # :372
 policy = make_policy(cfg.policy, ds_meta=meta_obj)        # :420
 action = policy.select_action(batch)                      # :532
 ```
+
+手工加载 ckpt（已验证可用）：
+
+```python
+from lerobot.policies.act.modeling_act import ACTPolicy   # ← 类名是 ACTPolicy
+
+p = ACTPolicy.from_pretrained("~/act_runs/tube_v1/checkpoints/003000/pretrained_model")
+# ✅ chunk_size=100, n_action_steps=1
+```
+
+> ⚠️ 注意别导错：`modeling_act.py` 里有 `ACTPolicy`（PreTrainedPolicy 子类，
+> 有 `from_pretrained`/`select_action`）和 `ACT`（纯 nn.Module）。
+> 要加载 ckpt 用 **`ACTPolicy`**。
 
 ### 3.1 启动方式
 
@@ -256,29 +309,43 @@ ok = d < 0.02 and tube_z < rack_top_z and grip_closed
 
 ---
 
-## 7. 快速开始（复制粘贴）
+## 7. 快速开始（复制粘贴，已实测跑通）
 
 ```bash
-# ---- 一次性：装训练环境 ----
+# ---- 一次性：装训练环境（跳过已装的 torch）----
 cd ~/lerobot_ros2
 env UV_CACHE_DIR="$HOME/.cache/uv" ./init.sh setup-train-env
 .venv-train/bin/python -c "import numpy, lerobot; print(numpy.__version__, lerobot.__version__)"
+# 期望: 2.2.x  0.5.1
 
-# ---- 数据（已有 run_04 的话可跳过前两步）----
+# ---- 数据（run_04 已导出过可跳过）----
 cd ~/FaSim-Isaac/exts/fasim.replicator.sdg
 S=~/fasim_data/unitree_g1d/sinopec_test_tube/run_04
 ./scripts/sdg.sh export $S --out ~/lerobot_datasets/tube_smoke \
     --action-space absolute --overwrite
 ./scripts/sdg.sh export-check ~/lerobot_datasets/tube_smoke
 
-# ---- 试训（数据少，只看能否跑起来）----
+# ---- 训练 ----
 cd ~/lerobot_ros2 && source .venv-train/bin/activate
 python -m lerobot.scripts.lerobot_train \
-    --dataset.repo_id=tube_smoke \
-    --dataset.root=$HOME/lerobot_datasets/tube_smoke \
-    --policy.type=act \
-    --output_dir=$HOME/act_runs/smoke \
-    --batch_size=4 --steps=2000 --save_freq=1000
+  --dataset.repo_id=tube_smoke \
+  --dataset.root=$HOME/lerobot_datasets/tube_smoke \
+  --dataset.video_backend=pyav \
+  --policy.type=act \
+  --policy.chunk_size=100 --policy.n_action_steps=1 \
+  --policy.push_to_hub=false \
+  --output_dir=$HOME/act_runs/tube_v1 \
+  --batch_size=8 --num_workers=4 \
+  --steps=3000 --save_freq=1000 --eval_freq=0 \
+  --wandb.enable=false
+# 实测: 5:53 分钟, loss 7.06 → 0.598
+
+# ---- 验证 ckpt 可加载 ----
+.venv-train/bin/python -c "
+from lerobot.policies.act.modeling_act import ACTPolicy
+p = ACTPolicy.from_pretrained('$HOME/act_runs/tube_v1/checkpoints/003000/pretrained_model')
+print('OK', p.config.chunk_size, p.config.n_action_steps)
+"
 ```
 
 跑通后再：
