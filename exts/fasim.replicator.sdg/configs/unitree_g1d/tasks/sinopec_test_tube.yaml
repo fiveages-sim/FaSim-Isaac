@@ -86,3 +86,43 @@ record:
   physics_hz: 200
   physics_dt: 0.005      # 200Hz 的步长写法（与 physics_hz 等价，后者优先）
   max_frames: 2000
+
+# ---------------------------------------------------------------------------
+# 采集预设 —— 保证多批次数据格式对齐
+# ---------------------------------------------------------------------------
+# 同一任务要采几十条轨迹（ACT 训练用）。每次手选参数容易某次改错一个值，
+# 那一批数据就和之前不兼容了（导出时 capture_profile 会拦，但白采了）。
+# 预设把参数固化成名字，选一次即可。
+#
+# target_fps: 按本任务 physics_hz(200) 自动换算 every，比手写 every 稳
+#             （换场景步频改了也不会错）。
+# every:      直接给物理步数（与 target_fps 二选一，every 优先）。
+#
+capture_presets:
+  # ACT 训练主力：20fps、原分辨率 640x480、全字段
+  act_train:
+    desc: "ACT 训练（20fps / 640x480 / camera+joint+ee+object）"
+    what: [camera, joint, ee, object]
+    camera: all
+    target_fps: 20
+    depth: true
+
+  # 高分辨率：想提升视觉细节时用（显存/时间开销大 3 倍）
+  act_hires:
+    desc: "ACT 高分辨率（15fps / 1280x720）"
+    what: [camera, joint, ee, object]
+    camera: all
+    target_fps: 15
+    width: 1280
+    height: 720
+    depth: true
+
+  # 快速冒烟：只验证流水线通不通，省时间省磁盘
+  smoke:
+    desc: "冒烟测试（10fps / 320x240 / 无深度）"
+    what: [camera, joint]
+    camera: head
+    target_fps: 10
+    width: 320
+    height: 240
+    depth: false

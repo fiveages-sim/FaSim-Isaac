@@ -91,6 +91,41 @@ class TaskSpec:
     跑得动多少"。换机器要重新实测后改 ``configs/_default.yaml``。
     """
     max_frames: int = 2000
+    """单 episode 帧数上限（防跑飞）。
+
+    注意：这是**单次采集**的上限，不是数据集总量。批量导出会合并多个会话。
+    """
+    capture_presets: dict[str, dict] = field(default_factory=dict)
+    """采集预设 —— 一组「保证数据格式对齐」的参数组合。
+
+    为什么需要：同一个任务要采很多条轨迹（ACT 需要几十条）。如果每次采集都
+    手选参数，很容易某次改了个分辨率或 every，那一批数据就和之前的不兼容了
+    （``capture_profile`` 会在导出时报不一致，但那时已经浪费了采集时间）。
+
+    预设把参数固化在任务配置里，选一次就锁定：
+
+    ```yaml
+    capture_presets:
+      act_train:                     # 预设名
+        desc: ACT 训练用（20fps，高分辨率）
+        what: [camera, joint, ee, object]
+        camera: all
+        target_fps: 20               # 由 physics_hz 反推 every
+        width: 1280
+        height: 720
+        depth: true
+      act_fast:
+        desc: 快速验证（10fps，低分辨率）
+        what: [camera, joint]
+        camera: all
+        every: 20
+        width: 640
+        height: 480
+    ```
+
+    ``target_fps`` 与 ``every`` 二选一：前者按任务 ``physics_hz`` 自动换算，
+    更稳（换场景步频变了也不会错）。都没写时用 ``every=10``。
+    """
     variant_selection: dict[str, str] = field(default_factory=dict)
     """Variant switches applied to the robot prim before play, e.g. {"ROS": "fiveages"}."""
 

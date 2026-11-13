@@ -193,14 +193,24 @@ def export_session(
                 与同事 pose 模式完全对齐。同样用实测值而非 cmd。
 
     Returns:
-        ``{"ok", "out", "frames", "features", "python"}``
+        ``{"ok", "out", "frames", "episodes", "features", "python"}``
+
+    说明：``session_dir`` 可以是单个会话路径，也可以是**会话路径列表**
+    （多 episode 导出 —— 每个会话导出成数据集里的一个 episode）。
+    后者用于「一个任务批次下多次采集 → 一个训练集」的场景。
     """
     import tempfile
 
-    session = Path(session_dir).expanduser().resolve()
+    raw_sessions = ([session_dir] if isinstance(session_dir, (str, Path))
+                    else list(session_dir))
+    sessions = [Path(s).expanduser().resolve() for s in raw_sessions]
+    if not sessions:
+        raise ValueError("没有给出任何会话目录")
+    for s in sessions:
+        if not s.is_dir():
+            raise FileNotFoundError(s)
+    session = sessions[0]   # 主会话：用于默认 repo_id / robot_type / task
     out = Path(out_dir).expanduser().resolve()
-    if not session.is_dir():
-        raise FileNotFoundError(session)
     if out.exists():
         if not overwrite:
             raise FileExistsError(
@@ -208,9 +218,25 @@ def export_session(
             )
         shutil.rmtree(out)
 
-    frames, meta = _load_frames(session)
+    # 逐会话收集帧 —— 每个会话是一个独立 episode
+    episodes_frames: list[list[Path]] = []
+    metas: list[dict] = []
+    for s in sessions:
+        fs, m = _load_frames(s)
+        if not fs:
+            _log(f"WARN 跳过无帧会话: {s}")
+            continue
+        episodes_frames.append(fs)
+        metas.append(m)
+    if not episodes_frames:
+        raise ValueError("所有会话都没有帧")
+    frames = [f for ep in episodes_frames for f in ep]   # 扁平（用于探测 feature）
+    meta = metas[0]
     n = len(frames)
     cams = _discover_cameras(frames)
+    if len(episodes_frames) > 1:
+        _log(f"多会话导出：{len(episodes_frames)} 个 episode，"
+             f"共 {n} 帧 → {out}")
 
     # fps：优先 session.json 的 physics_dt×every。
     # physics_dt 是**设定值**（场景 physxScene:timeStepsPerSecond → 仿真时间口径），
@@ -330,6 +356,10 @@ def export_session(
         "robot_type": rtype,
         "task": task_text,
         "frames": [str(f) for f in frames],
+        # 多 episode：每个子列表导出成数据集里的一个 episode。
+        # worker 优先用这个；没有时回落到上面的扁平 frames（单 episode）。
+        "episodes": [[str(f) for f in ep] for ep in episodes_frames],
+        "episode_names": [s.name for s in sessions],
         "cams": cams,
         "features": features,
         "obj_labels": obj_labels,
@@ -359,5 +389,6 @@ def export_session(
 
     return {
         "ok": True, "out": str(out), "frames": n,
+        "episodes": len(episodes_frames),
         "features": sorted(features), "python": str(py),
     }

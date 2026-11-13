@@ -390,6 +390,7 @@ def arm_capture(
     name: str = "",
     record_ee: bool = True,
     record_objects: bool = True,
+    preset: str = "",
 ) -> dict | None:
     """挂载采集器并立即返回（非阻塞）。
 
@@ -407,6 +408,9 @@ def arm_capture(
         name: 会话子目录名；留空用时间戳。
         record_ee: 记录左右末端位姿（tcp，world 系），来自 robot.yaml 的 ee_prims。
         record_objects: 记录 tracked_prims 里的物体位姿（试管/架子等）。
+        preset: 采集预设名（任务配置 ``capture_presets`` 下的 key）。只用于
+            记录到 session.json，便于回溯「这批数据用哪个预设采的」；
+            参数本身已由 CLI 解析好再传进来。
 
     Returns:
         ``{"out":..., "cameras":[...], "every":..., "what":[...]}``；已挂载返回 None。
@@ -675,6 +679,7 @@ def arm_capture(
         _wall_steps=0,
         # 供 session.json 记录，下游 pack/fk 靠它定位 planning URDF
         robot_key=str(robot_key), task_key=str(task_key),
+        preset=str(preset or ""),
     )
     if physics_dt > 0:
         fps_sim = 1.0 / (physics_dt * max(1, int(every)))
@@ -888,6 +893,7 @@ def arm_capture(
                 "out": str(out),
                 "robot_key": str(robot_key),
                 "task_key": str(task_key),
+                "preset": str(preset or ""),
                 "status": "capturing",       # stop 时改为 written
                 # 设定值（决定时间轴）
                 "physics_dt": physics_dt,

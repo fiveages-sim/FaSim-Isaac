@@ -149,24 +149,135 @@ def pick(title: str, options: list[tuple[str, str]], default_idx: int = 1,
              + ("，b=返回" if allow_back else "") + "）")
 
 
+def _is_tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _read_key() -> str:
+    """读一个按键，返回归一化的名字。
+
+    返回: 'up' / 'down' / 'space' / 'enter' / 'a' / 'q' / 其他单字符。
+    用 termios 进原始模式，避免方向键被 readline 吃掉。
+    """
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":                      # ESC 序列：方向键
+            seq = sys.stdin.read(2)
+            if seq == "[A":
+                return "up"
+            if seq == "[B":
+                return "down"
+            return "esc"
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == " ":
+            return "space"
+        if ch == "\x03":                      # Ctrl-C
+            raise KeyboardInterrupt
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def pick_multi(title: str, options: list[tuple[str, str]],
-               default: list[str] | None = None) -> list[str]:
-    """多选。输入如 ``1,3`` 或回车=上次选的那几项。"""
-    print(f"\n{_c(title, BOLD)}")
-    dflt = [v for v, _ in options] if default is None else [
-        v for v, _ in options if v in default] or [v for v, _ in options]
-    for i, (v, desc) in enumerate(options, 1):
-        mark = _c("  ✓", GREEN) if v in dflt else ""
-        print(f"  {i}) {desc}{mark}")
-    d = ",".join(str(i + 1) for i, (v, _) in enumerate(options) if v in dflt)
-    ans = ask("选择（逗号分隔，回车=用 ✓ 的项）", d)
-    if ans.strip().lower() in ("", "全部", "all"):
-        return dflt
-    idx: list[int] = []
-    for tok in ans.replace(" ", "").split(","):
-        if tok.isdigit() and 1 <= int(tok) <= len(options):
-            idx.append(int(tok) - 1)
-    return [options[i][0] for i in idx] or dflt
+               default: list[str] | None = None,
+               allow_empty: bool = False) -> list[str]:
+    """多选采集项。
+
+    **交互式（TTY）**：上下箭头移动光标，空格勾选/取消，回车确认，a=全选，q=取消。
+    屏幕上方就地重绘，有 ``[x]`` 框框。这是默认路径 —— 避免手输数字打错。
+
+    **非 TTY**（管道/CI/日志）：退回「逗号分隔数字」输入，行为与旧版一致。
+
+    Args:
+        default: 预勾选的 value 列表；None 表示全选。
+        allow_empty: 允许一个都不选（回车时为空则返回空列表，而不是回退默认）。
+    """
+    if not options:
+        return []
+
+    dflt = ([v for v, _ in options] if default is None
+            else [v for v, _ in options if v in default])
+
+    # ---- 非 TTY：保留原来的文本输入 ----
+    if not _is_tty():
+        print(f"\n{_c(title, BOLD)}")
+        for i, (v, desc) in enumerate(options, 1):
+            mark = _c("  ✓", GREEN) if v in dflt else ""
+            print(f"  {i}) {desc}{mark}")
+        d = ",".join(str(i + 1) for i, (v, _) in enumerate(options) if v in dflt)
+        ans = ask("选择（逗号分隔，回车=用 ✓ 的项）", d)
+        if ans.strip().lower() in ("", "全部", "all"):
+            return dflt
+        idx = [int(t) - 1 for t in ans.replace(" ", "").split(",")
+               if t.isdigit() and 1 <= int(t) <= len(options)]
+        return [options[i][0] for i in idx] or dflt
+
+    # ---- TTY：方向键 + 空格 ----
+    chosen = set(dflt)
+    cursor = 0
+    n = len(options)
+
+    def render() -> None:
+        # 回到标题行重绘：先上移 n 行（首次渲染前 n 行还没画，用 \r 兜底）
+        lines = [f"\n{_c(title, BOLD)}"]
+        for i, (_v, desc) in enumerate(options):
+            box = _c("[x]", GREEN) if options[i][0] in chosen else "[ ]"
+            arrow = _c("❯", CYAN) if i == cursor else " "
+            lines.append(f" {arrow} {box} {desc}")
+        lines.append(_c("  ↑↓ 移动  空格 勾选  a 全选  n 全不选  回车 确认  q 取消", DIM))
+        sys.stdout.write("\r\033[K" + "\n\033[K".join(lines) + "\033[K")
+        sys.stdout.flush()
+
+    def clear(n_lines: int) -> None:
+        # 光标上移并清空，供重绘/收尾
+        sys.stdout.write(f"\033[{n_lines}A")
+        for _ in range(n_lines):
+            sys.stdout.write("\033[K\n")
+        sys.stdout.write(f"\033[{n_lines}A")
+        sys.stdout.flush()
+
+    total_lines = n + 2
+    render()
+    try:
+        while True:
+            key = _read_key()
+            if key == "up":
+                cursor = (cursor - 1) % n
+            elif key == "down":
+                cursor = (cursor + 1) % n
+            elif key == "space":
+                v = options[cursor][0]
+                chosen.symmetric_difference_update({v})
+            elif key == "a":
+                chosen = {v for v, _ in options}
+            elif key == "n":
+                chosen = set()
+            elif key == "enter":
+                break
+            elif key in ("q", "esc"):
+                chosen = set(dflt)   # 取消 = 回到默认
+                break
+            clear(total_lines)
+            render()
+    finally:
+        clear(total_lines)
+
+    result = [v for v, _ in options if v in chosen]
+    if not result and not allow_empty:
+        _log("一个都没选，回退为全部")
+        result = [v for v, _ in options]
+    _log(f"已选: {result if result else '（空）'}")
+    return result
 
 
 def run(cmd: list[str]) -> int:
@@ -329,6 +440,30 @@ def show_context(robot: str, task: str) -> None:
 # ---------------------------------------------------------------- 功能分支
 
 
+def _do_capture_with_preset(robot: str, task: str, name: str,
+                            preset: dict, state: dict) -> None:
+    """按预设直接开始采集（只问输出目录，其余参数全部锁定）。"""
+    print(f"\n{_c(f'预设: {name}', BOLD)}  {preset.get('desc', '')}")
+
+    base = _default_out(robot, task)
+    suggest = f"{base}/{_suggest_name(base)}"
+    print(f"{DIM}  数据根目录: {runtime.data_root()}{NC}")
+    print(f"{DIM}  参数已锁定：what={preset.get('what')} "
+          f"camera={preset.get('camera')} "
+          f"target_fps={preset.get('target_fps')} "
+          f"size={preset.get('width')}x{preset.get('height')} "
+          f"depth={preset.get('depth')}{NC}")
+    out = ask("输出目录（回车=用建议名）", suggest)
+    if out.lower() in ("b", "back"):
+        return
+    state["last_out"] = out
+    state["preset"] = name
+
+    args = ["capture", "--robot", robot, "--task", task,
+            "--preset", name, "--out", out]
+    run([str(SDG_SH)] + args)
+
+
 def _default_out(robot: str, task: str) -> str:
     try:
         return str(runtime.data_root() / robot / task)
@@ -337,8 +472,31 @@ def _default_out(robot: str, task: str) -> str:
 
 
 def menu_capture(robot: str, task: str, state: dict) -> None:
-    """采集：只问该问的。每步都能 b 返回上一级。"""
+    """采集：只问该问的。每步都能 b 返回上一级。
+
+    第一问是**采集预设**（如果任务配置里定义了）—— 选一次就锁定全部参数，
+    保证多批次数据格式对齐。不选预设才逐项手选（保留给回放/针对性采集）。
+    """
     print(f"\n{_c('=== 采集 ===', BOLD)}")
+
+    try:
+        task_cfg = load_task_config(robot, task)
+    except Exception:  # noqa: BLE001
+        task_cfg = None
+    presets = dict(getattr(task_cfg, "capture_presets", None) or {}) if task_cfg else {}
+
+    # ---- 预设优先 ----
+    if presets:
+        opts = [(k, f"{k:12s} {v.get('desc', '')}") for k, v in presets.items()]
+        opts.append(("__manual__", "逐项手选（回放/针对性采集）"))
+        sel = pick("采集预设（推荐：多批次数据格式一致）", opts,
+                   state.get("preset_idx", 1), allow_back=True)
+        if sel in (BACK, "quit"):
+            return
+        if sel != "__manual__":
+            _do_capture_with_preset(robot, task, sel, presets[sel], state)
+            return
+
     all_what = ["camera", "joint", "ee", "object"]
     desc = {
         "camera": "相机 RGB-D（同时采内参）",
@@ -351,10 +509,6 @@ def menu_capture(robot: str, task: str, state: dict) -> None:
     state["what"] = what
 
     camera = ""
-    try:
-        task_cfg = load_task_config(robot, task)
-    except Exception:  # noqa: BLE001
-        task_cfg = None
     if "camera" in what:
         try:
             cams = [c.name for c in (task_cfg.cameras or ())] if task_cfg else []
@@ -363,14 +517,12 @@ def menu_capture(robot: str, task: str, state: dict) -> None:
         if not cams:
             _log("WARN 该任务没配相机，跳过相机")
         else:
-            opts = [(c, c) for c in cams]
+            opts_c = [(c, c) for c in cams]
             if len(cams) > 1:
-                opts.append(("all", f"全部（{len(cams)} 个）"))
-            camera = pick("选择相机", opts, 1 if len(cams) == 1 else len(opts),
+                opts_c.append(("all", f"全部（{len(cams)} 个）"))
+            camera = pick("选择相机", opts_c, 1 if len(cams) == 1 else len(opts_c),
                           allow_back=True)
-            if camera == BACK:
-                return
-            if camera == "quit":
+            if camera in (BACK, "quit"):
                 return
 
     # every 的实际帧率 = 物理步频 / every；步频来自任务配置（对应场景资产）

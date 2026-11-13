@@ -451,7 +451,10 @@ exts/fasim.replicator.sdg/
 │   ├── TOPIC_CAPTURE_SETUP.md
 │   ├── benchmark-vs-topic-capture.md
 │   ├── colleague-dataset-analysis.md      ← 同事 data-collector-platform 数据体检
-│   └── analysis_dcp_dataset.py            上文的复现脚本
+│   ├── analysis_dcp_dataset.py            上文的复现脚本
+│   ├── data-organization-and-batch.md     ← 目录结构 / 采集预设 / 批量处理
+│   ├── frame-duplication-metrics.md       数据判据方法论（别用均值判重复）
+│   └── ACT_TRAINING_ROADMAP.md            ACT 训练与推理路线
 ├── fasim/replicator/sdg/
 │   ├── live_capture.py           ← 实际采集逻辑（由扩展调用）
 │   ├── live_replay.py            同实例回放（joints / ee）

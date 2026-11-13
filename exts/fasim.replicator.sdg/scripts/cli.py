@@ -119,6 +119,41 @@ def _pick(title: str, options: list[tuple[str, str]], default: int = 1) -> str:
         _log(f"无效选择 {ans!r}")
 
 
+def _pick_multi_what(all_what: list[str], default: list[str] | None) -> list[str] | None:
+    """交互式多选「采什么」。
+
+    复用 sdg_menu 的 TTY 多选框（方向键 + 空格）。这样 CLI 和菜单的交互一致，
+    而不是一个用框框、一个用逗号 —— 后者是本次要修掉的问题。
+    """
+    desc = {
+        "camera": "相机 RGB-D（同时采内参）",
+        "joint": "关节角（回放必需）",
+        "ee": "末端位姿（tcp 真值 + 指令）",
+        "object": "交互物体位姿",
+    }
+    opts = [(w, f"{w:8s} {desc.get(w, w)}") for w in all_what]
+    try:
+        import importlib.util
+        from pathlib import Path as _P
+
+        menu_path = _P(__file__).with_name("sdg_menu.py")
+        spec = importlib.util.spec_from_file_location("_sdg_menu_pick", menu_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        picked = mod.pick_multi("采集项（空格勾选，回车确认）", opts, default=default)
+        return [str(x) for x in picked]
+    except Exception as exc:  # noqa: BLE001
+        # 兜底：极端情况下退回文本输入，不比现在更差
+        _log(f"WARN 多选框不可用（{exc}），退回文本输入")
+        print("\n采什么（逗号分隔，回车=全部）")
+        for i, (w, d) in enumerate(opts, 1):
+            print(f"  {i}) {d}")
+        ans = _ask("选择", ",".join(str(i + 1) for i in range(len(opts))))
+        out = [opts[int(t) - 1][0] for t in ans.split(",")
+               if t.strip().isdigit() and 1 <= int(t) <= len(opts)]
+        return out or list(all_what)
+
+
 def _isaac_pids() -> list[int]:
     """找出正在跑的 Isaac Sim 进程（Kit 主进程）。
 
@@ -248,6 +283,31 @@ def cmd_capture(args: argparse.Namespace) -> int:
         return 1
     task = args.task or _pick("任务", [(t, t) for t in tasks])
 
+    # --- 载入任务配置（预设要用到 cameras/physics_hz，所以提前）---
+    cfg = load_task_config(robot, task, cfg_root)
+    cams = list(getattr(cfg, "cameras", None) or [])
+
+    # --- 采集预设：名字一选，参数全锁定 ---
+    # 这是保证「同任务多批次数据格式对齐」的主要手段 —— 手选参数容易某次
+    # 改了分辨率/every，导致那批数据无法与之前合并（见 capture_profile）。
+    preset_name = getattr(args, "preset", "") or ""
+    preset: dict = {}
+    presets = dict(getattr(cfg, "capture_presets", None) or {})
+    if presets and not preset_name and not getattr(args, "yes", False) \
+            and not args.what and not args.every:
+        # 交互式且未显式给参数 → 让用户选预设
+        opts = [(k, f"{k:12s} {v.get('desc', '')}") for k, v in presets.items()]
+        opts.append(("__manual__", "(不使用预设，逐项手选)"))
+        sel = _pick("采集预设（推荐 —— 保证多批次格式一致）", opts, 1)
+        if sel != "__manual__":
+            preset_name = sel
+    if preset_name:
+        if preset_name not in presets:
+            _log(f"ERROR 未知预设 {preset_name!r}，可选: {list(presets)}")
+            return 1
+        preset = dict(presets[preset_name])
+        _log(f"使用预设 {preset_name}：{preset.get('desc', '')}")
+
     # --- 采什么（camera / joint / ee / object 的任意子集）---
     ALL_WHAT = ["camera", "joint", "ee", "object"]
     if args.what:
@@ -257,31 +317,28 @@ def cmd_capture(args: argparse.Namespace) -> int:
             _log(f"ERROR 未知采集项 {bad}，可选 {ALL_WHAT}")
             return 1
         what = want
+    elif preset.get("what"):
+        what = [str(w) for w in preset["what"] if str(w) in ALL_WHAT]
+        if not what:
+            _log(f"ERROR 预设 {preset_name} 的 what 非法: {preset.get('what')}")
+            return 1
     elif args.yes:
         what = list(ALL_WHAT)
     else:
-        print("\n采什么（逗号分隔，回车=全部）")
-        print("  camera  相机 RGB-D")
-        print("  joint   关节角（回放必需）")
-        print("  ee      末端位姿（tcp）")
-        print("  object  交互物体位姿")
-        ans = _ask("选择", ",".join(ALL_WHAT))
-        what = [w.strip() for w in ans.split(",") if w.strip()]
-        bad = [w for w in what if w not in ALL_WHAT]
-        if bad:
-            _log(f"ERROR 未知采集项 {bad}")
-            return 1
+        what = _pick_multi_what(ALL_WHAT, None)
+        if what is None:
+            return 0
     if "joint" not in what:
         _log("WARN 没选 joint —— 后续不能用 sdg.sh preview 回放自检")
 
     # --- 相机 ---
-    cfg = load_task_config(robot, task, cfg_root)
-    cams = list(getattr(cfg, "cameras", None) or [])
-
     if "camera" not in what:
         camera = ""  # 不采相机
     elif args.camera:
         camera = args.camera
+    elif preset.get("camera"):
+        camera = str(preset["camera"])
+        _log(f"  相机（来自预设）: {camera}")
     else:
         opts = [(c.name, f"{c.name:14s} {c.resolution[0]}x{c.resolution[1]}") for c in cams]
         if len(cams) > 1:
@@ -299,6 +356,21 @@ def cmd_capture(args: argparse.Namespace) -> int:
     phys_hz = getattr(cfg, "physics_hz", None)
     if args.every:
         every = args.every
+    elif preset.get("every"):
+        # 预设直接给了物理步数
+        every = max(1, int(preset["every"]))
+        _log(f"  every={every}（来自预设）")
+    elif preset.get("target_fps"):
+        # 预设给的是目标帧率 → 按本任务 physics_hz 反推（换场景也不会错）
+        tgt = float(preset["target_fps"])
+        if phys_hz:
+            every = max(1, int(round(phys_hz / tgt)))
+            _log(f"  目标 {tgt:g} fps → every={every}"
+                 f"（{phys_hz:g} Hz / {every} = {phys_hz/every:.1f} fps，来自预设）")
+        else:
+            every = 10
+            _log(f"WARN 预设给了 target_fps={tgt:g} 但任务没写 physics_hz，"
+                 f"退回 every={every}")
     else:
         if phys_hz:
             hz_note = f"物理步频 {phys_hz:g} Hz（任务配置 record.physics_hz）"
@@ -336,15 +408,22 @@ def cmd_capture(args: argparse.Namespace) -> int:
     # --- 分辨率 ---
     if args.width and args.height:
         width, height = args.width, args.height
+    elif preset.get("width") and preset.get("height"):
+        width, height = int(preset["width"]), int(preset["height"])
+        _log(f"  分辨率 {width}x{height}（来自预设）")
     else:
         sel = _pick("分辨率", [("cfg", "用配置默认"), ("small", "320x240 (省开销)")])
         width = 320 if sel == "small" else None
         height = 240 if sel == "small" else None
 
     # --- 深度 ---
-    depth = args.depth if args.depth is not None else (
-        _pick("深度图", [("y", "要（推荐）"), ("n", "不要（更省）")]) == "y"
-    )
+    if args.depth is not None:
+        depth = args.depth
+    elif "depth" in preset:
+        depth = bool(preset["depth"])
+        _log(f"  深度图 {'开' if depth else '关'}（来自预设）")
+    else:
+        depth = _pick("深度图", [("y", "要（推荐）"), ("n", "不要（更省）")]) == "y"
 
     # --- 输出 ---
     default_out = runtime.default_session_dir(robot, task)
@@ -360,6 +439,8 @@ def cmd_capture(args: argparse.Namespace) -> int:
     print(" 准备开始采集")
     print(f"  机器人   : {robot}")
     print(f"  任务     : {task}")
+    if preset_name:
+        print(f"  预设     : {preset_name}  ({preset.get('desc', '')})")
     print(f"  采集项   : {','.join(what)}")
     if "camera" not in what:
         cam_desc = "不采"
@@ -390,6 +471,8 @@ def cmd_capture(args: argparse.Namespace) -> int:
         "record_joints": "joint" in what,
         "record_ee": "ee" in what,
         "record_objects": "object" in what,
+        # 预设名 —— 写进 session.json，方便回溯「这批数据是哪个预设采的」
+        "preset": preset_name or "",
     }
     if width and height:
         req["width"], req["height"] = width, height
@@ -778,20 +861,66 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    """把采集会话导出成 LeRobot 数据集（v3.0）。"""
+    """把采集会话导出成 LeRobot 数据集（v3.0）。
+
+    支持批量：``--session`` 给**任务目录**（如
+    ``~/fasim_data/unitree_g1d/sinopec_test_tube``）时，会把该任务下所有
+    会话合并成**一个数据集的多条 episode** —— 这正是「一个任务、多次采集、
+    一个训练集」的用法。
+
+    输出目录名字会自动带上 episode 数，便于区分单条 vs 批量导出。
+    """
     from fasim.replicator.sdg import export_lerobot as ex
 
-    session = Path(args.session).expanduser()
-    if not session.is_dir():
-        _log(f"ERROR 会话目录不存在: {session}")
-        _explain_missing_path(session, want="session.json")
+    sessions = _expand_sessions(args.session)
+    if not sessions:
+        _log(f"ERROR 没找到采集会话: {args.session}")
+        _explain_missing_path(Path(args.session).expanduser(), want="session.json")
         return 1
-    out = Path(args.out).expanduser() if args.out else (
-        Path.home() / "lerobot_datasets" / session.name
-    )
+
+    root = Path(args.session).expanduser()
+    batch = len(sessions) > 1 or not ((root / "frames").is_dir()
+                                      or (root / "session.json").is_file())
+
+    # ---- 批量合并前的参数一致性守门 ----
+    # 只有参数一致时才能把多个 run 合成一个数据集；否则 feature 定义冲突、
+    # 或时间轴混乱（静默成功，训出来的策略无法解释）。
+    if len(sessions) > 1:
+        from fasim.replicator.sdg import capture_profile as cp
+
+        rep = cp.compare(sessions)
+        print()
+        print(cp.format_report(rep))
+        print()
+        if not rep.ok:
+            _log("ERROR 采集参数不一致，已中止（加 --allow-mismatch 可强制合并，"
+                 "但训练结果将不可解释）")
+            if not getattr(args, "allow_mismatch", False):
+                return 1
+            _log("WARN --allow-mismatch 已指定，继续合并（后果自负）")
+
+    # 默认输出目录：单会话用会话名；批量用「任务目录名」（如 sinopec_test_tube）
+    if args.out:
+        out = Path(args.out).expanduser()
+    elif batch:
+        stem = root.name if root.is_dir() else sessions[0].parent.name
+        out = Path.home() / "lerobot_datasets" / f"{stem}_{len(sessions)}eps"
+    else:
+        out = Path.home() / "lerobot_datasets" / sessions[0].name
+
+    if batch:
+        _log(f"批量导出：{len(sessions)} 个会话 → 一个数据集（{len(sessions)} episode）")
+        for s in sessions:
+            _log(f"  · {s.name}")
+        if not getattr(args, "yes", False):
+            ans = _ask(f"合并导出到 {out}？ [Y/n]", "Y")
+            if ans.lower() not in ("", "y", "yes"):
+                _log("已取消")
+                return 0
+
     try:
         res = ex.export_session(
-            session, out,
+            sessions if batch else sessions[0], out,
             repo_id=args.repo_id or None,
             fps=args.fps or None,
             robot_type=args.robot_type or None,
@@ -805,8 +934,8 @@ def cmd_export(args: argparse.Namespace) -> int:
         _log(f"ERROR {exc}")
         return 1
     _log(f"导出完成: {res['out']}")
-    _log(f"  {res['frames']} 帧  features={res['features']}")
-    _log(f"  加载方式: LeRobotDataset(repo_id='{session.name}', root='{res['out']}')")
+    _log(f"  {res['frames']} 帧 / {res.get('episodes', 1)} episode  features={res['features']}")
+    _log(f"  加载方式: LeRobotDataset(repo_id='{out.name}', root='{res['out']}')")
     return 0
 
 
@@ -1202,22 +1331,101 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _expand_sessions(path_str: str) -> list[Path]:
+    """把用户给的路径展开成「一个或多个采集会话目录」。
+
+    支持三种输入：
+
+    1. **单个会话**：含 ``frames/`` 或 ``session.json`` → 原样返回
+    2. **任务批次目录**：直下一层有多个会话（如
+       ``~/fasim_data/unitree_g1d/sinopec_test_tube/`` 下的 ``run_03``/``run_04``）
+       → 返回全部子会话（按名字排序）
+    3. **机器人目录**：再下一层是任务（``unitree_g1d/sinopec_test_tube``）
+       → 递归收集所有任务下的所有会话
+
+    判定「是会话」的依据：目录里有 ``frames/``、``session.json`` 或
+    ``episode.npz`` 之一。这样 run_XX / bench01 这类命名都能认出来，
+    不依赖命名约定。
+
+    返回空列表表示没找到。
+    """
+    root = Path(path_str).expanduser()
+    if not root.is_dir():
+        return []
+
+    def is_session(d: Path) -> bool:
+        return ((d / "frames").is_dir()
+                or (d / "session.json").is_file()
+                or (d / "episode.npz").is_file())
+
+    if is_session(root):
+        return [root]
+
+    # 广度优先收集：先看直下，再看下一层
+    direct = sorted(p for p in root.iterdir() if p.is_dir() and is_session(p))
+    if direct:
+        return direct
+
+    # 机器人目录 → 任务目录 → 会话
+    nested: list[Path] = []
+    for task_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        nested.extend(sorted(p for p in task_dir.iterdir()
+                             if p.is_dir() and is_session(p)))
+    return nested
+
+
+def _resolve_batch(args, label: str) -> list[Path] | None:
+    """解析批量目标并打印清单。返回 None 表示应中止。"""
+    sessions = _expand_sessions(args.session)
+    if not sessions:
+        _log(f"ERROR 没找到采集会话: {args.session}")
+        _explain_missing_path(Path(args.session).expanduser(), want="session.json")
+        return None
+    if len(sessions) > 1:
+        _log(f"批量 {label}：{len(sessions)} 个会话")
+        for s in sessions:
+            n = len(list((s / "frames").glob("frame_*.npz"))) if (s / "frames").is_dir() else 0
+            _log(f"  · {s.name}  ({n} 帧)")
+        if getattr(args, "yes", False) is False:
+            ans = _ask(f"对以上 {len(sessions)} 个会话执行 {label}？ [Y/n]", "Y")
+            if ans.lower() not in ("", "y", "yes"):
+                _log("已取消")
+                return None
+    return sessions
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
-    """采集会话 → episode npz（层2 能读的格式）。"""
+    """采集会话 → episode npz（层2 能读的格式）。
+
+    支持批量：``--session`` 给任务目录（含多个 run）会逐个处理。
+    """
     from fasim.replicator.sdg import pack
 
-    try:
-        out = pack.pack_episode(
-            args.session,
-            out_path=args.out or None,
-            frame_dt=args.frame_dt or None,
-            robot_key=getattr(args, "robot", "") or None,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log(f"ERROR {exc}")
+    sessions = _resolve_batch(args, "pack")
+    if sessions is None:
         return 1
-    print(f"episode: {out}")
-    return 0
+
+    ok = fail = 0
+    for s in sessions:
+        try:
+            out = pack.pack_episode(
+                s,
+                out_path=(args.out or None) if len(sessions) == 1 else None,
+                frame_dt=args.frame_dt or None,
+                robot_key=getattr(args, "robot", "") or None,
+            )
+            if len(sessions) == 1:
+                print(f"episode: {out}")
+            else:
+                _log(f"  ✓ {s.name} → {Path(out).name}")
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  ✗ {s.name}: {exc}")
+            fail += 1
+
+    if len(sessions) > 1:
+        _log(f"pack 完成：成功 {ok}，失败 {fail}")
+    return 0 if fail == 0 else 1
 
 
 def cmd_preview(args: argparse.Namespace) -> int:
@@ -1368,24 +1576,43 @@ def _preview_ee(ep: Path, args: argparse.Namespace) -> int:
 
 
 def cmd_trim(args: argparse.Namespace) -> int:
-    """把连续采集切成任务片段，剔除待机段。"""
+    """把连续采集切成任务片段，剔除待机段。
+
+    支持批量：``--session`` 给任务目录会逐个处理。
+    """
     from fasim.replicator.sdg import trim
 
-    try:
-        report = trim.trim_session(
-            args.session,
-            threshold=args.threshold,
-            pad_sec=args.pad,
-            min_len_sec=args.min_len,
-            merge_gap_sec=args.merge_gap,
-            write=args.write,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log(f"ERROR {exc}")
+    sessions = _resolve_batch(args, "trim")
+    if sessions is None:
         return 1
+
+    ok = fail = 0
+    reports = []
+    for s in sessions:
+        try:
+            report = trim.trim_session(
+                s,
+                threshold=args.threshold,
+                pad_sec=args.pad,
+                min_len_sec=args.min_len,
+                merge_gap_sec=args.merge_gap,
+                write=args.write,
+            )
+            if len(sessions) > 1:
+                seg = (report or {}).get("segments") or []
+                _log(f"  ✓ {s.name}: {len(seg)} 段")
+            reports.append(report)
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            _log(f"  ✗ {s.name}: {exc}")
+            fail += 1
+
     if args.json:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
-    return 0
+        print(json.dumps(reports if len(sessions) > 1 else (reports[0] if reports else {}),
+                         indent=2, ensure_ascii=False))
+    if len(sessions) > 1:
+        _log(f"trim 完成：成功 {ok}，失败 {fail}")
+    return 0 if fail == 0 else 1
 
 
 def cmd_live(args: argparse.Namespace) -> int:
@@ -1608,6 +1835,9 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("capture", help="交互式开始采集（推荐）")
     c.add_argument("--robot", default="")
     c.add_argument("--task", default="")
+    c.add_argument("--preset", default="",
+                   help="采集预设名（任务配置 capture_presets 下定义）。"
+                        "用预设可保证多批次数据格式一致")
     c.add_argument("--camera", default="", help="相机名，逗号分隔；空=全部")
     c.add_argument("--what", default="",
                    help="采什么：camera,joint,ee,object 的逗号子集；空=全部")
@@ -1649,6 +1879,10 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("--overwrite", action="store_true", help="输出目录已存在时清空")
     ex.add_argument("--lerobot-python", default="",
                     help="能 import lerobot 的 python；留空自动找")
+    ex.add_argument("-y", "--yes", action="store_true",
+                    help="批量导出时不询问确认（脚本/CI 用）")
+    ex.add_argument("--allow-mismatch", dest="allow_mismatch", action="store_true",
+                    help="批量合并时允许采集参数不一致（危险：时间轴/feature 会错乱）")
     ex.add_argument(
         "--action-space", dest="action_space", default="absolute",
         choices=["absolute", "delta", "ee_delta"],
@@ -1690,6 +1924,7 @@ def main(argv: list[str] | None = None) -> int:
         help="机器人 key，用于读 configs/<robot>/robot.yaml 的 planning 段"
         "（决定反算末端指令位姿用哪份 URDF）。留空自动从会话目录猜",
     )
+    p.add_argument("-y", "--yes", action="store_true", help="批量时跳过确认")
     p.set_defaults(func=cmd_pack)
 
     v = sub.add_parser("preview", help="用层2 回放路径预览 episode（需 Isaac python）")
@@ -1710,7 +1945,7 @@ def main(argv: list[str] | None = None) -> int:
     v.set_defaults(func=cmd_preview)
 
     t = sub.add_parser("trim", help="把连续采集切成任务片段，剔除待机段")
-    t.add_argument("session", help="会话目录")
+    t.add_argument("session", help="会话目录，或任务目录（批量处理该任务下所有会话）")
     t.add_argument("--threshold", type=float, default=0.01,
                    help="关节角变化率阈值 rad/s（默认 0.01）")
     t.add_argument("--pad", type=float, default=1.0, help="每段前后缓冲秒数")
@@ -1719,6 +1954,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="两段间隔短于此秒数则合并")
     t.add_argument("--write", action="store_true", help="真的写出 segment_*.npz")
     t.add_argument("--json", action="store_true", help="额外打印完整 JSON 报告")
+    t.add_argument("-y", "--yes", action="store_true", help="批量时跳过确认")
     t.set_defaults(func=cmd_trim)
 
     lv = sub.add_parser("live", help="在同一 Isaac 实例里回放 episode（不弹新窗口）")

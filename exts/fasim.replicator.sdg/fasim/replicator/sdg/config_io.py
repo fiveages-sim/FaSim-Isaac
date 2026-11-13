@@ -181,6 +181,10 @@ def load_task_config(
             physics_hz=_parse_physics_hz(record),
             physics_hz_wall_baseline=_parse_wall_baseline(record),
             max_frames=int(record.get("max_frames", 2000)),
+            capture_presets={
+                str(k): dict(v) for k, v in (raw.get("capture_presets") or {}).items()
+                if isinstance(v, dict)
+            },
             variant_selection={str(k): str(v) for k, v in (raw.get("variant_selection") or {}).items()},
         )
     except KeyError as exc:
