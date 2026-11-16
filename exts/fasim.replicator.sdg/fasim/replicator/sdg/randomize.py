@@ -127,6 +127,41 @@ def get_pose(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
         return None
 
 
+def _get_pose_xform_fallback(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Isaac 内 RigidPrim 读不到时的补充路径：USD Xform 世界位姿。
+
+    **仅用于静态/非物理驱动 prim**（如架子本身在 authoring stage 上的位姿）。
+    对物理驱动的刚体，USD 值可能是 stale（newton kit 关了同步），
+    所以它只作 fallback，且调用方应知道精度可能不足。
+    """
+    try:
+        import omni.usd
+        from pxr import UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return None
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            return None
+        xf = UsdGeom.Xformable(prim)
+        if not xf:
+            return None
+        m = xf.ComputeLocalToWorldTransform(0.0)
+        t = m.ExtractTranslation()
+        q = m.ExtractRotationQuat()
+        pos = np.array([t[0], t[1], t[2]], dtype=np.float64)
+        # GfQuatd: (real, imaginary) → wxyz
+        im = q.GetImaginary()
+        quat = np.array([q.GetReal(), im[0], im[1], im[2]], dtype=np.float64)
+        n = np.linalg.norm(quat)
+        if n > 1e-9:
+            quat = quat / n
+        return pos, quat
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def set_pose_service(prim_path: str, pos: np.ndarray, quat: np.ndarray,
                      *, zero_velocity: bool = True) -> bool:
     """通过 ``/set_entity_state`` 服务设刚体位姿（**外部进程也能用**）。
@@ -177,44 +212,103 @@ def set_pose_service(prim_path: str, pos: np.ndarray, quat: np.ndarray,
         return False
 
 
+def set_pose_usd_api(prim_path: str, pos: np.ndarray, quat: np.ndarray) -> bool:
+    """**在 Isaac 进程内**用 USD API 直接写 prim 的世界位姿。
+
+    与 RigidPrim 的区别：RigidPrim 写的是 PhysX 状态（会被物理改写）；
+    USD API 写的是 stage（下一帧物理会读它作为初值）。
+    在 randomize 这种「先摆位置再让物理 settle」的场景里，
+    写 USD 更符合语义，而且**同步、无阻塞**。
+    """
+    try:
+        import omni.usd
+        from pxr import Gf, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return False
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            return False
+        xf = UsdGeom.Xformable(prim)
+        if not xf:
+            return False
+
+        # 父级世界变换的逆，用于把世界位姿换算成局部
+        parent = prim.GetParent()
+        parent_inv = Gf.Matrix4d(1.0)
+        if parent and parent.IsValid():
+            pxf = UsdGeom.Xformable(parent)
+            if pxf:
+                parent_inv = pxf.ComputeLocalToWorldTransform(0.0).GetInverse()
+
+        m = Gf.Matrix4d(1.0)
+        m.SetTranslate(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+        m.SetRotateOnly(Gf.Quatd(float(quat[0]),
+                                 Gf.Vec3d(float(quat[1]), float(quat[2]), float(quat[3]))))
+        local = m * parent_inv
+
+        t = local.ExtractTranslation()
+        q = local.ExtractRotationQuat()
+
+        ops = {op.GetOpName(): op for op in xf.GetOrderedXformOps()}
+        t_op = ops.get("xformOp:translate")
+        if t_op is None:
+            t_op = xf.AddTranslateOp()
+        t_op.Set(Gf.Vec3d(t[0], t[1], t[2]))
+        q_op = ops.get("xformOp:orient")
+        if q_op is None:
+            q_op = xf.AddOrientOp()
+        q_op.Set(Gf.Quatf(q.GetReal(), Gf.Vec3f(q.GetImaginary())))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN USD 写位姿失败 {prim_path}: {exc}")
+        return False
+
+
 def set_pose(prim_path: str, pos: np.ndarray, quat: np.ndarray,
              *, zero_velocity: bool = True) -> bool:
-    """写刚体世界位姿（优先 Isaac 内 RigidPrim，失败退回 ROS 服务）。
+    """写世界位姿（Isaac 内优先 USD API，外部退回 ROS 服务）。
 
-    ``zero_velocity``：**必须清零速度**（默认开）。
-    只设位姿不清速度时，物体保留着「上一轮被机器人拿着移动」的线速度/角速度，
-    下一帧物理一跑就被甩出去 —— 实测试管就是这么崩飞的。
+    ``zero_velocity``：清零速度。只设位姿不清速度时，物体会保留上一轮
+    被机器人握着移动的速度，下一帧物理一跑就甩出去（实测试管崩飞）。
+
+    **为什么 Isaac 内不用服务**：randomize 从 app.update() 回调里调用，
+    主循环被占用，ROS 服务拿不到响应（实测超时 → 静默失败 → 试管不动）。
     """
-    # 先试 Isaac 内的高效路径
+    # 1) Isaac 内：USD API（同步、不阻塞）
+    if set_pose_usd_api(prim_path, pos, quat):
+        if zero_velocity:
+            _zero_velocity_isaac(prim_path)
+        return True
+    # 2) 外部进程：ROS 服务
+    return set_pose_service(prim_path, pos, quat, zero_velocity=zero_velocity)
+
+
+def _zero_velocity_isaac(prim_path: str) -> None:
+    """Isaac 内清零刚体速度（RigidPrim 接口，逐版本兼容）。"""
     try:
         rp = _rigid(prim_path)
-        rp.set_world_poses(
-            positions=np.asarray(pos, dtype=np.float64).reshape(1, 3),
-            orientations=np.asarray(quat, dtype=np.float64).reshape(1, 4),
-        )
-        if zero_velocity:
-            for meth, args in (
-                ("set_linear_velocities", (np.zeros((1, 3)),)),
-                ("set_velocities", (np.zeros((1, 6)),)),
-            ):
-                fn = getattr(rp, meth, None)
-                if fn is None:
-                    continue
-                try:
-                    fn(*args)
-                    break
-                except Exception:  # noqa: BLE001
-                    continue
-            fn = getattr(rp, "set_angular_velocities", None)
-            if fn is not None:
-                try:
-                    fn(np.zeros((1, 3)))
-                except Exception:  # noqa: BLE001
-                    pass
-        return True
-    except Exception:
-        # 外部进程（无 isaacsim）→ 走 ROS 服务
-        return set_pose_service(prim_path, pos, quat, zero_velocity=zero_velocity)
+    except Exception:  # noqa: BLE001
+        return
+    for meth, args in (
+        ("set_linear_velocities", (np.zeros((1, 3)),)),
+        ("set_velocities", (np.zeros((1, 6)),)),
+    ):
+        fn = getattr(rp, meth, None)
+        if fn is None:
+            continue
+        try:
+            fn(*args)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    fn = getattr(rp, "set_angular_velocities", None)
+    if fn is not None:
+        try:
+            fn(np.zeros((1, 3)))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _quat_mul_wxyz(a, b) -> np.ndarray:
@@ -323,8 +417,52 @@ def _call_service(srv_type, srv_name: str, request, *, timeout: float = 5.0):
         return None
 
 
+def _read_xform_via_usd_api(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """**在 Isaac 进程内**直接用 USD API 读局部 TRS（不经 ROS，最快最可靠）。
+
+    为什么必须这么做：sdg 的 randomize 是从 ``app.update()`` 回调里调用的，
+    此时 **Isaac 主循环正被占用**，任何 ROS 服务调用（``spin_once`` 等）都拿
+    不到响应 —— 实测报 ``WARN 服务超时: /get_prim_attribute``，导致 hole_4
+    读不到、试管被跳过（看起来就是"试管没跟着架子走、躺在桌子旁边"）。
+
+    直接查 USD stage 没有这个问题：它就是在当前线程同步返回。
+    """
+    try:
+        import omni.usd
+        from pxr import UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return None
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            return None
+        xf = UsdGeom.Xformable(prim)
+        if not xf:
+            return None
+        # 按 xformOpOrder 顺序合成局部 TRS
+        t = np.zeros(3, dtype=np.float64)
+        q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        s = np.ones(3, dtype=np.float64)
+        for op in xf.GetOrderedXformOps():
+            name = op.GetOpName()
+            val = op.Get()
+            if "translate" in name:
+                t = np.asarray(val, dtype=np.float64).reshape(3)
+            elif "orient" in name:
+                v = np.asarray(val, dtype=np.float64).reshape(-1)[:4]
+                # UsdGeomXformOp 的 orient 是 (real, i, j, k) = wxyz，与我们要的一致
+                n = np.linalg.norm(v)
+                q = v / n if n > 1e-9 else q
+            elif "scale" in name:
+                s = np.asarray(val, dtype=np.float64).reshape(3)
+        return t, q, s
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """通过 ``/get_prim_attribute`` 服务读一个 prim 的**局部** TRS。
+    """读一个 prim 的**局部** TRS。优先 USD API，退回 ROS 服务（带缓存）。
 
     为什么走服务而不是 XformPrim：newton kit 关了 PhysX→USD 同步
     （DEBUG_LOG #1），XformPrim 在本环境读到的是 stale/无效值。
@@ -332,8 +470,6 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
     **缓存**：authoring stage 的局部 TRS 在仿真期间**不会变**（随机化只改
     PhysX，不写 USD），所以按 prim_path 缓存，避免每次读都等服务、spin ——
     那是「随机化卡顿」的来源（每次读 3 个属性 × 若干 prim × 等 100ms）。
-
-    缓存失效：只有重启 Isaac / 重载场景才会变，进程内不必担心。
 
     Returns:
         ``(translate(3), orient_wxyz(4), scale(3))``；读不到返回 None。
@@ -345,6 +481,13 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
     if prim_path in cache:
         return cache[prim_path]
 
+    # 1) Isaac 进程内：直接用 USD API（同步、无阻塞）
+    out = _read_xform_via_usd_api(prim_path)
+    if out is not None:
+        cache[prim_path] = out
+        return out
+
+    # 2) 外部进程：走 ROS 服务
     try:
         import json as _json
 
@@ -423,10 +566,26 @@ def get_pose_service(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
 
 
 def get_pose_any(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
-    """优先 Isaac 内 RigidPrim（快），失败退回 ROS 服务（外部进程可用）。"""
+    """读世界位姿，按「Isaac 内优先，外部退回服务」的顺序尝试。
+
+    顺序：
+      1. RigidPrim（Isaac 内，物理真值，最快）
+      2. USD Xform（Isaac 内，静态 prim 的兜底）
+      3. ROS /get_entity_state（外部进程）
+
+    **为什么 Isaac 内不能走服务**：sdg 的 randomize 从 ``app.update()``
+    回调里调用，主循环被占用，ROS 服务拿不到响应（实测 ``服务超时:
+    /get_prim_attribute``，导致 tube 被跳过）。所以在 Isaac 里必须用
+    同步的 USD / PhysX 接口。
+    """
     got = get_pose(prim_path)
     if got is not None:
         return got
+    # Isaac 内：USD 兜底
+    got = _get_pose_xform_fallback(prim_path)
+    if got is not None:
+        return got
+    # 外部进程：ROS 服务
     return get_pose_service(prim_path)
 
 
