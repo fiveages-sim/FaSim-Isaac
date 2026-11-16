@@ -693,7 +693,7 @@ def menu_randomize(robot: str, task: str, state: dict) -> None:
     挑位置后手动开始采集（半自动数采）。
 
     每次都从「初始快照位姿 + 随机偏移」算起，所以：
-      - 第一次用必须先「记录初始位姿」（本菜单第 1 项会自动检测并提示）
+      - 第一次用必须先「记录初始位姿」（本菜单第一项会自动检测并提示）
       - 反复随机不会累积漂移（每次都从快照重新算）
     """
     from fasim.replicator.sdg import config_io
@@ -736,16 +736,16 @@ def menu_randomize(robot: str, task: str, state: dict) -> None:
     if has_snap:
         print(f"{GREEN}  初始位姿快照: 已有{NC} {DIM}({snap}){NC}")
     else:
-        print(f"{_c('  初始位姿快照: 还没有 —— 先选「1) 记录初始位姿」', YELLOW)}")
+        print(f"{_c('  初始位姿快照: 还没有 —— 先选「记录初始位姿」', YELLOW)}")
 
     while True:
         sel = pick(
             "操作",
             [
-                ("snapshot", "1) 记录初始位姿（第一轮前必须做一次）"),
-                ("once", "2) 随机一次（看效果）"),
-                ("multi", "3) 连续随机 N 次（验证会不会崩）"),
-                ("range", "4) 改随机范围（临时，不改 yaml）"),
+                ("snapshot", "记录初始位姿（第一轮前必须做一次）"),
+                ("once", "随机一次（看效果）"),
+                ("multi", "连续随机 N 次（验证会不会崩）"),
+                ("range", "改随机范围（临时，不改 yaml）"),
             ],
             2 if has_snap else 1,
             allow_back=True,
@@ -760,14 +760,14 @@ def menu_randomize(robot: str, task: str, state: dict) -> None:
 
         if sel == "once":
             if not has_snap:
-                _log(f"{_c('先记录初始位姿（第 1 项）', YELLOW)}")
+                _log(f"{_c('先记录初始位姿（第一项）', YELLOW)}")
                 continue
             run([str(SDG_SH), "randomize", "--robot", robot, "--task", task])
             continue
 
         if sel == "multi":
             if not has_snap:
-                _log(f"{_c('先记录初始位姿（第 1 项）', YELLOW)}")
+                _log(f"{_c('先记录初始位姿（第一项）', YELLOW)}")
                 continue
             n = ask("连续随机几轮", "10")
             try:

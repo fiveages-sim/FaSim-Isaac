@@ -139,15 +139,42 @@ class TaskSpec:
     randomize:
       seed: 0                    # 0 = 每次用时间戳
       settle_steps: 60           # 设完位姿后让物理跑多少步（200Hz 下 60=0.3s）
-      verify_tol_m: 0.05         # 读回验证容差（set_world_poses 可能被物理改写）
+      verify_tol_m: 0.05         # 读回验证容差
       objects:
-        # 试管架：只在桌面内平移（z 由桌面决定，不要随机）
-        - prim: /World/room/scene/test_tube_rack
-          axes: {x: 0.04, y: 0.03}
-        # 架上的试管：跟着架子一起搬（保持相对位置，避免穿模/甩飞）
+        # ① 随机平移（axes）
+        - prim: /World/room/scene/test_tube_rack_01
+          axes: {x: 0.03, y: 0.03}
+        # ② 精确放进某个子 frame（place_on）—— 如「插进孔里」
         - prim: /World/room/scene/test_tube
-          follow: /World/room/scene/test_tube_rack
+          place_on:
+            target: /World/room/scene/test_tube_rack_01
+            frame: hole_4
+            offset: [0.0, 0.0, 0.0]
+        # ③ 或跟随另一个物体的平移量（follow）
+        - prim: /World/room/scene/some_other
+          follow: /World/room/scene/test_tube_rack_01
     ```
+
+    **执行顺序**（不需要额外排序字段，天然正确）::
+
+        1) 所有 axes      —— 随机平移
+        2) 所有 follow    —— 跟随另一个物体的偏移量
+        3) 所有 place_on  —— 从目标子 frame 读世界位姿，精确放置
+        4) settle + 读回验证
+
+    所以「先随机架子、再按架子新位置把试管放进孔里」直接写成
+    「架子有 axes、试管有 place_on」即可，不需要配置先后。
+
+    **place_on vs follow**：
+
+    | | 语义 | 适用 |
+    |---|---|---|
+    | ``follow`` | 跟随另一个物体的**平移量** | 刚性组合、相对位置稳定 |
+    | ``place_on`` | 从 target 的**子 frame** 读世界位姿，把物体精确放过去 | 插孔/吸附，**不依赖相对位置** |
+
+    试管任务必须用 ``place_on``：任务结束时试管已被拿走，
+    ``follow`` 只搬平移量、还原不出「在孔里」；而 ``place_on`` 每轮都
+    重新从 ``hole_4`` 读世界位姿，无论架子随机到哪试管都在孔里。
 
     **顺序语义**：每轮总是先「恢复初始快照位姿」再叠加随机偏移。
     任务结尾物体位置和开头往往差很多（被抓到手里、插进孔里），

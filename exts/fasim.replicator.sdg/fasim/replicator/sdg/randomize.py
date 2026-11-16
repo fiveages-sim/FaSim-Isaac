@@ -24,13 +24,30 @@ randomize:
   seed: 0                    # 0 = 每次用时间戳
   settle_steps: 30           # 设完位姿后让物理跑多少步（稳定）
   objects:
-    - prim: /World/room/scene/test_tube_rack
-      restore_from: /World/room/scene/test_tube_rack   # 省略 = 用 initial_poses
-      axes: {x: 0.04, y: 0.03}   # ±范围（米）。未列出 = 不动
+    # ① 先随机化「被插入的架子」
+    - prim: /World/room/scene/test_tube_rack_01
+      axes: {x: 0.04, y: 0.03}
+    # ② 再把试管**放进那个架子的指定孔里**（不随机化，而是精确放置）
     - prim: /World/room/scene/test_tube
-      follow: /World/room/scene/test_tube_rack         # 跟随另一个物体一起搬
-      axes: {}
+      place_on:
+        target: /World/room/scene/test_tube_rack_01
+        frame: hole_4            # 目标的子 frame（USD 局部链里的名字）
+        offset: [0.0, 0.0, 0.0]  # 在 frame 系内的额外偏移（米）
 ```
+
+**``place_on`` vs ``follow`` 的区别（关键）**
+
+| | 语义 | 适用 |
+|---|---|---|
+| `follow: <prim>` | 跟随另一个物体的**平移量** | 两个物体是刚性组合、且已知相对位置 |
+| `place_on: {target, frame}` | 从 target 的**子 frame** 读出世界位姿，把本物体精确放过去 | 需要「插进某个孔 / 吸附到某个插槽」——**不依赖相对位置是否稳定** |
+
+试管任务必须用 `place_on`：任务结束时试管已经被拿走了，`follow` 只能算
+平移量、还原不出「在孔里」这个状态；而 `place_on` 每轮都重新从
+rack_01 的 `hole_4` 读世界位姿，**无论架子被随机到哪，试管都在孔里**。
+
+顺序语义：**先处理 `axes`（随机平移），再处理 `place_on`（精确放置）**。
+这样「先随机架子、再按架子新位置放试管」天然成立，不需要额外排序字段。
 
 ``follow`` 的语义：该物体不单独随机化，而是**跟着 ``follow`` 指定的物体
 平移相同的偏移量**（保持相对布局）。适合「架子上插着试管」这种组合。
@@ -76,6 +93,20 @@ def _to_np(v) -> np.ndarray:
     return a.reshape(a.shape[-1]) if a.ndim else a
 
 
+def _quat_rotate(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """用四元数（w,x,y,z）旋转向量 v。"""
+    q = np.asarray(q_wxyz, dtype=np.float64).reshape(-1)[:4]
+    n = np.linalg.norm(q)
+    if n < 1e-9:
+        return np.asarray(v, dtype=np.float64)
+    w, x, y, z = q / n
+    vv = np.asarray(v, dtype=np.float64).reshape(3)
+    # v' = v + 2w(q_vec × v) + 2 q_vec × (q_vec × v)
+    qv = np.array([x, y, z], dtype=np.float64)
+    t = 2.0 * np.cross(qv, vv)
+    return vv + w * t + np.cross(qv, t)
+
+
 def get_pose(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
     """读刚体世界位姿 → (pos(3), quat_wxyz(4))；失败返回 None。"""
     try:
@@ -108,6 +139,49 @@ def set_pose(prim_path: str, pos: np.ndarray, quat: np.ndarray) -> bool:
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN 写位姿失败 {prim_path}: {exc}")
         return False
+
+
+def get_subframe_world_pose(parent_prim: str, frame: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """读「parent_prim 下的子 frame」的世界位姿 → (pos(3), quat_wxyz(4))。
+
+    为什么需要它：编排的 grasp_id（如 ``hole_4``）就是 rack USD 内部的子
+    frame，代表「孔的中心 + 朝向」。要做「把试管放进这个孔」，就得拿到这个
+    frame 的**世界**位姿，而不是靠猜相对偏移。
+
+    实现：子 frame 是纯 Xform（没有 RigidBodyAPI），所以不能用 RigidPrim
+    读；用 XformPrim 读世界位姿。**注意** newton kit 关了 PhysX→USD 同步
+    （见 DEBUG_LOG #1），但这里 parent 是**静态**场景资产（架子），
+    其 Xform 值在 authoring stage 上是准确的 —— 只有「被物理驱动的刚体」
+    才会读到 stale 值。
+
+    若 parent 本身也被随机平移过，XformPrim 读到的世界位姿会正确包含
+    父级 xformOp:translate 的改动（USD 组合语义）。
+    """
+    try:
+        from isaacsim.core.experimental.prims import XformPrim
+        from isaacsim.core.experimental.utils import backend as backend_utils
+
+        path = f"{parent_prim.rstrip('/')}/{frame}"
+        for backend in ("fabric", "usdrt", None):
+            try:
+                if backend is None:
+                    xp = XformPrim(path, reset_xform_properties=False)
+                    p, q = xp.get_world_poses()
+                else:
+                    with backend_utils.use_backend(backend, raise_on_unsupported=True):
+                        xp = XformPrim(path, reset_xform_properties=False)
+                        p, q = xp.get_world_poses()
+                pos = _to_np(p).reshape(-1)[:3]
+                quat = _to_np(q).reshape(-1)[:4]
+                if np.all(np.isfinite(pos)) and np.all(np.isfinite(quat)):
+                    return pos, quat
+            except Exception:  # noqa: BLE001
+                continue
+        _log(f"WARN 读子 frame 失败 {path}")
+        return None
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 读子 frame 异常 {parent_prim}/{frame}: {exc}")
+        return None
 
 
 # ------------------------------------------------------------------ 配置解析
@@ -147,12 +221,18 @@ def snapshot_path(data_dir: str | Path) -> Path:
 
 
 def save_snapshot(cfg: dict, data_dir: str | Path) -> dict[str, Any]:
-    """记录所有待随机化物体的**当前**世界位姿（第一轮开始前调用一次）。"""
+    """记录所有待随机化物体的**当前**世界位姿（第一轮开始前调用一次）。
+
+    ``place_on`` 的物体不记录 —— 它们每轮都从目标 frame 重新定位，
+    不依赖快照。
+    """
     snap: dict[str, Any] = {"taken_at": time.time(), "objects": {}}
     for obj in (cfg.get("objects") or []):
         prim = str(obj.get("prim") or "")
         if not prim:
             continue
+        if isinstance(obj.get("place_on"), dict):
+            continue          # 由 place_on 决定，不需要快照
         got = get_pose(prim)
         if got is None:
             snap["objects"][prim] = None
@@ -269,6 +349,48 @@ def restore_and_randomize(
                 "follow": src,
                 "offset": [round(float(v), 4) for v in off],
             })
+
+    # ---- 第三遍：place_on —— 把物体**精确放进**目标的子 frame ----
+    #
+    # 这是「插进孔里」的正确做法。与 follow 的区别：
+    #   follow  只搬平移量，依赖「相对位置在快照时就正确」
+    #   place_on 每轮都重新从 target 的子 frame 读**世界**位姿，所以
+    #            无论 target 被随机到哪，本物体都落在目标 frame 上
+    #
+    # 顺序上天然是「先随机架子（第一遍 axes）→ 再按架子新位置放试管」，
+    # 因为本遍在 axes 遍之后执行。
+    for obj in objects:
+        prim = str(obj.get("prim") or "")
+        po = obj.get("place_on")
+        if not prim or not isinstance(po, dict):
+            continue
+        target = str(po.get("target") or "").strip()
+        frame = str(po.get("frame") or "").strip()
+        if not target or not frame:
+            warnings.append(f"{prim}: place_on 需要 target 与 frame 两个字段")
+            continue
+        got = get_subframe_world_pose(target, frame)
+        if got is None:
+            warnings.append(
+                f"{prim}: 读不到 {target}/{frame} 的世界位姿 —— 检查 frame 名是否存在")
+            continue
+        pos, quat = got
+        off = po.get("offset") or [0.0, 0.0, 0.0]
+        try:
+            off_v = np.asarray([float(x) for x in off][:3], dtype=np.float64)
+        except (TypeError, ValueError):
+            off_v = np.zeros(3)
+        if np.any(off_v):
+            # 偏移在 frame 的局部系里，需要旋转到世界系
+            pos = pos + _quat_rotate(quat, off_v)
+        if set_pose(prim, pos, quat):
+            applied.append({
+                "prim": prim,
+                "place_on": f"{target}/{frame}",
+                "target": [round(float(v), 4) for v in pos],
+            })
+            _log(f"  place_on {prim} → {target}/{frame} "
+                 f"pos={np.round(pos, 4).tolist()}")
 
     # ---- 让物理稳定 ----
     n_settle = int(cfg.get("settle_steps", 0) or 0)

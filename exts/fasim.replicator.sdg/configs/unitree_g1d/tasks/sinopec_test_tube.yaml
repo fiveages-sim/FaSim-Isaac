@@ -45,19 +45,27 @@ randomize:
   settle_steps: 60        # 200Hz 下 60 步 = 0.3s，够物体落稳
   verify_tol_m: 0.05      # 读回验证容差
   objects:
-    # 右手边的架子（**试管初始放在这个架子上**）。
-    # 实测：初始时试管离本架 24mm、离对面架 201mm。
+    # ① 右手边的架子（**试管初始放在这个架子上**）
+    #    实测：初始时试管离本架 24mm、离对面架 201mm。
     - prim: /World/room/scene/test_tube_rack_01
       axes: {x: 0.03, y: 0.03}
-    # 左手边的空架子（任务终点：试管被插在这里）
+    # ② 左手边的空架子（任务终点：试管被插在这里）
     - prim: /World/room/scene/test_tube_rack
       axes: {x: 0.04, y: 0.03}
-    # 试管：**跟随它初始所在的架子（01）**一起搬，保持相对位置。
-    # 不写 axes 表示不单独随机，只跟随。
-    # （注意：任务结束时试管会被插到另一只架子上，但每轮随机化都是
-    #   「先恢复到初始快照」再偏移，所以跟随 01 号架始终正确。）
+    # ③ 试管：**精确放进 01 号架的 hole_4**（用 place_on，不是 follow）
+    #
+    # 为什么必须 place_on：
+    #   任务结束时试管已经被拿走/插到另一只架子上，所以「按当前相对位置
+    #   平移」还原不出「在孔里」。place_on 每轮都重新从 rack_01 的 hole_4
+    #   子 frame 读**世界**位姿 —— 无论架子被随机到哪，试管都精确落在孔里。
+    #
+    # 顺序天然正确：place_on 在 axes 之后执行，所以是「先随机架子，
+    # 再按架子新位置放试管」。
     - prim: /World/room/scene/test_tube
-      follow: /World/room/scene/test_tube_rack_01
+      place_on:
+        target: /World/room/scene/test_tube_rack_01
+        frame: hole_4
+        offset: [0.0, 0.0, 0.0]   # 需要微调时在这里加（frame 局部系，米）
 
 # ---------------------------------------------------------------------------
 # 相机
