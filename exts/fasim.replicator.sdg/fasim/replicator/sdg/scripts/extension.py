@@ -189,7 +189,62 @@ def _dispatch(req: dict) -> dict:
 
             return {"ok": True, **live_replay.status()}
 
-        return {"ok": False, "error": f"未知指令 {verb!r}（支持 start/stop/status）"}
+        # ---------------- 物体随机化（自动化采集用） ----------------
+        if verb == "randomize":
+            # 单轮：恢复到初始快照 → 叠加随机偏移 → settle → 读回验证
+            from fasim.replicator.sdg import randomize as rnd
+
+            req.pop("cmd", None)
+            data_dir = str(req.pop("data_dir", "") or "")
+            if not data_dir:
+                return {"ok": False, "error": "缺少 data_dir（存初始位姿快照的目录）"}
+            cfg = req.pop("cfg", None)
+            if cfg is None:
+                # 没给 cfg 就用任务配置里的 randomize 段
+                try:
+                    from fasim.replicator.sdg.config_io import load_task_config
+                    rk = str(req.get("robot_key") or "")
+                    tk = str(req.get("task_key") or "")
+                    if rk and tk:
+                        cfg = rnd.load_config(load_task_config(rk, tk))
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": f"读任务配置失败: {exc}"}
+            if not cfg:
+                return {"ok": False, "error": "没有 randomize 配置（任务 yaml 缺该段）"}
+
+            def _settle(n_steps: int) -> None:
+                import omni.kit.app
+                app = omni.kit.app.get_app()
+                for _ in range(max(0, int(n_steps))):
+                    app.update()
+
+            res = rnd.restore_and_randomize(cfg, data_dir=data_dir, settle_fn=_settle)
+            return {"ok": bool(res.get("ok")), **res}
+
+        if verb == "randomize_snapshot":
+            # 记录初始位姿（第一轮采集开始前调一次）
+            from fasim.replicator.sdg import randomize as rnd
+
+            req.pop("cmd", None)
+            data_dir = str(req.pop("data_dir", "") or "")
+            if not data_dir:
+                return {"ok": False, "error": "缺少 data_dir"}
+            cfg = req.pop("cfg", None)
+            if cfg is None:
+                try:
+                    from fasim.replicator.sdg.config_io import load_task_config
+                    rk = str(req.get("robot_key") or "")
+                    tk = str(req.get("task_key") or "")
+                    if rk and tk:
+                        cfg = rnd.load_config(load_task_config(rk, tk))
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": f"读任务配置失败: {exc}"}
+            if not cfg:
+                return {"ok": False, "error": "没有 randomize 配置"}
+            snap = rnd.save_snapshot(cfg, data_dir)
+            return {"ok": True, "snapshot": snap}
+
+        return {"ok": False, "error": f"未知指令 {verb!r}（支持 start/stop/status/live*/randomize*）"}
     except Exception as exc:  # noqa: BLE001
         import traceback
 

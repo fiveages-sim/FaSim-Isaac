@@ -186,6 +186,7 @@ def load_task_config(
                 if isinstance(v, dict)
             },
             variant_selection={str(k): str(v) for k, v in (raw.get("variant_selection") or {}).items()},
+            randomize=dict(raw.get("randomize") or {}),
         )
     except KeyError as exc:
         raise SdgConfigError(f"{robot_key}/tasks/{task_key}.yaml missing required key {exc}") from exc

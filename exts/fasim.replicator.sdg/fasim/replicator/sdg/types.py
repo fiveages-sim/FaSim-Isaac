@@ -129,6 +129,34 @@ class TaskSpec:
     variant_selection: dict[str, str] = field(default_factory=dict)
     """Variant switches applied to the robot prim before play, e.g. {"ROS": "fiveages"}."""
 
+    randomize: dict = field(default_factory=dict)
+    """运行时物体随机化配置（``randomize`` 段），用于自动化采集。
+
+    **不与具体机器人/任务强绑定** —— 随机化哪些 prim、每个轴的范围、谁跟随谁，
+    全部由这里声明。没有这一段就完全不做随机化（零影响）。
+
+    ```yaml
+    randomize:
+      seed: 0                    # 0 = 每次用时间戳
+      settle_steps: 60           # 设完位姿后让物理跑多少步（200Hz 下 60=0.3s）
+      verify_tol_m: 0.05         # 读回验证容差（set_world_poses 可能被物理改写）
+      objects:
+        # 试管架：只在桌面内平移（z 由桌面决定，不要随机）
+        - prim: /World/room/scene/test_tube_rack
+          axes: {x: 0.04, y: 0.03}
+        # 架上的试管：跟着架子一起搬（保持相对位置，避免穿模/甩飞）
+        - prim: /World/room/scene/test_tube
+          follow: /World/room/scene/test_tube_rack
+    ```
+
+    **顺序语义**：每轮总是先「恢复初始快照位姿」再叠加随机偏移。
+    任务结尾物体位置和开头往往差很多（被抓到手里、插进孔里），
+    直接对当前位置加偏移会把物体甩飞。
+
+    实现在 :mod:`fasim.replicator.sdg.randomize`，
+    可行性验证脚本 ``scripts/verify_randomize.py``。
+    """
+
 
 @dataclass
 class RecordResult:

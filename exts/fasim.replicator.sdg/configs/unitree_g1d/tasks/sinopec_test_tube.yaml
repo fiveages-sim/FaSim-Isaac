@@ -31,6 +31,33 @@ tracked_prims:
   test_tube_rack_01: /World/room/scene/test_tube_rack_01
 
 # ---------------------------------------------------------------------------
+# 运行时物体随机化（自动化采集用）
+# ---------------------------------------------------------------------------
+# 每轮采集前：先把物体**恢复到初始快照位姿**，再叠加随机偏移。
+# （任务结尾物体位置和开头差很多 —— 被抓到手里/插进孔里 —— 直接对当前位置
+#  加偏移会把物体甩飞。所以 restore-then-offset 是必须的。）
+#
+# 可行性先验证：./scripts/sdg.sh randomize-check
+#
+# 字段说明见 fasim/replicator/sdg/types.py 的 TaskSpec.randomize
+randomize:
+  seed: 0                 # 0 = 每次用时间戳
+  settle_steps: 60        # 200Hz 下 60 步 = 0.3s，够物体落稳
+  verify_tol_m: 0.05      # 读回验证容差
+  objects:
+    # 右侧试管架（有试管的那只）：只在桌面内平移。
+    # z 不随机 —— 物体在桌面上，z 由桌面高度决定。
+    - prim: /World/room/scene/test_tube_rack
+      axes: {x: 0.04, y: 0.03}
+    # 左侧空架子：独立随机
+    - prim: /World/room/scene/test_tube_rack_01
+      axes: {x: 0.03, y: 0.03}
+    # 试管：**跟随右架一起搬**（保持插在孔里的相对位置）
+    # 不写 axes 表示它自己不单独随机，只跟随。
+    - prim: /World/room/scene/test_tube
+      follow: /World/room/scene/test_tube_rack
+
+# ---------------------------------------------------------------------------
 # 相机
 # ---------------------------------------------------------------------------
 # prim 路径说明：

@@ -189,13 +189,24 @@ def _gripper_switch_series(
     ==========  ==========================================
     ``-0.0200`` 夹住：右手持管抬起，tube_z 0.743 → 0.920
     ``+0.0245`` 张开：管子落回 tube_z 0.743
-    ``0.0000``  上电闲置值（两指并拢，属闭合点）
+    ``0.0000``  上电闲置值 —— **运控还没下发过指令**
     ==========  ==========================================
 
-    与 dex1 的 URDF 限位（``lower=-0.02, upper=0.0245``，初始 0）按上面的
-    控制器规则算出的 ``closed_position_=-0.02`` 完全吻合 —— 所以判据就是
-    **"离哪个限位更近"**，而不是"高于/低于中点"（后者在初始值靠近上限的
-    机器人上会反掉）。
+    ### idle 值必须「保持上一帧」，不能判成闭合
+
+    ``0.0`` 恰好等于 URDF 初始值。物理上两指此时是并拢的（确实像闭合），
+    但**它不是"意图闭合"**，而是"运控还没发第一个命令"。而真实工况是：
+    **进 OCS2 后夹爪会张开**，推理开始时应保持张开。
+
+    早期实现把 ``0.0`` 判成闭合，导致训练数据教模型"开局左爪闭合"
+    （实测 41 条 run 的 ``left_gripper_cmd[0]`` 全为 0，而左爪首次张开要到
+    第 147~151 帧）。推理时表现为"开局左爪就闭合"，与场景不符。
+
+    所以：**``|v - init| < eps`` 的帧沿用上一帧的值**（没有上一帧时用 1.0=张开，
+    与"进 OCS2 后张开"的工况一致）。
+
+    其余帧按"离哪个限位更近"判定 —— 复刻控制器规则，而不是"高于/低于中点"
+    （后者在初始值靠近上限的机器人上会反掉）。
 
     Args:
         ep_npz: ``episode.npz``（pack 产物，含 ``joint_pos_cmd`` + ``joint_names``）。
@@ -215,8 +226,8 @@ def _gripper_switch_series(
         return [(1.0, 1.0)] * n_frames
     q = np.asarray(q, dtype=np.float64)
 
-    # 每条手臂解析出 (closed_val, open_val)；判据 = 离哪个更近。
-    bounds: list[tuple[float, float] | None] = []
+    # 每条手臂解析出 (closed_val, open_val, init_val)；判据 = 离哪个更近。
+    bounds: list[tuple[float, float, float] | None] = []
     for side in ("left", "right"):
         col = None
         for cand in (f"{side}_gripper_joint", f"{side}_hand_finger_joint"):
@@ -236,15 +247,24 @@ def _gripper_switch_series(
             # 全程同一个值 —— 该 episode 没动过夹爪，按张开处理
             bounds.append(None)
             continue
-        # 初始值：第一条有效帧（上电时夹爪处于初始位，通常是 0）
+        # 初始值：第一条有效帧。它通常等于 URDF 初始位（0.0），也正因为它
+        # 是"运控尚未下发"的 idle 值，所以判定时要单独排除（见下面的 idle 处理）。
         init = float(finite[0])
         # 复刻 AdaptiveGripperController：距初始值更近的限位 = 闭合位
         if abs(hi - init) < abs(lo - init):
-            bounds.append((hi, lo))     # (closed, open)
+            bounds.append((hi, lo, init))     # (closed, open, init)
         else:
-            bounds.append((lo, hi))
+            bounds.append((lo, hi, init))
+
+    # idle 判定的容差：与初始值相差小于"到两个限位距离"的 5% 就算 idle。
+    # 用相对量而不是绝对值，换机器人/换限位范围时不用改。
+    def _is_idle(v: float, closed_val: float, open_val: float, init: float) -> bool:
+        span = max(abs(open_val - closed_val), 1e-9)
+        return abs(v - init) < 0.05 * span
 
     out_sw: list[tuple[float, float]] = []
+    # 起始默认 **张开**：真实工况是"进 OCS2 后夹爪张开"，推理开始时就是张开。
+    # 若首帧是 idle（没下过指令），保持张开是唯一自洽的选择。
     prev = [1.0, 1.0]
     for i in range(n_frames):
         row: list[float] = []
@@ -262,8 +282,13 @@ def _gripper_switch_series(
             if not np.isfinite(v):
                 row.append(prev[k])
                 continue
-            closed_val, open_val = bnd
-            # 离张开位更近 → 1；否则 → 0（含正好落在闭合位的闲置值）
+            closed_val, open_val, init = bnd
+            if _is_idle(v, closed_val, open_val, init):
+                # idle（运控还没下发）→ **保持上一帧**。
+                # 首帧时 prev 是 1.0（张开），与"进 OCS2 后夹爪张开"一致。
+                row.append(prev[k])
+                continue
+            # 离张开位更近 → 1；否则 → 0
             row.append(1.0 if abs(v - open_val) < abs(v - closed_val) else 0.0)
         while len(row) < 2:
             row.append(1.0)
