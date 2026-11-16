@@ -873,9 +873,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     """
     from fasim.replicator.sdg import export_lerobot as ex
 
-    sessions = _expand_sessions(args.session)
+    sessions = _filter_failed_sessions(_expand_sessions(args.session))
     if not sessions:
-        _log(f"ERROR 没找到采集会话: {args.session}")
+        _log(f"ERROR 没找到可用采集会话: {args.session}")
         _explain_missing_path(Path(args.session).expanduser(), want="session.json")
         return 1
 
@@ -1029,6 +1029,69 @@ try:
             if float(np.abs(_O).max()) < 1e-9:
                 print("STATE_ALL_ZERO —— observation.state 全是 0！")
                 bad += 1
+
+        # ---- 四元数检查（顺序错位很难发现，只影响姿态不影响位置）----
+        #
+        # 踩过的坑：fk.py 产出 wxyz（USD 约定），而 action 字段名是
+        # left_ee.quat.x/.y/.z/.w（ROS 的 xyzw）。直接按名搬会错位一位，
+        # 实际旋转变成"绕 Z 转 180°"，表现为左右臂镜像、夹爪朝正后方扭转，
+        # 但**位置全对**，所以 MAE/相关性都很好看，只有真驱动机器人才暴露。
+        _an = (_info.get("features", {{}}).get("action", {{}}) or {{}}).get("names") or []
+        _qidx = [i for i, n in enumerate(_an) if ".quat." in n]
+        if _qidx:
+            _Q = _A[:, _qidx]
+            _norms = np.linalg.norm(_Q.reshape(len(_Q), -1, 4), axis=2)
+            print(f"QUAT_NORM    min={{_norms.min():.6f}} max={{_norms.max():.6f}} "
+                  f"mean={{_norms.mean():.6f}}")
+            if _norms.min() < 0.99 or _norms.max() > 1.01:
+                print("QUAT_NOT_UNIT —— 四元数模长不是 1，可能存在顺序错位")
+                bad += 1
+            # 每组四元数的 w 分量应是最大绝对值之一（接近 1 表示"近无旋转"，
+            # 或至少 |w| 不该恒为 ~0）。若 |w| 极小但 |z| 近 1，很可能还是
+            # wxyz 被当成 xyzw 存了。
+            # 注意：_Q 的列是 _qidx 的**压缩后**下标，不能用 _an 的全局下标去索引
+            # （14 维时 6/13 会越界 → 被外层 except 吞掉，连带跳过下面的夹爪检查）。
+            _local = {{n: i for i, n in enumerate([_an[j] for j in _qidx])}}
+            _wcols = [_local[n] for n in _local if n.endswith(".quat.w")]
+            _zcols = [_local[n] for n in _local if n.endswith(".quat.z")]
+            if _wcols and _zcols:
+                _wabs = float(np.abs(_Q[:, _wcols]).mean())
+                _zabs = float(np.abs(_Q[:, _zcols]).mean())
+                print(f"QUAT_W_VS_Z  mean|w|={{_wabs:.6f}} mean|z|={{_zabs:.6f}}")
+                if _wabs < 1e-6 and _zabs > 0.9:
+                    print("QUAT_SUSPECT_ORDER —— |w|≈0 而 |z|≈1，"
+                          "疑似 wxyz 被当成 xyzw（应做一次轮转）")
+                    bad += 1
+
+        # ---- 夹爪开关量检查（ee_absolute_gripper）----
+        #
+        # 夹爪必须是 **0/1 开关量**（对齐运控 target_command），不能是关节位置。
+        # 若这里看到夹爪维是连续的小数（量级 ~0.02），说明导出用了关节位置 ——
+        # 那样闭合时会停在"刚好碰到管子"，**夹持力不足**（踩过的坑）。
+        #
+        # 另外夹爪必须**至少出现过一次闭合**，否则任务段里根本没抓东西，
+        # 策略学不到抓取（表现为推理时伸出去又抽回）。
+        _gidx = [i for i, n in enumerate(_an)
+                 if n.endswith("_gripper.pos") or "_gripper." in n]
+        if _gidx:
+            _G = _A[:, _gidx]
+            _gmin, _gmax = float(_G.min()), float(_G.max())
+            print(f"GRIPPER      dim={{len(_gidx)}} min={{_gmin:.3f}} max={{_gmax:.3f}}")
+            _not_binary = ~np.isclose(_G, 0.0) & ~np.isclose(_G, 1.0)
+            if float(_not_binary.mean()) > 0.01:
+                print("GRIPPER_NOT_BINARY —— 夹爪维不是 0/1 开关量，"
+                      "疑似用了关节位置（闭合会夹不紧）。"
+                      "应导出 action_space=ee_absolute_gripper")
+                bad += 1
+            for _c in range(len(_gidx)):
+                _col = _G[:, _c]
+                _nclose = int(np.isclose(_col, 0.0).sum())
+                print(f"  {{_an[_gidx[_c]]}}: 闭合帧 {{_nclose}}/{{len(_col)}} "
+                      f"({{100.0*_nclose/max(len(_col),1):.1f}}%)")
+                if _nclose == 0:
+                    print(f"GRIPPER_NEVER_CLOSED —— {{_an[_gidx[_c]]}} 全程张开，"
+                          "策略学不到抓取动作")
+                    bad += 1
     else:
         print("WARN 无法读取 action 列（feature 名不是 action？）")
 except Exception as exc:
@@ -1380,6 +1443,25 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _filter_failed_sessions(sessions: list[Path]) -> list[Path]:
+    """剔除采集失败/数据损坏的会话，并打印被剔除的清单。
+
+    判据见 ``capture_profile.is_failed_session``：有失败标记 / 0 帧 /
+    三路相机分辨率不一致或缺失。这类数据塞进 LeRobot 会让导出中断
+    （实测 43 条在第 33 个 episode 因 wrist 分辨率 720x1280 崩掉）。
+    """
+    from fasim.replicator.sdg import capture_profile as _cp
+
+    failed = [s for s in sessions if _cp.is_failed_session(s)]
+    if not failed:
+        return sessions
+    names = [s.name for s in failed]
+    _log(f"跳过 {len(failed)} 个失败/损坏会话: "
+         f"{names[:10]}{'…' if len(names) > 10 else ''}")
+    _log("  判据：有 .capture_failed.json / 0 帧 / 三路相机分辨率不一致或缺失")
+    return [s for s in sessions if s not in failed]
+
+
 def _expand_sessions(path_str: str) -> list[Path]:
     """把用户给的路径展开成「一个或多个采集会话目录」。
 
@@ -1424,12 +1506,19 @@ def _expand_sessions(path_str: str) -> list[Path]:
 
 
 def _resolve_batch(args, label: str) -> list[Path] | None:
-    """解析批量目标并打印清单。返回 None 表示应中止。"""
-    sessions = _expand_sessions(args.session)
+    """解析批量目标并打印清单。返回 None 表示应中止。
+
+    自动排除「采集失败留下的空壳」（0 帧 / 有 .capture_failed.json 标记）——
+    它们会因 cameras=[] / every=0 触发参数不一致，把正常数据也拦下来。
+    """
+    from fasim.replicator.sdg import capture_profile as _cp
+
+    sessions = _filter_failed_sessions(_expand_sessions(args.session))
     if not sessions:
-        _log(f"ERROR 没找到采集会话: {args.session}")
+        _log(f"ERROR 没找到可用采集会话: {args.session}")
         _explain_missing_path(Path(args.session).expanduser(), want="session.json")
         return None
+
     if len(sessions) > 1:
         _log(f"批量 {label}：{len(sessions)} 个会话")
         for s in sessions:
@@ -1934,11 +2023,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="批量合并时允许采集参数不一致（危险：时间轴/feature 会错乱）")
     ex.add_argument(
         "--action-space", dest="action_space", default="absolute",
-        choices=["absolute", "delta", "ee_delta", "ee_absolute"],
+        choices=["absolute", "delta", "ee_delta", "ee_absolute",
+                 "ee_absolute_gripper"],
         help="action 语义：absolute=关节指令（默认，部署无累积误差）"
              " / delta=关节单步增量（对齐同事语义，state[t]+action[t]==state[t+1]）"
              " / ee_delta=末端位姿增量 14 维（与同事 pose 模式完全对齐）"
-             " / ee_absolute=末端位姿绝对值 14 维（供 inference.py 发运控）",
+             " / ee_absolute=末端位姿绝对值 14 维（供 inference.py 发运控）"
+             " / ee_absolute_gripper=同上 14 维 + 左右夹爪开关量 2 维"
+             "（0=闭合 1=张开，对齐运控 target_command；训练用这个才能抓东西）",
     )
     ex.set_defaults(func=cmd_export)
 

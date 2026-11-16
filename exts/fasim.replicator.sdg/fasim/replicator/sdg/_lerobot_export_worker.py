@@ -120,6 +120,8 @@ def main(req_path: str) -> int:
 
     n_ok = 0
     n_missing_cmd = 0
+    n_episodes = 0
+    n_skipped_ep = 0
     # ``episodes``: [[frame_path, ...], ...] —— 每个子列表 = 一个 episode。
     # 兼容旧的单 episode 请求（只有 ``frames`` 扁平列表 → 包成一层）。
     episodes = req.get("episodes")
@@ -197,17 +199,23 @@ def main(req_path: str) -> int:
                         else:
                             frame["action"] = np.zeros(14, dtype=np.float32)
                             n_missing_cmd += 1
-                    elif asp == "ee_absolute":
-                        # 14 维末端**绝对**位姿，供 inference.py 直接发运控：
+                    elif asp in ("ee_absolute", "ee_absolute_gripper"):
+                        # 14 维末端**绝对**位姿（+ 可选 2 维夹爪开关量），供
+                        # inference.py 直接发运控：
                         #   left_ee.pos.xyz + left_ee.quat.xyzw（右侧同理）
+                        #   [, left_gripper.pos, right_gripper.pos]  ← 0=闭合 1=张开
                         #
-                        # 数据来自 **episode.npz 的 *_cmd_pos/_cmd_quat**（FK 反算
+                        # 位姿来自 **episode.npz 的 *_cmd_pos/_cmd_quat**（FK 反算
                         # 的指令位姿），由主进程预先算好放进 req["ee_actions"]。
                         # 原始 frames/*.npz 里**没有**这些字段 —— 曾经在这里读
                         # 帧文件，导致 1.7 万帧 action 全零、训练白跑一轮。
                         #
                         # 不用 *_pos/_quat（实测值）：实测与指令有 6.7mm 稳态
                         # 误差，拿实测当目标发运控会叠加两次。
+                        #
+                        # 夹爪是**开关量**（对齐运控 target_command），不是关节
+                        # 位置 —— 闭合幅度由 AdaptiveGripperController 自己回
+                        # 限位压出夹持力。见 export_lerobot._gripper_switch_series。
                         acts = (req.get("ee_actions") or [])
                         ep_acts = acts[ep_i] if ep_i < len(acts) else []
                         if i < len(ep_acts):
@@ -271,14 +279,39 @@ def main(req_path: str) -> int:
             if (i + 1) % 100 == 0:
                 _log(f"  已写入 {ep_ok}/{len(ep_frames)} 帧（ep{ep_i}）")
 
+        if ep_ok == 0:
+            # 整个 episode 一帧都没写成功（比如相机分辨率不一致导致每帧都
+            # Feature mismatch）。**跳过它**而不是调 save_episode —— 后者会抛
+            # "You must add one or several frames before calling add_episode"
+            # 把整个导出中断（实测 43 条在第 33 个 episode 崩掉，前 32 条
+            # 的数据虽然写进磁盘但 meta 没 finalize，等于白导）。
+            _log(f"WARN 跳过 episode {ep_i}（0 帧写入成功）—— "
+                 f"该会话数据不可用，见上方 WARN")
+            n_skipped_ep += 1
+            continue
         _log(f"保存 episode {ep_i}（{ep_ok} 帧）…")
-        ds.save_episode()
+        try:
+            ds.save_episode()
+            n_episodes += 1
+        except Exception as exc:  # noqa: BLE001
+            # 保存失败必须清空缓冲，否则残留的帧会串到下一个 episode，
+            # 造成更难查的错位。
+            _log(f"WARN 保存 episode {ep_i} 失败，跳过: {exc}")
+            n_skipped_ep += 1
+            try:
+                ds.clear_episode_buffer()
+            except Exception:  # noqa: BLE001
+                pass
 
     try:
         ds.finalize()  # v3 有 finalize（聚合 stats/视频元信息）；旧版没有
     except Exception:  # noqa: BLE001
         pass
-    _log(f"完成: {out}  ({n_ok} 帧 / {len(episodes)} episode)")
+    _log(f"完成: {out}  ({n_ok} 帧 / {n_episodes} episode 保存成功"
+         + (f"，{n_skipped_ep} 个跳过" if n_skipped_ep else "") + ")")
+    if n_skipped_ep:
+        _log(f"  WARN 有 {n_skipped_ep} 个 episode 因数据问题被跳过 —— "
+             f"检查对应的采集会话（相机分辨率不一致 / 缺图像字段）")
     if asp != "absolute":
         _log(f"  action 语义: {asp}")
         if n_missing_cmd:

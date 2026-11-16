@@ -400,6 +400,47 @@ def _pose_delta_mm(
     return float(np.linalg.norm(np.asarray(a[0]) - np.asarray(b[0])) * 1000.0)
 
 
+def _rp_alive(rp: Any) -> bool:
+    """判断缓存的 render product 是否还能用。
+
+    背景：stop_capture 时我们**不 destroy** rp（避免破坏 Replicator 全局状态、
+    导致 ROS 图 writer 报 invalid null prim）。但两次采集之间如果 reload 过
+    stage 或重启仿真，缓存的 rp 已经失效，attach annotator 会抛
+    ``RuntimeError: Accessed invalid null prim``。
+
+    判据（从宽到严，任一失败即视为失效）：
+      1. 对象非 None
+      2. 能取到它的 prim 路径（不同版本 API 名不同，都试一遍）
+      3. 该路径在当前 stage 上确实存在
+
+    取不到路径时**保守返回 False**（宁可重建，也不要拿失效对象去 attach）。
+    """
+    if rp is None:
+        return False
+    path = None
+    for attr in ("path", "prim_path", "get_path", "product_path"):
+        try:
+            v = getattr(rp, attr, None)
+            if callable(v):
+                v = v()
+            if isinstance(v, str) and v.strip():
+                path = v.strip()
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not path:
+        return False
+    try:
+        import omni.usd
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return False
+        return bool(stage.GetPrimAtPath(path).IsValid())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def arm_capture(
     out_dir: str = "",
     every: int = 10,
@@ -475,6 +516,31 @@ def arm_capture(
         out = runtime.default_session_dir(robot_key, task_key, name)
     (out / "frames").mkdir(parents=True, exist_ok=True)
 
+    # **失败标记**：目录一建出来就先放这个文件，成功挂载采集器后再删。
+    #
+    # 为什么需要：相机创建失败（曾因复用失效的 render product 抛
+    # "Accessed invalid null prim"）时本函数直接 return None，但目录已经
+    # 建好了、里面只有一个空 frames/ —— 用户以为采到了，实际 0 帧，
+    # 而且连 session.json 都没有（排查时无从下手）。实测积累过 7 个这种空壳。
+    #
+    # 有标记就能一眼分辨：
+    #   有 .capture_failed.json → 采集根本没起来，别用
+    #   没有这个文件            → 正常会话
+    fail_marker = out / ".capture_failed.json"
+
+    def _mark_failed(reason: str) -> None:
+        try:
+            fail_marker.write_text(
+                json.dumps({"reason": reason, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "robot_key": str(robot_key), "task_key": str(task_key)},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    _mark_failed("初始化未完成（若看到本文件说明采集没启动成功）")
+
     # 相机：``camera`` 的语义（务必与 CLI 保持一致，否则会静默不采）
     #   None / ""      → **不采相机**（只采状态），不建 render product
     #   "all"          → 采 task.yaml 里配的全部相机
@@ -493,18 +559,30 @@ def arm_capture(
         for spec in specs:
             w = int(width or (spec.resolution[0] if spec.resolution else 640))
             h = int(height or (spec.resolution[1] if spec.resolution else 480))
+            rp = None
             try:
                 # 复用同名 render product（避免多次采集不断累积）。
-                # ``rep.create.render_product`` 每次新建；但我们在 stop 时
-                # 不 destroy（见 stop_capture 里的说明），所以这里先查缓存。
+                #
+                # **但必须先验证它还有效**：如果两次采集之间 reload 过 stage
+                # （重开 room.usda）或重启过仿真，缓存的 rp 已经失效，
+                # 直接 attach annotator 会抛
+                #   RuntimeError: Accessed invalid null prim
+                # 而且是"有概率触发"—— 连续采集不复位就正常，重载场景后就炸，
+                # 很难一眼看出关联。
+                #
+                # 判据：rp 对象还在，且它的 prim 路径仍在当前 stage 里。
                 cache = _S.setdefault("_rp_cache", {})
                 key = f"{spec.name}@{w}x{h}@{spec.prim_path}"
-                rp = cache.get(key)
-                if rp is None:
+                cached = cache.get(key)
+                if cached is not None and _rp_alive(cached):
+                    rp = cached
+                    _log(f"相机 {spec.name}: 复用已有 render product")
+                else:
+                    if cached is not None:
+                        _log(f"相机 {spec.name}: 缓存的 rp 已失效，重建")
+                        cache.pop(key, None)
                     rp = rep.create.render_product(spec.prim_path, (w, h))
                     cache[key] = rp
-                else:
-                    _log(f"相机 {spec.name}: 复用已有 render product")
             except Exception as exc:  # noqa: BLE001
                 _log(f"WARN 相机 {spec.name} 创建失败 ({spec.prim_path}): {exc}")
                 continue
@@ -529,7 +607,8 @@ def arm_capture(
             _log(f"相机 {spec.name}: {w}x{h} @ {spec.prim_path}"
                  + ("  (+内参)" if cp is not None else ""))
         if not cams:
-            _log("ERROR 所有相机都创建失败")
+            _mark_failed("所有相机都创建失败（render product 不可用，见上方 WARN）")
+            _log("ERROR 所有相机都创建失败 —— 已写入 .capture_failed.json 标记")
             return None
     else:
         # 明确说清"为什么没采"—— cam02 就是选了全部相机却因空串语义丢成
@@ -636,7 +715,8 @@ def arm_capture(
     if obj_views:
         what.append("object")
     if not what:
-        _log("ERROR 什么都没采（相机/关节/末端/物体全部不可用）")
+        _mark_failed("什么都没采（相机/关节/末端/物体全部不可用）")
+        _log("ERROR 什么都没采 —— 已写入 .capture_failed.json 标记")
         return None
 
     import time
@@ -984,6 +1064,11 @@ def arm_capture(
     _log("下一步: 运行【轨迹生成 / 任务编排工具】让机器人跑一遍任务")
     _log("跑完: 回到本终端执行 ./scripts/sdg.sh stop（或菜单里选「结束采集」）")
     _log("=" * 60)
+    # 挂载成功 → 删掉失败标记（有标记 = 采集没起来）
+    try:
+        fail_marker.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
     return {"out": str(out), "cameras": [c["name"] for c in _S["cameras"]], "every": _S["every"]}
 
 
@@ -1110,6 +1195,13 @@ def stop_capture() -> dict:
         _log("WARN 没采到 joint_pos_cmd（下发目标）—— 回放只能回退实测值")
 
     _S.update(armed=False, sub=None, cameras=[], out=None, records=[])
+    # 注意：**不清空 `_rp_cache`**。
+    # 我们不 destroy render product（见上面的说明），下次采集时由
+    # ``_rp_alive()`` 判断缓存的 rp 是否还有效：
+    #   - 连续采集（没重载 stage）→ 复用，避免累积
+    #   - 中间 reload 过场景 → 判失效 → 自动重建
+    # 曾经这里无条件复用，导致"重开 room.usda 后再采集必报
+    # Accessed invalid null prim"，而且表现为"有概率触发"，很难查。
     return info
 
 

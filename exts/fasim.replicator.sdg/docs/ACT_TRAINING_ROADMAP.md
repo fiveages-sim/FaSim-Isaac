@@ -100,19 +100,61 @@ S=~/fasim_data/unitree_g1d/sinopec_test_tube/run_04
 ./scripts/sdg.sh trim   $S                          # 切掉静止段（可选）
 ./scripts/sdg.sh export $S \
     --out ~/lerobot_datasets/tube_v1 \
-    --action-space absolute                         # 或 delta / ee_delta
+    --action-space ee_absolute_gripper             # 抓取任务用这个（14 维 ee + 2 维夹爪开关）
 ```
 
 ### 1.3 `action-space` 怎么选
 
 | 选项 | 内容 | 什么时候用 |
 |---|---|---|
-| `absolute`（默认） | `joint_pos_cmd` 绝对关节指令 | **先跑这个**。部署时策略直接输出目标角，无累积误差；G1D 是位置控制，天然吃绝对值 |
+| `absolute`（默认） | `joint_pos_cmd` 绝对关节指令 | 想直接控关节时用 |
 | `delta` | `joint_pos[t+1] - joint_pos[t]` | 对齐同事 data-collector-platform（他们用 delta），便于混训/横向对比。实测自洽误差 1.86e-09 |
 | `ee_delta` | 末端相邻增量 14 维 | 想学任务空间（与同事 pose 模式同构） |
+| `ee_absolute` | 末端**绝对**位姿 14 维 | 推理走运控 IK（`inference.py`） |
+| **`ee_absolute_gripper`** | 上面 14 维 + **夹爪开关量 2 维** | **做抓取任务必须用这个**，否则策略没有夹爪通道、抓不住东西 |
 
 > 注意 `delta` **不是** `cmd - 实测`。后者是控制器修正量，实测比真实位移大
 > **7.43 倍**（0.0092 vs 0.0012 rad），会让策略学到「每步都要大修正」，部署时抖。
+
+#### 夹爪为什么是**开关量**而不是关节位置（踩过的坑）
+
+运控的 `AdaptiveGripperController` 是 `target_command` 模式：闭合时它不回"录制时的
+关节角"，而是回到**距初始值最近的限位**，靠压出夹持力夹紧物体：
+
+```cpp
+closed_position_ = (|upper - init| < |lower - init|) ? upper : lower;
+new_target = closed_position_ + percent * (open_position_ - closed_position_);
+```
+
+如果把采集到的夹爪关节位置（`±0.02` 这种）当指令发下去，闭合会停在"刚好碰到管子"
+的位置，**夹持力不足**。所以 action 里只保留「开/合」这一位，幅度交给运控决定。
+
+**sdg 侧怎么拿到这一位**（不用走话题）：sdg 采的是 Isaac 内部
+`get_dof_position_targets()`，而 `target_command` 模式下 ros2_control 只会往位置命令
+接口写**两个限位之一**，所以 `joint_pos_cmd` 的夹爪列天然离散。实测 41 条 run 全部
+只有 3 个值：
+
+| cmd | 含义（run_01 物理结果反推） |
+|---|---|
+| `-0.0200` | 夹住：右手持管抬起，tube_z `0.743 → 0.920` |
+| `+0.0245` | 张开：管子落回 `0.743` |
+| `0.0000` | 上电闲置值（两指并拢，属闭合点） |
+
+判据 = **离哪个限位更近**（复刻控制器规则），而不是"高于/低于中点"——后者在初始值
+靠近上限的机器人上会反掉。dex1 的 URDF 限位是 `lower=-0.02, upper=0.0245, init=0`，
+算出 `closed_position_ = -0.02`，与上表一致。
+
+`export-check` 会强制校验：夹爪维必须是 0/1、且至少出现过一次闭合；否则报
+`GRIPPER_NOT_BINARY` / `GRIPPER_NEVER_CLOSED`。
+
+#### ⚠️ `observation.ee` 的四元数是 wxyz，而 `action` 是 xyzw
+
+同一数据集里两种约定并存：`action` 的 `*_quat.{x,y,z,w}` 名字明确（xyzw，对齐
+`geometry_msgs/Pose`），而 `observation.ee` 是 14 维裸数组、**没有 names**，其值来自
+`episode.npz` 的 wxyz。直接用会差 **166°**（看起来像"左右臂镜像"）。
+
+当前 ACT 只吃 `observation.state` + 三路图像，`observation.ee` 不在 `input_features`
+里，所以**不影响训练**。但如果以后要把它喂给策略，必须先做 wxyz→xyzw 轮转。
 
 ### 1.4 校验（必做）
 

@@ -64,6 +64,8 @@ INFO_ONLY = ("frames", "preset")
 
 
 def _load_session_json(session: Path) -> dict[str, Any]:
+    # 有 .capture_failed.json 的目录 = 采集没起来（0 帧），不该参与合并判断。
+    # 它会被 fingerprint() 识别成"空会话"，但更安全的做法是在调用方过滤。
     p = session / "session.json"
     if not p.is_file():
         return {}
@@ -71,6 +73,48 @@ def _load_session_json(session: Path) -> dict[str, Any]:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return {}
+
+
+def is_failed_session(session: Path) -> bool:
+    """这个目录是不是「采集失败/数据损坏的空壳」？
+
+    排除三类（都会让批量合并失败或污染数据集）：
+      1. 有 ``.capture_failed.json`` 标记（采集没起来）
+      2. ``frames/`` 里一帧都没有（0 帧）
+      3. **三路相机分辨率不一致或缺失** —— 实测过的病症：
+         - run_26/31: 三路都报 0x0（相机没真正出图）
+         - run_34/45: wrist_left 变成 720x1280（render product 串了，
+           head 的尺寸给了 wrist）
+         这类数据塞进 LeRobot 会直接抛 "Feature mismatch" 并把整个
+         导出中断（实测 43 条导出在第 33 个 episode 崩掉）。
+    """
+    if (session / ".capture_failed.json").is_file():
+        return True
+    fd = session / "frames"
+    if not fd.is_dir():
+        return True
+    frames = sorted(fd.glob("frame_*.npz"))
+    if not frames:
+        return True
+    # 抽查第 1 帧与中间帧的分辨率（避免逐帧读太慢）
+    for f in (frames[0], frames[len(frames) // 2]):
+        try:
+            import numpy as np
+
+            with np.load(f, allow_pickle=False) as z:
+                shapes = {k: tuple(z[k].shape[:2]) for k in
+                          ("head_rgb", "wrist_left_rgb", "wrist_right_rgb")
+                          if k in z.files}
+            if len(shapes) < 3:
+                return True                      # 缺相机字段
+            if len(set(shapes.values())) != 1:
+                return True                      # 分辨率不一致
+            h, w = next(iter(shapes.values()))
+            if h <= 0 or w <= 0:
+                return True                      # 0x0
+        except Exception:  # noqa: BLE001
+            return True
+    return False
 
 
 def _probe_joint_info(session: Path) -> tuple[int, tuple[str, ...]]:

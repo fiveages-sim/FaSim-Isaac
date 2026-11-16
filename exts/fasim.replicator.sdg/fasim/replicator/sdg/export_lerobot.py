@@ -154,16 +154,140 @@ def _image_to_hwc_u8(arr: Any) -> np.ndarray | None:
 # ---------------------------------------------------------------- 主流程
 
 
-def _load_ee_actions(ep_npz: Path, n_frames: int) -> list[list[float]]:
-    """从 episode.npz 读 14 维末端**绝对**位姿作为 action。
+#: 夹爪开合量的名字。**必须是 0/1 开关量**，不是关节位置。
+GRIPPER_SWITCH_NAMES = ("left_gripper.pos", "right_gripper.pos")
+
+
+def _gripper_switch_series(
+    ep_npz: Path, n_frames: int
+) -> list[tuple[float, float]]:
+    """从 ``episode.npz`` 的 ``joint_pos_cmd`` 推出每帧的夹爪**开合开关量**。
+
+    为什么是开关量而不是关节位置
+    ----------------------------
+    运控的 ``AdaptiveGripperController`` 是**开关量控制**（``target_command``，
+    0=闭合 / 1=张开）。闭合时它不是回到"录制时的关节角"，而是回到**距初始值
+    最近的限位**（``closed_position_``），靠压出夹持力夹紧物体
+    （``adaptive_gripper_controller.cpp``::
+
+        closed_position_ = (|upper - init| < |lower - init|) ? upper : lower;
+        new_target = closed_position_ + percent * (open_position_ - closed_position_);
+
+    ）。如果把采集到的夹爪关节位置当成指令发下去，闭合时会停在"刚好碰到管子"
+    的位置，**夹持力不足** —— 这个坑踩过。所以这里只保留"开/合"这一位信息，
+    幅度交给运控自己决定。
+
+    为什么 sdg 内部就能拿到（不需要走话题）
+    --------------------------------------
+    sdg 采的是 Isaac 内部 ``get_dof_position_targets()``，而 ``target_command``
+    模式下 ros2_control 只会往位置命令接口写**两个限位之一**，所以
+    ``joint_pos_cmd`` 的夹爪列天然是离散的、逐帧带状态。实测 41 条 run 全部
+    只有 3 个值 ``{-0.02, 0.0, +0.0245}``：
+
+    ==========  ==========================================
+    cmd         实际后果（run_01 物理结果反推）
+    ==========  ==========================================
+    ``-0.0200`` 夹住：右手持管抬起，tube_z 0.743 → 0.920
+    ``+0.0245`` 张开：管子落回 tube_z 0.743
+    ``0.0000``  上电闲置值（两指并拢，属闭合点）
+    ==========  ==========================================
+
+    与 dex1 的 URDF 限位（``lower=-0.02, upper=0.0245``，初始 0）按上面的
+    控制器规则算出的 ``closed_position_=-0.02`` 完全吻合 —— 所以判据就是
+    **"离哪个限位更近"**，而不是"高于/低于中点"（后者在初始值靠近上限的
+    机器人上会反掉）。
+
+    Args:
+        ep_npz: ``episode.npz``（pack 产物，含 ``joint_pos_cmd`` + ``joint_names``）。
+        n_frames: 期望帧数（与 frames 对齐）。
+
+    Returns:
+        ``[(left_sw, right_sw), ...]``，1=张开、0=闭合。
+    """
+    import numpy as np
+
+    with np.load(ep_npz, allow_pickle=False) as z:
+        keys = set(z.files)
+        jn = [str(n) for n in z["joint_names"]] if "joint_names" in keys else []
+        q = z["joint_pos_cmd"] if "joint_pos_cmd" in keys else None
+    if q is None or not jn:
+        # 没有指令列 → 不敢猜，全部按张开处理（至少不会误夹）
+        return [(1.0, 1.0)] * n_frames
+    q = np.asarray(q, dtype=np.float64)
+
+    # 每条手臂解析出 (closed_val, open_val)；判据 = 离哪个更近。
+    bounds: list[tuple[float, float] | None] = []
+    for side in ("left", "right"):
+        col = None
+        for cand in (f"{side}_gripper_joint", f"{side}_hand_finger_joint"):
+            if cand in jn:
+                col = jn.index(cand)
+                break
+        if col is None:
+            bounds.append(None)
+            continue
+        seq = q[:, col]
+        finite = seq[np.isfinite(seq)]
+        if not len(finite):
+            bounds.append(None)
+            continue
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi - lo < 1e-6:
+            # 全程同一个值 —— 该 episode 没动过夹爪，按张开处理
+            bounds.append(None)
+            continue
+        # 初始值：第一条有效帧（上电时夹爪处于初始位，通常是 0）
+        init = float(finite[0])
+        # 复刻 AdaptiveGripperController：距初始值更近的限位 = 闭合位
+        if abs(hi - init) < abs(lo - init):
+            bounds.append((hi, lo))     # (closed, open)
+        else:
+            bounds.append((lo, hi))
+
+    out_sw: list[tuple[float, float]] = []
+    prev = [1.0, 1.0]
+    for i in range(n_frames):
+        row: list[float] = []
+        for k, bnd in enumerate(bounds):
+            col = None
+            side = ("left", "right")[k]
+            for cand in (f"{side}_gripper_joint", f"{side}_hand_finger_joint"):
+                if cand in jn:
+                    col = jn.index(cand)
+                    break
+            if bnd is None or col is None:
+                row.append(prev[k])
+                continue
+            v = float(q[i, col]) if i < len(q) else float("nan")
+            if not np.isfinite(v):
+                row.append(prev[k])
+                continue
+            closed_val, open_val = bnd
+            # 离张开位更近 → 1；否则 → 0（含正好落在闭合位的闲置值）
+            row.append(1.0 if abs(v - open_val) < abs(v - closed_val) else 0.0)
+        while len(row) < 2:
+            row.append(1.0)
+        prev = row[:2]
+        out_sw.append((row[0], row[1]))
+    return out_sw
+
+
+def _load_ee_actions(
+    ep_npz: Path, n_frames: int, with_gripper: bool = False
+) -> list[list[float]]:
+    """从 episode.npz 读末端**绝对**位姿作为 action（可选带夹爪开关量）。
 
     字段顺序必须与 features["action"]["names"] 一致：
         left_ee.pos.{x,y,z}, left_ee.quat.{x,y,z,w},
         right_ee.pos.{x,y,z}, right_ee.quat.{x,y,z,w}
+        [, left_gripper.pos, right_gripper.pos]   ← with_gripper=True
 
     用 ``*_cmd_pos/_cmd_quat``（**FK 反算的指令位姿**），不是 ``*_pos/_quat``
     （实测值）：实测与指令有 6.7mm 稳态误差，拿实测当目标发运控会让误差叠加
     两次。这与「回放必须先发指令」是同一条原则。
+
+    夹爪位（when ``with_gripper``）取自 :func:`_gripper_switch_series` ——
+    **开关量 0/1**，不是关节位置。详见那个函数的说明。
 
     帧数对齐：episode.npz 与 frames/*.npz 由同一个 pack 生成，应逐帧对应。
     若长度不符则按最短对齐并告警（宁可少几帧也不要错位）。
@@ -189,15 +313,33 @@ def _load_ee_actions(ep_npz: Path, n_frames: int) -> list[list[float]]:
         _log(f"WARN {ep_npz.parent.name}: episode.npz 有 {n} 帧，"
              f"frames 有 {n_frames} 帧 —— 按 {min(n, n_frames)} 对齐")
         n = min(n, n_frames)
+
+    grip = _gripper_switch_series(ep_npz, n) if with_gripper else None
+
     for i in range(n):
         # 转成 Python float —— numpy.float32 不能直接 JSON 序列化。
         # 下游 worker 通过 json 传参，这里是唯一出口，统一转一次。
-        out.append([
+        #
+        # ⚠️ **四元数必须把 wxyz 转成 xyzw**。
+        # ``episode.npz`` 里的 ``*_cmd_quat`` 是 ``fk.py`` 的 ``_rot_to_wxyz``
+        # 产物，顺序是 **w,x,y,z**；而我们在 features 里声明的 action 名字是
+        # ``left_ee.quat.x/.y/.z/.w``（对齐 geometry_msgs/Pose，那是 **x,y,z,w**）。
+        #
+        # 直接按原名搬会把整条链错位一位，实际表示变成"绕 Z 转 180° + 怪旋转"，
+        # 实测表现为左右臂镜像、夹爪朝正后方扭转 —— 而位置部分正常，
+        # 所以只有姿态诡异、很迷惑。
+        row = [
             float(lp[i, 0]), float(lp[i, 1]), float(lp[i, 2]),
-            float(lq[i, 0]), float(lq[i, 1]), float(lq[i, 2]), float(lq[i, 3]),
+            # wxyz -> xyzw
+            float(lq[i, 1]), float(lq[i, 2]), float(lq[i, 3]), float(lq[i, 0]),
             float(rp[i, 0]), float(rp[i, 1]), float(rp[i, 2]),
-            float(rq[i, 0]), float(rq[i, 1]), float(rq[i, 2]), float(rq[i, 3]),
-        ])
+            float(rq[i, 1]), float(rq[i, 2]), float(rq[i, 3]), float(rq[i, 0]),
+        ]
+        if grip is not None:
+            # 0/1 开关量：0=闭合（运控回限位压出夹持力）、1=张开
+            row.append(float(grip[i][0]))
+            row.append(float(grip[i][1]))
+        out.append(row)
     return out
 
 
@@ -238,6 +380,14 @@ def export_session(
                 代价：最后一帧无 t+1，action 填 0；部署需积分，长序列会漂。
             **ee_delta** —— 末端位姿相邻增量（pos3+dquat4 × 左右 = 14 维），
                 与同事 pose 模式完全对齐。同样用实测值而非 cmd。
+            **ee_absolute** —— 末端**绝对**位姿（pos3+quat4 × 左右 = 14 维），
+                对齐 ``inference.py`` 直接发运控。位姿取 ``*_cmd_pos/_cmd_quat``
+                （FK 反算的**指令**位姿），不是实测。
+            **ee_absolute_gripper** —— 上面 14 维 + 2 维夹爪**开关量**
+                （``left_gripper.pos`` / ``right_gripper.pos``，0=闭合 1=张开
+                = 运控 ``target_command`` 的语义）。夹爪只保留开/合这一位，
+                幅度交给运控的 ``AdaptiveGripperController`` 自己回限位压出
+                夹持力 —— **不要**把采集到的夹爪关节位置当指令，那样夹不紧。
 
     Returns:
         ``{"ok", "out", "frames", "episodes", "features", "python"}``
@@ -287,9 +437,10 @@ def export_session(
     #
     # 为什么不在 worker 里读：worker 只拿到帧文件路径清单，不认识会话目录
     # 结构；而且 episode 与 frames 的帧数/顺序需要用同一个来源保证一致。
-    ee_actions: list[list[list[float]]] | None = None
     asp_pre = str(action_space or "absolute").lower()
-    if asp_pre == "ee_absolute":
+    want_grip = "gripper" in asp_pre
+    ee_actions: list[list[list[float]]] | None = None
+    if asp_pre in ("ee_absolute", "ee_absolute_gripper"):
         ee_actions = []
         for s, fs in zip(used_sessions, episodes_frames):
             ep_npz = s / "episode.npz"
@@ -298,13 +449,19 @@ def export_session(
                     f"{s.name} 缺 episode.npz —— ee_absolute 需要 FK 反算的末端指令位姿。\n"
                     f"  先跑: sdg.sh pack {s}  （或对任务目录跑一次批量 pack）"
                 )
-            acts = _load_ee_actions(ep_npz, len(fs))
+            acts = _load_ee_actions(ep_npz, len(fs), with_gripper=want_grip)
             ee_actions.append(acts)
         bad = sum(1 for a in ee_actions for r in a if not any(r))
         if bad:
             _log(f"WARN {bad} 帧的 ee action 全零（episode.npz 里缺 cmd 字段？）")
         else:
-            _log(f"ee action 已从 episode.npz 读取（{len(ee_actions)} 个 episode）")
+            _log(f"ee action 已从 episode.npz 读取（{len(ee_actions)} 个 episode"
+                 + ("，含夹爪开关量" if want_grip else "") + "）")
+        if want_grip and ee_actions:
+            g = ee_actions[0]
+            nl = sum(1 for r in g if len(r) > 15 and r[14] < 0.5)
+            nr = sum(1 for r in g if len(r) > 15 and r[15] < 0.5)
+            _log(f"  夹爪闭合帧（值=0）: left {nl}/{len(g)}  right {nr}/{len(g)}")
     frames = [f for ep in episodes_frames for f in ep]   # 扁平（用于探测 feature）
     meta = metas[0]
     n = len(frames)
@@ -359,9 +516,11 @@ def export_session(
                 break
 
     asp = str(action_space or "absolute").lower()
-    if asp not in ("absolute", "delta", "ee_delta", "ee_absolute"):
+    if asp not in ("absolute", "delta", "ee_delta", "ee_absolute",
+                   "ee_absolute_gripper"):
         raise ValueError(
-            f"action_space 必须是 absolute / delta / ee_delta / ee_absolute，收到 {action_space!r}"
+            f"action_space 必须是 absolute / delta / ee_delta / ee_absolute"
+            f" / ee_absolute_gripper，收到 {action_space!r}"
         )
 
     features: dict[str, Any] = {
@@ -373,6 +532,7 @@ def export_session(
     #   absolute / delta → 关节维（nj）
     #   ee_delta         → 左右各 pos3+dquat4 = 14（**增量**）
     #   ee_absolute      → 左右各 pos3+quat4 = 14（**绝对**，对齐 inference.py）
+    #   ee_absolute_gripper → 上面 14 维 + 左右夹爪开关量 2 维 = 16
     if asp == "ee_delta":
         features["action"] = {
             "dtype": "float32",
@@ -381,17 +541,21 @@ def export_session(
                       for k in ("dpos_x", "dpos_y", "dpos_z",
                                 "dquat_x", "dquat_y", "dquat_z", "dquat_w")],
         }
-    elif asp == "ee_absolute":
+    elif asp in ("ee_absolute", "ee_absolute_gripper"):
         # 名字必须与 lerobot_robot_ros2 的 send_action 对得上：
         #   LEFT_EE_PREFIX = "left_ee" → 它读 left_ee.pos.x / left_ee.quat.x ...
+        #   LEFT_GRIPPER_KEY = "left_gripper.pos"
         # 所以这里用 left_ee.pos.x 这种**带下划线**的写法，而不是 left_pos_x。
+        names = [f"{s}_ee.{kind}.{axis}"
+                 for s in ("left", "right")
+                 for kind, axes in (("pos", "xyz"), ("quat", "xyzw"))
+                 for axis in axes]
+        if asp == "ee_absolute_gripper":
+            names += list(GRIPPER_SWITCH_NAMES)
         features["action"] = {
             "dtype": "float32",
-            "shape": [14],
-            "names": [f"{s}_ee.{kind}.{axis}"
-                      for s in ("left", "right")
-                      for kind, axes in (("pos", "xyz"), ("quat", "xyzw"))
-                      for axis in axes],
+            "shape": [len(names)],
+            "names": names,
         }
     else:
         a_names = None
