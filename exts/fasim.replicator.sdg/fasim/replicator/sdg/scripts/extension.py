@@ -218,6 +218,13 @@ def _dispatch(req: dict) -> dict:
                 for _ in range(max(0, int(n_steps))):
                     app.update()
 
+            # ---- 自检：确认 Isaac 内的读/写通道能用 ----
+            # 这一步很重要：randomize 是在 app.update() 回调里跑的，
+            # ROS 服务会超时。如果 USD API 也不可用，就会静默退回服务、
+            # 然后超时 → 物体被跳过（用户看到的「试管躺在旁边」）。
+            if req.pop("selftest", False):
+                return {"ok": True, "selftest": rnd.isaac_channel_selftest()}
+
             res = rnd.restore_and_randomize(cfg, data_dir=data_dir, settle_fn=_settle)
             out = dict(res)
             out["ok"] = bool(res.get("ok"))

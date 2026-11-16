@@ -599,6 +599,24 @@ def cmd_randomize(args: argparse.Namespace) -> int:
             obj["axes"] = ax
         _log(f"已覆盖随机范围: x={rx} y={ry} z={rz}（None 表示用配置值）")
 
+    if getattr(args, "selftest", False):
+        resp = _request({"cmd": "randomize", "selftest": True,
+                         "data_dir": data_dir, "cfg": cfg}, timeout=60)
+        if not resp.get("ok"):
+            _log(f"ERROR {resp.get('error', '未知错误')}")
+            return 1
+        st = resp.get("selftest") or {}
+        _log("=== Isaac 回调内的通道自检 ===")
+        _log(f"  stage_ok     : {st.get('stage_ok')}")
+        _log(f"  usd_read     : {st.get('usd_read')}   ← 局部 TRS（必须可用）")
+        _log(f"  usd_world    : {st.get('usd_world')}  ← USD 世界位姿")
+        _log(f"  usd_write    : {st.get('usd_write')}  ← USD 写位姿")
+        _log(f"  rigid_read   : {st.get('rigid_read')} ← PhysX 刚体读")
+        _log(f"  service_read : {st.get('service_read')} ← ROS 服务（回调里预期超时）")
+        ok = st.get("usd_read") is not None and st.get("usd_write") is True
+        _log(f"\n  ⇒ {'✅ USD 通道可用，随机化应该正常' if ok else '❌ USD 通道不可用 —— 会退回服务并超时'}")
+        return 0 if ok else 1
+
     if getattr(args, "snapshot", False):
         resp = _request({"cmd": "randomize_snapshot", "data_dir": data_dir, "cfg": cfg},
                         timeout=60)
@@ -2115,6 +2133,8 @@ def main(argv: list[str] | None = None) -> int:
     rnd.add_argument("--task", default="", help="任务 key")
     rnd.add_argument("--snapshot", action="store_true",
                      help="只记录初始位姿（第一轮前跑一次）")
+    rnd.add_argument("--selftest", action="store_true",
+                     help="自检：在 Isaac 回调内各条读/写通道是否可用（排查随机化不生效）")
     rnd.add_argument("--rounds", type=int, default=1, help="连续随机几轮")
     rnd.add_argument("--range-x", dest="range_x", type=float, default=None,
                      help="临时覆盖 x 半幅（米）")

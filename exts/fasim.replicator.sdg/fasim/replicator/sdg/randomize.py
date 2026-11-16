@@ -150,15 +150,19 @@ def _get_pose_xform_fallback(prim_path: str) -> tuple[np.ndarray, np.ndarray] | 
         m = xf.ComputeLocalToWorldTransform(0.0)
         t = m.ExtractTranslation()
         q = m.ExtractRotationQuat()
-        pos = np.array([t[0], t[1], t[2]], dtype=np.float64)
-        # GfQuatd: (real, imaginary) → wxyz
+        if q is None:
+            return None
+        pos = np.array([float(t[0]), float(t[1]), float(t[2])], dtype=np.float64)
         im = q.GetImaginary()
-        quat = np.array([q.GetReal(), im[0], im[1], im[2]], dtype=np.float64)
+        quat = np.array([float(q.GetReal()), float(im[0]),
+                         float(im[1]), float(im[2])], dtype=np.float64)
         n = np.linalg.norm(quat)
         if n > 1e-9:
             quat = quat / n
         return pos, quat
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_once(f"usd_pose_exc:{prim_path}",
+                  f"WARN USD 读世界位姿失败 {prim_path}: {type(exc).__name__}: {exc}")
         return None
 
 
@@ -250,19 +254,29 @@ def set_pose_usd_api(prim_path: str, pos: np.ndarray, quat: np.ndarray) -> bool:
 
         t = local.ExtractTranslation()
         q = local.ExtractRotationQuat()
+        if q is None:
+            return False
 
         ops = {op.GetOpName(): op for op in xf.GetOrderedXformOps()}
         t_op = ops.get("xformOp:translate")
         if t_op is None:
             t_op = xf.AddTranslateOp()
-        t_op.Set(Gf.Vec3d(t[0], t[1], t[2]))
+        t_op.Set(Gf.Vec3d(float(t[0]), float(t[1]), float(t[2])))
         q_op = ops.get("xformOp:orient")
         if q_op is None:
             q_op = xf.AddOrientOp()
-        q_op.Set(Gf.Quatf(q.GetReal(), Gf.Vec3f(q.GetImaginary())))
+        im = q.GetImaginary()
+        # 用 Quatf 还是 Quatd 取决于 op 的精度；Quatf 最常见
+        try:
+            q_op.Set(Gf.Quatf(float(q.GetReal()),
+                              Gf.Vec3f(float(im[0]), float(im[1]), float(im[2]))))
+        except Exception:  # noqa: BLE001
+            q_op.Set(Gf.Quatd(float(q.GetReal()),
+                              Gf.Vec3d(float(im[0]), float(im[1]), float(im[2]))))
         return True
     except Exception as exc:  # noqa: BLE001
-        _log(f"WARN USD 写位姿失败 {prim_path}: {exc}")
+        _log_once(f"usd_set_exc:{prim_path}",
+                  f"WARN USD 写位姿失败 {prim_path}: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -426,21 +440,30 @@ def _read_xform_via_usd_api(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
     读不到、试管被跳过（看起来就是"试管没跟着架子走、躺在桌子旁边"）。
 
     直接查 USD stage 没有这个问题：它就是在当前线程同步返回。
+
+    ### 实现要点（踩过）
+    ``op.Get()`` 对 translate 返回 ``Gf.Vec3d/Vec3f``、对 orient 返回
+    ``Gf.Quatf/Quatd``。**``np.asarray(Gf.Quatf)`` 会抛异常**，于是整个函数
+    被 except 吞掉、返回 None，又退回（会超时的）服务路径。
+    所以这里对每种类型都显式取值，不做宽松转换。
     """
     try:
         import omni.usd
-        from pxr import UsdGeom
+        from pxr import Gf, UsdGeom
 
         stage = omni.usd.get_context().get_stage()
         if stage is None:
+            _log_once("usd_api", "WARN get_stage() 返回 None")
             return None
         prim = stage.GetPrimAtPath(prim_path)
-        if not prim or not prim.IsValid():
+        if not prim.IsValid():
+            _log_once(f"usd_api:{prim_path}", f"WARN prim 无效: {prim_path}")
             return None
         xf = UsdGeom.Xformable(prim)
         if not xf:
+            _log_once(f"usd_api_xf:{prim_path}", f"WARN 不可 Xformable: {prim_path}")
             return None
-        # 按 xformOpOrder 顺序合成局部 TRS
+
         t = np.zeros(3, dtype=np.float64)
         q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         s = np.ones(3, dtype=np.float64)
@@ -448,17 +471,37 @@ def _read_xform_via_usd_api(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
             name = op.GetOpName()
             val = op.Get()
             if "translate" in name:
-                t = np.asarray(val, dtype=np.float64).reshape(3)
+                t = np.array([float(val[0]), float(val[1]), float(val[2])], dtype=np.float64)
             elif "orient" in name:
-                v = np.asarray(val, dtype=np.float64).reshape(-1)[:4]
-                # UsdGeomXformOp 的 orient 是 (real, i, j, k) = wxyz，与我们要的一致
+                # Gf.Quatf / Gf.Quatd：(real, imaginary) → wxyz，与我们要的一致
+                if isinstance(val, (Gf.Quatf, Gf.Quatd)):
+                    im = val.GetImaginary()
+                    v = np.array([float(val.GetReal()), float(im[0]),
+                                  float(im[1]), float(im[2])], dtype=np.float64)
+                else:
+                    v = np.array([float(val[0]), float(val[1]),
+                                  float(val[2]), float(val[3])], dtype=np.float64)
                 n = np.linalg.norm(v)
                 q = v / n if n > 1e-9 else q
             elif "scale" in name:
-                s = np.asarray(val, dtype=np.float64).reshape(3)
+                s = np.array([float(val[0]), float(val[1]), float(val[2])], dtype=np.float64)
         return t, q, s
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_once(f"usd_api_exc:{prim_path}",
+                  f"WARN USD API 读 {prim_path} 异常: {type(exc).__name__}: {exc}")
         return None
+
+
+def _log_once(key: str, msg: str) -> None:
+    """同类消息只打一次（避免每帧刷屏）。"""
+    seen = getattr(_log_once, "_seen", None)
+    if seen is None:
+        seen = set()
+        _log_once._seen = seen          # type: ignore[attr-defined]
+    if key in seen:
+        return
+    seen.add(key)
+    _log(msg)
 
 
 def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -587,6 +630,55 @@ def get_pose_any(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
         return got
     # 外部进程：ROS 服务
     return get_pose_service(prim_path)
+
+
+def isaac_channel_selftest() -> dict:
+    """自检：确认「在 Isaac 回调里」能读/写位姿的各条通道是否可用。
+
+    必须在**真实回调上下文**里跑才有意义 —— 外部进程跑会得到不同结果
+    （外部进程里 ROS 服务是可用的，Isaac 回调里不可用）。
+
+    Returns:
+        ``{"usd_read": {...}, "usd_write": bool, "rigid": {...}, "service": {...}}``
+    """
+    out: dict = {"usd_read": None, "usd_write": None,
+                 "rigid_read": None, "service_read": None, "stage_ok": None}
+    probe = "/World/room/scene/test_tube_rack_01"
+    sub = "/World/room/scene/test_tube_rack_01/hole_4"
+
+    try:
+        import omni.usd
+        stage = omni.usd.get_context().get_stage()
+        out["stage_ok"] = stage is not None
+    except Exception as exc:  # noqa: BLE001
+        out["stage_ok"] = f"exc: {type(exc).__name__}: {exc}"
+
+    # 1) USD API 读局部 TRS
+    r = _read_xform_via_usd_api(sub)
+    out["usd_read"] = None if r is None else {
+        "t": [round(float(x), 5) for x in r[0]],
+        "q": [round(float(x), 5) for x in r[1]],
+    }
+
+    # 2) USD API 读世界位姿
+    w = _get_pose_xform_fallback(probe)
+    out["usd_world"] = None if w is None else {
+        "pos": [round(float(x), 5) for x in w[0]]}
+
+    # 3) RigidPrim 读
+    g = get_pose(probe)
+    out["rigid_read"] = None if g is None else {
+        "pos": [round(float(x), 5) for x in g[0]]}
+
+    # 4) 服务读（预期在回调里会超时 —— 这正是 bug 的来源）
+    s = get_pose_service(probe)
+    out["service_read"] = None if s is None else {
+        "pos": [round(float(x), 5) for x in s[0]]}
+
+    # 5) USD 写（写到当前位置，等价 no-op）
+    if w is not None:
+        out["usd_write"] = set_pose_usd_api(probe, w[0], w[1])
+    return out
 
 
 def get_prim_local_trs(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
