@@ -188,6 +188,63 @@ def find_segments(
     return out
 
 
+def find_whole_span(
+    activity: np.ndarray,
+    threshold: float,
+    dt: float,
+    head_sec: float,
+    tail_sec: float,
+) -> tuple[int, int] | None:
+    """整段模式：找出「保留开头一点 home + 完整任务 + 回 home 结束」的区间。
+
+    与 :func:`find_segments` 的区别（这是数采训练用的，不是切分工具）：
+
+    - ``find_segments`` 找**所有活跃段**并各切一条 —— 适合一个 session 里
+      跑了多个任务的情况。
+    - 本函数**整段保留**，只砍掉开头过长的待机和结尾多余的待机 —— 适合
+      「一个 session = 一条完整 episode」的数采，且**必须保留动作连续性**
+      （开头 home 姿态、结尾回 home 的过程都是训练要学的动作）。
+
+    为什么要保留开头一小段 home
+    ---------------------------
+    编排开始前仿真可能已经 Play 了十几秒（等 OCS2 就绪），这段全静止，
+    对训练无价值（ACT 会学到"长期不动"）。但**完全从第一帧动作开始切**
+    又会让 episode 缺少"起始于 home 姿态"这个上下文 —— 策略需要知道
+    "从待命状态开始"。所以保留 ``head_sec`` 秒静止作为起点。
+
+    为什么结尾要截到「最后一次明显运动之后一点」
+    -------------------------------------------
+    回 home 的过程是训练要学的收尾动作，必须保留；但回 home 完成后
+    还会有几秒静止（等下一次 stop），那部分无价值。所以取
+    「最后一次活跃帧 + ``tail_sec``」作为结尾 —— ``tail_sec`` 让机器人
+    真正停稳，避免截断在插值中途。
+
+    Args:
+        activity: 每帧关节变化率（rad/s）。
+        threshold: 超过此值算"在动"。
+        dt: 帧间隔（秒）。
+        head_sec: 开头保留多少秒静止（home 姿态）。
+        tail_sec: 结尾在最后一次运动后多留多少秒（等停稳）。
+
+    Returns:
+        ``(start, end)`` 闭区间；全程无活动返回 None。
+    """
+    active = activity > threshold
+    idx = np.flatnonzero(active)
+    if idx.size == 0:
+        return None
+
+    first_active = int(idx[0])
+    last_active = int(idx[-1])
+
+    head_pad = max(0, int(round(head_sec / dt)))
+    tail_pad = max(0, int(round(tail_sec / dt)))
+
+    start = max(0, first_active - head_pad)
+    end = min(len(activity) - 1, last_active + tail_pad)
+    return start, end
+
+
 def trim_session(
     session_dir: str | Path,
     threshold: float = 0.01,
@@ -195,23 +252,41 @@ def trim_session(
     min_len_sec: float = 2.0,
     merge_gap_sec: float = 1.5,
     write: bool = False,
+    mode: str = "segments",
+    head_sec: float = 2.0,
+    tail_sec: float = 1.5,
+    out_name: str = "episode_trimmed",
 ) -> dict:
-    """主入口。返回报告 dict；``write=True`` 时同时写出 segment_*.npz。"""
+    """主入口。返回报告 dict；``write=True`` 时写出 npz。
+
+    Args:
+        mode: ``"segments"`` = 旧行为（找所有活跃段各切一条，适合一个
+            session 里跑了多个任务）；``"whole"`` = 整段保留、只裁掉
+            开头过长待机和结尾多余待机（**数采训练用这个**）。
+        head_sec: whole 模式下开头保留多少秒静止（home 姿态）。
+        tail_sec: whole 模式下结尾在最后一次运动后多留多少秒。
+        out_name: whole 模式写出的文件名（不含 .npz）。
+    """
     data = load_tracks(session_dir)
     q = data["joint_pos"]
     dt = data["dt"]
     n = q.shape[0]
 
     act = compute_activity(q, dt)
-    segs = find_segments(act, threshold, pad_sec, dt, min_len_sec, merge_gap_sec)
+
+    if mode == "whole":
+        span = find_whole_span(act, threshold, dt, head_sec, tail_sec)
+        segs = [span] if span else []
+    else:
+        segs = find_segments(act, threshold, pad_sec, dt, min_len_sec, merge_gap_sec)
 
     report = {
         "session": str(data["dir"]),
+        "mode": mode,
         "frames_total": n,
         "dt_ms": round(dt * 1000, 2),
         "duration_sec": round(n * dt, 2),
         "threshold_rad_s": threshold,
-        "pad_sec": pad_sec,
         "activity": {
             "max": round(float(act.max()), 4),
             "p95": round(float(np.percentile(act, 95)), 4),
@@ -230,39 +305,65 @@ def trim_session(
             for i, (s, e) in enumerate(segs)
         ],
     }
+    if mode == "whole":
+        report["head_sec"] = head_sec
+        report["tail_sec"] = tail_sec
+    else:
+        report["pad_sec"] = pad_sec
+
     kept = sum(s["frames"] for s in report["segments"])
     report["kept_frames"] = kept
     report["kept_ratio"] = round(kept / n, 3) if n else 0.0
+    report["dropped_frames"] = n - kept
 
-    _log(f"{n} 帧 / {report['duration_sec']}s，dt={report['dt_ms']}ms")
+    _log(f"{n} 帧 / {report['duration_sec']}s，dt={report['dt_ms']}ms  [{mode}]")
     _log(f"活跃度 max={report['activity']['max']} rad/s  median={report['activity']['median']}")
     if not segs:
         _log("WARN 没找到任何活跃段 —— 阈值太大？试试 --threshold 0.005")
     for s in report["segments"]:
         _log(f"  段 {s['index']}: 帧 {s['start_frame']}-{s['end_frame']} "
              f"({s['start_sec']}s-{s['end_sec']}s) {s['duration_sec']}s")
+    if mode == "whole" and segs:
+        s0 = report["segments"][0]
+        _log(f"  裁掉：开头 {s0['start_frame']} 帧（{s0['start_sec']}s 待机），"
+             f"结尾 {n - 1 - s0['end_frame']} 帧"
+             f"（{round((n - 1 - s0['end_frame']) * dt, 2)}s）")
     _log(f"保留 {kept}/{n} 帧（{report['kept_ratio']*100:.1f}%）")
 
     out_dir = data["dir"] / "segments"
     if write and segs:
         out_dir.mkdir(parents=True, exist_ok=True)
-        for i, (s, e) in enumerate(segs, 1):
-            _write_segment(data, s, e, out_dir / f"segment_{i:03d}.npz")
+        if mode == "whole":
+            # 整段模式只出一个文件，直接放会话根目录（下游 pack/导出更好找）
+            out_path = data["dir"] / f"{out_name}.npz"
+            _write_segment(data, segs[0][0], segs[0][1], out_path, kind="whole_trimmed")
+            report["written"] = str(out_path)
+            _log(f"已写出 → {out_path}")
+        else:
+            for i, (s, e) in enumerate(segs, 1):
+                _write_segment(data, s, e, out_dir / f"segment_{i:03d}.npz")
+            _log(f"已写出 {len(segs)} 个 episode → {out_dir}")
         (out_dir / "trim_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        _log(f"已写出 {len(segs)} 个 episode → {out_dir}")
         _log(f"报告: {out_dir / 'trim_report.json'}")
     elif write:
         _log("没有段可写")
     else:
-        _log("（只报告，未写文件；加 --write 才会切分）")
+        _log("（只报告，未写文件；加 --write 才会写出）")
 
     return report
 
 
-def _write_segment(data: dict, s: int, e: int, out: Path) -> Path:
-    """写一个 episode 格式的 npz（与 pack 的输出一致）。"""
+def _write_segment(
+    data: dict, s: int, e: int, out: Path, kind: str = "live_capture_trimmed"
+) -> Path:
+    """写一个 episode 格式的 npz（与 pack 的输出一致）。
+
+    Args:
+        kind: 写进 meta 的来源标记。``live_capture_trimmed`` = 从长 session
+            切出的段；``whole_trimmed`` = 整段保留、只裁两头待机。
+    """
     q = data["joint_pos"][s:e + 1]
     n = q.shape[0]
     dt = data["dt"]
@@ -277,7 +378,7 @@ def _write_segment(data: dict, s: int, e: int, out: Path) -> Path:
         "meta": np.array(
             json.dumps(
                 {
-                    "kind": "live_capture_trimmed",
+                    "kind": kind,
                     "source_session": str(data["dir"]),
                     "start_frame": int(s),
                     "end_frame": int(e),

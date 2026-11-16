@@ -247,9 +247,25 @@ def _gripper_switch_series(
             # 全程同一个值 —— 该 episode 没动过夹爪，按张开处理
             bounds.append(None)
             continue
-        # 初始值：第一条有效帧。它通常等于 URDF 初始位（0.0），也正因为它
-        # 是"运控尚未下发"的 idle 值，所以判定时要单独排除（见下面的 idle 处理）。
-        init = float(finite[0])
+        # 初始值必须是 URDF idle，不是「这条轨迹的第一帧」。
+        #
+        # AdaptiveGripperController 用控制器启动时的关节位（URDF 初始，
+        # G1D 上是 0.0）决定哪个限位是闭合。采集若从「夹爪已经张开」开始，
+        # 第一帧命令已经是张开限位（实测 run_079 起手就是 +0.0245，序列里
+        # 没有 0.0）。拿第一帧当 init 会把开/合判反，闭合帧全部标成张开。
+        #
+        # 所以优先用落在两限位之间的样本（那才是还没下发指令的 idle）。
+        # 序列里没有这种样本、但 0 夹在两限位之间时，用 0：这是这套夹爪的
+        # URDF 初始位。两边都对不上才退回第一帧。
+        span = hi - lo
+        margin = 0.05 * span
+        interior = finite[(finite > lo + margin) & (finite < hi - margin)]
+        if len(interior):
+            init = float(interior[0])
+        elif lo < 0.0 < hi:
+            init = 0.0
+        else:
+            init = float(finite[0])
         # 复刻 AdaptiveGripperController：距初始值更近的限位 = 闭合位
         if abs(hi - init) < abs(lo - init):
             bounds.append((hi, lo, init))     # (closed, open, init)

@@ -262,6 +262,67 @@ def _request(payload: dict, timeout: float = 30.0) -> dict:
 # ---------------------------------------------------------------- 子命令
 
 
+def _auto_snapshot_if_needed(robot: str, task: str) -> bool:
+    """采集开始前：没有初始位姿快照就自动记录一份。
+
+    为什么放在这里
+    --------------
+    随机化的 ``place_on`` 依赖「物体快照」来还原「试管在孔里」这个状态。
+    没有快照时随机化会失败，但报错发生在**随机化时**，那时仿真已经跑过
+    任务、试管被拿走了 —— 这时补记的快照是**错的**（会记下"试管在左手
+    或已插孔"的位置），而且很难察觉。
+
+    所以最稳的时机是「刚 Play、物体还在初始位置、任务还没跑」时自动记。
+    采集开始前正好是这个时刻。
+
+    Returns:
+        True = 已有或记录成功；False = 失败（不阻塞采集，只警告）。
+    """
+    import json as _json
+
+    from fasim.replicator.sdg.config_io import load_task_config
+
+    try:
+        cfg = load_task_config(robot, task)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 读任务配置失败，跳过快照检查: {exc}")
+        return False
+
+    rnd_cfg = dict(getattr(cfg, "randomize", {}) or {})
+    if not rnd_cfg:
+        return True   # 没配随机化，不需要快照
+
+    data_dir = str(getattr(cfg, "output_dir", "") or "")
+    if not data_dir:
+        _log("WARN 任务配置没有 output_dir，跳过快照检查")
+        return False
+
+    snap_file = Path(data_dir).expanduser() / "scene_initial_poses.json"
+    if snap_file.is_file():
+        # 已有快照：不覆盖。快照必须来自「物体在初始位」的时刻，
+        # 中途重记只会把它弄脏（比如试管已被拿走）。
+        _log(f"初始位姿快照已存在 ({snap_file})")
+        return True
+
+    _log("没有初始位姿快照 —— 自动记录一份")
+    _log("  时机：采集开始前，物体应在初始位置")
+    resp = _request(
+        {"cmd": "randomize_snapshot", "robot_key": robot, "task_key": task,
+         "data_dir": data_dir},
+        timeout=60,
+    )
+    if not resp.get("ok"):
+        _log(f"WARN 自动记录快照失败: {resp.get('error', '未知')}")
+        _log("  随机化的 place_on 可能失效；手动补记: "
+             "./sdg.sh randomize --snapshot")
+        return False
+
+    snap = resp.get("snapshot") or {}
+    n = len(snap.get("objects") or snap) if isinstance(snap, dict) else 0
+    _log(f"已记录初始位姿快照（{n} 个物体）→ {snap_file}")
+    return True
+
+
 def cmd_capture(args: argparse.Namespace) -> int:
     from fasim.replicator.sdg.config_io import CONFIG_ROOT, load_task_config
 
@@ -461,6 +522,8 @@ def cmd_capture(args: argparse.Namespace) -> int:
         _log("已取消")
         return 0
 
+    _auto_snapshot_if_needed(robot, task)
+
     req = {
         "cmd": "start",
         "robot_key": robot,
@@ -527,7 +590,176 @@ def cmd_status(args: argparse.Namespace) -> int:
     _log(f"采集中: {resp['frames']} 帧 / {resp['physics_steps']} 物理步")
     _log(f"  相机 {resp['cameras']}  every={resp['every']}  错误 {resp['errors']}")
     _log(f"  输出 {resp['out']}")
+    dc = resp.get("done_checker")
+    if dc:
+        cur = dc.get("last_d_xy_mm")
+        cur_s = f"{cur:.1f}mm" if cur is not None else "—"
+        state = "✅ 已完成" if dc.get("done") else f"进行中（当前 xy={cur_s}）"
+        _log(f"  完成检测: {state}  判据 {dc['object']}→{dc['rack']} "
+             f"xy<{dc['xy_tol_mm']:.0f}mm")
+        if dc.get("done"):
+            _log(f"    命中帧 {dc.get('done_frame')}")
+    elif resp.get("done"):
+        _log(f"  完成检测: ✅ {resp['done']}")
     return 0
+
+
+def _load_state() -> dict:
+    """读菜单保存的上下文（上次选的机器人/任务）。
+
+    与 ``sdg_menu.py`` 的 STATE_PATH 保持一致；读不到就返回空 dict
+    （``motion`` 命令会提示用 --robot/--task 显式指定）。
+    """
+    import json as _json
+
+    p = Path.home() / ".cache" / "fasim_sdg" / "menu_state.json"
+    try:
+        return _json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def cmd_motion(args: argparse.Namespace) -> int:
+    """一键起编排：从 sdg 侧拉起 motion-generation。
+
+    为什么要从 sdg 起而不是切仓库手敲 —— 见
+    :mod:`fasim.replicator.sdg.motion_launch` 的模块 docstring。
+    """
+    from fasim.replicator.sdg import motion_launch as ml
+
+    # 机器人/任务：显式参数 > 上次采集用的（state）
+    robot = str(getattr(args, "robot", "") or "").strip()
+    task = str(getattr(args, "task", "") or "").strip()
+    if not (robot and task):
+        st = _load_state()
+        robot = robot or str(st.get("robot") or "")
+        task = task or str(st.get("task") or "")
+    if not (robot and task):
+        _log("ERROR 不知道要跑哪个任务 —— 用 --robot/--task 指定，"
+             "或先跑一次 capture 让我记住上下文")
+        return 1
+
+    ok, info = ml.preflight(
+        repo_arg=getattr(args, "repo", "") or "",
+        robot_key=robot,
+        task_key=task,
+    )
+    if not ok:
+        return 2
+
+    _log(f"编排目标: {info['sdg_robot']}/{info['sdg_task']} "
+         f"→ {info['robot']}/{info['task_key']}")
+    _log(f"  仓库 {info['repo']}")
+    _log(f"  工作区 {info['workspace']}")
+    if info.get("activate"):
+        _log(f"  venv {info['activate']}")
+    else:
+        _log("  WARN 没找到 venv，将用当前 python（可能缺 rclpy）")
+
+    running = ml.is_running()
+    if running:
+        _log(f"WARN 已有编排在跑（pid {running[:3]}）—— 可能抢同一个 OCS2/关节")
+
+    if getattr(args, "check", False):
+        _log("预检通过（--check 模式，未启动）")
+        return 0
+
+    # 采集没开就提醒一句：编排照跑，但采不到数据
+    st = _request({"cmd": "status"}, timeout=10)
+    if not st.get("armed"):
+        _log("WARN 当前未采集 —— 编排会照跑，但采不到数据。"
+             "先 ./sdg.sh capture 开始采集")
+
+    return ml.run_motion(
+        repo_arg=getattr(args, "repo", "") or "",
+        robot_key=robot,
+        task_key=task,
+        scene=str(getattr(args, "scene", "") or "default"),
+        background=bool(getattr(args, "background", False)),
+        log_path=str(getattr(args, "log", "") or ""),
+    )
+
+
+def cmd_auto(args: argparse.Namespace) -> int:
+    """一键数采：随机化 → 采集 → 编排 → 结束 → 裁剪 → 打包。
+
+    详见 :mod:`fasim.replicator.sdg.auto_collect`。
+    """
+    from fasim.replicator.sdg import auto_collect, motion_launch as ml
+
+    robot = str(getattr(args, "robot", "") or "").strip()
+    task = str(getattr(args, "task", "") or "").strip()
+    if not (robot and task):
+        st = _load_state()
+        robot = robot or str(st.get("robot") or "")
+        task = task or str(st.get("task") or "")
+    if not (robot and task):
+        _log("ERROR 需要 --robot 与 --task（或先跑一次 capture 记住上下文）")
+        return 1
+
+    # ---- 预检：Isaac 在跑、socket 通、编排仓库找得到 ----
+    _log("预检")
+    st = _request({"cmd": "status"}, timeout=10)
+    if not st.get("ok"):
+        _log(f"ERROR Isaac 扩展没响应: {st.get('error')}")
+        _log("     先启动仿真: cd ~/FaSim-Isaac && ./run.sh")
+        return 2
+    _log("   Isaac 扩展就绪")
+
+    ok, info = ml.preflight(robot_key=robot, task_key=task)
+    if not ok:
+        return 2
+    _log(f"   编排 {info['robot']}/{info['task_key']}")
+    _log(f"   工作区 {info['workspace']}")
+
+    try:
+        ctx = auto_collect._resolve_task_ctx(robot, task)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR 读任务配置失败: {exc}")
+        return 2
+    _log(f"   数据目录 {ctx['data_dir']}")
+    _log(f"   随机化 {'有' if ctx['has_randomize'] else '无'}"
+         + (f"，快照{'已存在' if ctx['snapshot_file'].is_file() else '待记录'}"
+            if ctx["has_randomize"] else ""))
+
+    rounds = max(1, int(getattr(args, "rounds", 1) or 1))
+
+    # 磁盘预检 —— 长跑最硬的限制（每轮约 5G）
+    disk_ok, disk_msg = auto_collect.check_disk_space(ctx["data_dir"], rounds)
+    _log(f"   {disk_msg}")
+    if not disk_ok:
+        _log("ERROR 磁盘空间不足，请先清理（旧 run_* 里的 frames/ 最占空间）")
+        return 2
+
+    if getattr(args, "dry_run", False):
+        _log(f"预检通过（--dry-run，将跑 {rounds} 轮）")
+        return 0
+
+    # ---- 跑 ----
+    results = auto_collect.run_batch(
+        robot_key=robot,
+        task_key=task,
+        rounds=rounds,
+        scene=str(getattr(args, "scene", "") or "default"),
+        every=int(getattr(args, "every", 10) or 10),
+        camera=str(getattr(args, "camera", "") or "all"),
+        head_sec=float(getattr(args, "head", 2.0)),
+        tail_sec=float(getattr(args, "tail", 1.5)),
+        do_trim=not bool(getattr(args, "no_trim", False)),
+        do_pack=not bool(getattr(args, "no_pack", False)),
+        stop_on_fail=not bool(getattr(args, "keep_going", False)),
+        skip_randomize=bool(getattr(args, "skip_randomize", False)),
+        retries=int(getattr(args, "retries", 1) or 0),
+        restart_hint_every=int(getattr(args, "restart_hint_every", 5) or 0),
+        do_export=not bool(getattr(args, "no_export", False)),
+        prune_keep=int(getattr(args, "keep_frames", 8)),
+        batch_export=not bool(getattr(args, "export_each_round", False)),
+    )
+
+    if getattr(args, "json", False):
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+
+    return 0 if all(r.get("ok") for r in results) else 1
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1890,6 +2122,10 @@ def cmd_trim(args: argparse.Namespace) -> int:
                 min_len_sec=args.min_len,
                 merge_gap_sec=args.merge_gap,
                 write=args.write,
+                mode=args.mode,
+                head_sec=args.head,
+                tail_sec=args.tail,
+                out_name=args.out_name,
             )
             if len(sessions) > 1:
                 seg = (report or {}).get("segments") or []
@@ -2163,6 +2399,52 @@ def main(argv: list[str] | None = None) -> int:
     rnd.set_defaults(func=cmd_randomize)
     sub.add_parser("randomize-check", help="随机化可行性验证（会给出 Script Editor 指令）").set_defaults(
         func=cmd_randomize_check)
+
+    mo = sub.add_parser("motion", help="一键起编排（motion-generation 跑一遍任务）")
+    mo.add_argument("--robot", default="", help="机器人 key（默认用上次采集的）")
+    mo.add_argument("--task", default="", help="任务 key（默认用上次采集的）")
+    mo.add_argument("--scene", default="default", help="编排的场景预设（默认 default）")
+    mo.add_argument("--repo", default="", help="编排仓库路径（默认 ~/lerobot_ros2）")
+    mo.add_argument("--background", "-b", action="store_true",
+                    help="后台跑，立即返回（日志默认 /tmp/motion_generation.log）")
+    mo.add_argument("--log", default="", help="后台模式的日志路径")
+    mo.add_argument("--check", action="store_true",
+                    help="只做预检（定位仓库/venv/映射），不真的跑")
+    mo.set_defaults(func=cmd_motion)
+    ac = sub.add_parser("auto",
+                        help="一键数采：随机化→采集→编排→结束→裁剪→打包")
+    ac.add_argument("--robot", default="", help="机器人 key")
+    ac.add_argument("--task", default="", help="任务 key")
+    ac.add_argument("--rounds", type=int, default=1, help="跑几轮（每轮重新随机化）")
+    ac.add_argument("--scene", default="default", help="编排的场景预设")
+    ac.add_argument("--every", type=int, default=10, help="每 N 个物理步采一帧")
+    ac.add_argument("--camera", default="all", help="相机（all 或逗号分隔名字）")
+    ac.add_argument("--head", type=float, default=2.0,
+                    help="裁剪时开头保留多少秒 home（默认 2.0）")
+    ac.add_argument("--tail", type=float, default=1.5,
+                    help="裁剪时结尾多留多少秒等停稳（默认 1.5）")
+    ac.add_argument("--no-trim", action="store_true", help="不裁剪（保留完整原始帧）")
+    ac.add_argument("--no-pack", action="store_true", help="不打包 episode.npz")
+    ac.add_argument("--no-export", action="store_true",
+                    help="全程不导出 LeRobot 数据集（此时不会删 frames）")
+    ac.add_argument("--export-each-round", action="store_true",
+                    help="每轮单独导出一个数据集（默认是跑完所有轮后合并成"
+                         "一个多-episode 数据集）")
+    ac.add_argument("--keep-frames", type=int, default=8,
+                    help="导出后保留多少原始帧用于质监（默认 8；-1=全留，0=全删）")
+    ac.add_argument("--skip-randomize", action="store_true",
+                    help="不随机化（固定位姿，用于复现问题）")
+    ac.add_argument("--keep-going", action="store_true",
+                    help="某轮失败后继续跑下一轮（默认中止）")
+    ac.add_argument("--retries", type=int, default=1,
+                    help="单轮失败重试次数（默认 1；长跑建议保留）")
+    ac.add_argument("--restart-hint-every", type=int, default=5,
+                    help="每 N 轮提醒重启 Isaac（RTF 会逐轮下降；0=关闭）")
+    ac.add_argument("--dry-run", action="store_true",
+                    help="只做预检，不真的开始")
+    ac.add_argument("--json", action="store_true", help="最后打印 JSON 汇总")
+    ac.set_defaults(func=cmd_auto)
+
     sub.add_parser("status", help="查看采集进度").set_defaults(func=cmd_status)
     sub.add_parser("stop", help="结束采集").set_defaults(func=cmd_stop)
     sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
@@ -2260,15 +2542,24 @@ def main(argv: list[str] | None = None) -> int:
                    help="--drive ee 时的发送频率；留空按 episode 的 dt")
     v.set_defaults(func=cmd_preview)
 
-    t = sub.add_parser("trim", help="把连续采集切成任务片段，剔除待机段")
+    t = sub.add_parser("trim", help="裁掉待机段（数采用 whole 模式：留开头 home + 截到回 home）")
     t.add_argument("session", help="会话目录，或任务目录（批量处理该任务下所有会话）")
+    t.add_argument("--mode", choices=("segments", "whole"), default="whole",
+                   help="whole=整段保留只裁两头待机（数采默认）；"
+                        "segments=找所有活跃段各切一条（一个 session 跑多任务时用）")
     t.add_argument("--threshold", type=float, default=0.01,
                    help="关节角变化率阈值 rad/s（默认 0.01）")
-    t.add_argument("--pad", type=float, default=1.0, help="每段前后缓冲秒数")
-    t.add_argument("--min-len", type=float, default=2.0, help="短于此秒数的段丢弃")
+    t.add_argument("--pad", type=float, default=1.0, help="[segments] 每段前后缓冲秒数")
+    t.add_argument("--min-len", type=float, default=2.0, help="[segments] 短于此秒数的段丢弃")
     t.add_argument("--merge-gap", type=float, default=1.5,
-                   help="两段间隔短于此秒数则合并")
-    t.add_argument("--write", action="store_true", help="真的写出 segment_*.npz")
+                   help="[segments] 两段间隔短于此秒数则合并")
+    t.add_argument("--head", type=float, default=2.0,
+                   help="[whole] 开头保留多少秒静止（home 姿态上下文，默认 2.0）")
+    t.add_argument("--tail", type=float, default=1.5,
+                   help="[whole] 最后一次运动后多留多少秒等停稳（默认 1.5）")
+    t.add_argument("--out-name", default="episode_trimmed",
+                   help="[whole] 输出文件名（不含 .npz）")
+    t.add_argument("--write", action="store_true", help="真的写出 npz")
     t.add_argument("--json", action="store_true", help="额外打印完整 JSON 报告")
     t.add_argument("-y", "--yes", action="store_true", help="批量时跳过确认")
     t.set_defaults(func=cmd_trim)

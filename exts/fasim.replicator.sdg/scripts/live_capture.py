@@ -581,26 +581,68 @@ def arm_capture(
                     if cached is not None:
                         _log(f"相机 {spec.name}: 缓存的 rp 已失效，重建")
                         cache.pop(key, None)
+                        # 旧 rp 上的 annotator 也一并丢弃（只从缓存移除，
+                        # 不 destroy —— 见 stop_capture 的说明）。
+                        # 否则重建后会拿到绑在失效 rp 上的旧 annotator。
+                        for ak in [
+                            k for k in _S.get("_ann_cache", {})
+                            if k.startswith(f"{key}@")
+                        ]:
+                            _S["_ann_cache"].pop(ak, None)
                     rp = rep.create.render_product(spec.prim_path, (w, h))
                     cache[key] = rp
             except Exception as exc:  # noqa: BLE001
                 _log(f"WARN 相机 {spec.name} 创建失败 ({spec.prim_path}): {exc}")
                 continue
-            rgb = rep.annotators.get("rgb")
-            rgb.attach(rp)
-            dep = None
-            if depth:
-                dep = rep.annotators.get("distance_to_image_plane")
-                dep.attach(rp)
-            # 相机参数（内参 + 位姿）—— 没有它深度图无法转点云，也无法做
-            # 视觉-状态对齐校验。字段与布局见 _extract_camera_params。
-            cp = None
+            # ---- annotator：必须复用，否则长跑会累积 ----
+            #
+            # 实测劣化：连续 6 轮后 RTF 从 131Hz 掉到 78Hz（-40%）。
+            # 原因就是每次 arm_capture 都 `rep.annotators.get("rgb")` 新建
+            # 一个 annotator 对象、attach 到 rp，而 stop_capture 只 detach
+            # 不销毁 —— 对象本身留在 Replicator 的注册表里累积，每轮多 3 个
+            # （rgb/depth/camera_params）× 3 相机 = 9 个/轮，50 轮就是 450 个。
+            #
+            # 每个多余 annotator 都会在渲染时被遍历，直接拖慢主循环。
+            #
+            # 解法：和 rp 一样按 key 缓存复用。同一 (相机, 分辨率, prim) 的
+            # annotator 只需一个；重复 attach 是幂等的。
+            #
+            # 注意：**不能 destroy**（会破坏 Replicator 全局注册状态，
+            # 见 stop_capture 里的说明），但复用它就没必要 destroy。
+            ann_cache = _S.setdefault("_ann_cache", {})
+
+            def _get_ann(kind: str, _key: str):
+                """取缓存的 annotator；没有就新建一个并存起来。"""
+                ak = f"{_key}@{kind}"
+                obj = ann_cache.get(ak)
+                if obj is None:
+                    obj = rep.annotators.get(kind)
+                    ann_cache[ak] = obj
+                    _ann_new[0] += 1
+                return obj
+
+            _ann_new = [0]
             try:
-                cp = rep.annotators.get("camera_params")
-                cp.attach(rp)
-            except Exception as exc:  # noqa: BLE001
-                _log(f"WARN 相机 {spec.name} 的 camera_params 不可用: {exc}")
+                rgb = _get_ann("rgb", key)
+                rgb.attach(rp)
+                dep = None
+                if depth:
+                    dep = _get_ann("distance_to_image_plane", key)
+                    dep.attach(rp)
+                # 相机参数（内参 + 位姿）—— 没有它深度图无法转点云，也无法做
+                # 视觉-状态对齐校验。字段与布局见 _extract_camera_params。
                 cp = None
+                try:
+                    cp = _get_ann("camera_params", key)
+                    cp.attach(rp)
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"WARN 相机 {spec.name} 的 camera_params 不可用: {exc}")
+                    cp = None
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN 相机 {spec.name} annotator 创建失败: {exc}")
+                continue
+            if _ann_new[0]:
+                _log(f"  新建 {_ann_new[0]} 个 annotator（其余复用缓存）")
             cams.append({"name": spec.name, "rp": rp, "rgb": rgb, "depth": dep,
                          "cparams": cp,
                          "size": (w, h), "prim": str(spec.prim_path)})
@@ -719,6 +761,41 @@ def arm_capture(
         _log("ERROR 什么都没采 —— 已写入 .capture_failed.json 标记")
         return None
 
+    # ---- 任务完成检测器（可选）----
+    #
+    # 从任务配置的 done_when 段建。没配就 None，逐帧检测完全跳过。
+    #
+    # 前提校验：判据要读 obj/<label>_pos，所以这两个 label 必须在
+    # tracked_prims 里、且 obj_views 确实建起来了。配置写错 label 时
+    # 静默不触发会比报错难查得多（表现为"跑完了但永远不判完成"），
+    # 所以这里显式检查并 WARN。
+    done_checker = None
+    done_cfg = getattr(task, "done_when", None) or {}
+    if done_cfg:
+        from fasim.replicator.sdg import completion as _completion
+
+        obj_lbl = str(done_cfg.get("object") or "test_tube")
+        rack_lbl = str(done_cfg.get("rack") or "test_tube_rack")
+        missing = [lbl for lbl in (obj_lbl, rack_lbl)
+                   if lbl not in _S.get("obj_views", {})]
+        if missing:
+            _log(f"WARN done_when 需要的物体 {missing} 不在 tracked_prims 里 —— "
+                 f"完成检测已禁用（可选: {sorted(obj_views)}）")
+        else:
+            try:
+                done_checker = _completion.CompletionChecker(done_cfg)
+                st = done_checker.status()
+                dz_s = (f"dz<{st['dz_inside_mm']:.0f}mm"
+                        if st["dz_inside_mm"] is not None else "dz不限")
+                tilt_s = (f"tilt<{st['max_tilt_deg']:.0f}°"
+                          if st["max_tilt_deg"] is not None else "tilt不限")
+                _log(f"完成检测: {st['object']} → {st['rack']} 孔位 "
+                     f"xy<{st['xy_tol_mm']:.0f}mm 且 {dz_s} 且 {tilt_s} "
+                     f"连续 {st['consecutive_frames']} 帧"
+                     + ("，命中即停" if done_checker.stop_on_complete else "，仅标注"))
+            except Exception as exc:  # noqa: BLE001
+                _log(f"WARN done_when 配置无效，完成检测禁用: {exc}")
+
     import time
 
     # ===================== 物理步频：设定值 vs 实际值 =====================
@@ -800,6 +877,12 @@ def arm_capture(
         # 供 session.json 记录，下游 pack/fk 靠它定位 planning URDF
         robot_key=str(robot_key), task_key=str(task_key),
         preset=str(preset or ""),
+        # 任务完成检测（None = 未配置）。done_info 命中后保持，
+        # 供 _pump_socket 侧收尾与 status 查询读取。
+        done_checker=done_checker,
+        done_info=None,
+        done_at=None,
+        _done_err=0,
     )
     if physics_dt > 0:
         fps_sim = 1.0 / (physics_dt * max(1, int(every)))
@@ -952,6 +1035,46 @@ def arm_capture(
             # savez 无压缩只要 1.3ms（快 40 倍），代价是文件大一点。
             np.savez(_S["out"] / "frames" / f"frame_{idx:06d}.npz", **payload)
             _S["saved"] += 1
+
+            # ---- 任务完成检测（半自动数采）----
+            #
+            # 必须在落盘**之后**判断：完成判定要引用这一帧，若先判后存，
+            # 最后一帧可能没写进磁盘（用户会看到 session.json 说 done 但
+            # 帧数少一个）。
+            #
+            # 这里只有 numpy 运算（旋转+求距离），微秒级，不阻塞物理步进。
+            # 绝不在这里调 stop_capture()：那个函数会 detach annotator、
+            # 写 session.json，在物理步回调里做重活会打断步进。
+            # 只置一个标志，由 _pump_socket 的 app.update 侧收尾。
+            checker = _S.get("done_checker")
+            if checker is not None and not _S.get("done_info"):
+                try:
+                    verdict = checker.update(payload)
+                except Exception as exc:  # noqa: BLE001
+                    verdict = None
+                    if _S.get("_done_err", 0) < 2:
+                        _S["_done_err"] = 1
+                        _log(f"WARN 完成检测失败（不影响采集）: {exc!r}")
+                if verdict is not None:
+                    _S["done_info"] = verdict
+                    _S["done_at"] = time.monotonic()
+                    _log("=" * 60)
+                    _log(f"任务完成判定命中 —— {verdict['object']} 已在 "
+                         f"{verdict['rack']} 的孔位"
+                         f"（xy={verdict['d_xy_mm']}mm，"
+                         f"dz={verdict['dz_mm']}mm，"
+                         f"倾角={verdict['tilt_deg']}°，"
+                         f"连续 {verdict['consecutive_frames']} 帧）")
+                    if checker.stop_on_complete:
+                        _log("将在下次 app.update 时结束采集（stop_on_complete=true）")
+                    else:
+                        _log("继续采集到手动 stop（stop_on_complete=false）")
+                    _log("=" * 60)
+                    try:
+                        _S["_flush_progress"]()
+                    except Exception:  # noqa: BLE001
+                        pass
+
             if idx % 20 == 0:
                 _log(f"frame {idx} step {_S['step']} "
                      f"({_S['saved']} 帧已存, {_S['skipped']} 步跳过)")
@@ -1063,13 +1186,47 @@ def arm_capture(
     _log(f"相机: {[c['name'] for c in _S['cameras']]}  每 {_S['every']} 个物理步采 1 帧")
     _log("下一步: 运行【轨迹生成 / 任务编排工具】让机器人跑一遍任务")
     _log("跑完: 回到本终端执行 ./scripts/sdg.sh stop（或菜单里选「结束采集」）")
-    _log("=" * 60)
-    # 挂载成功 → 删掉失败标记（有标记 = 采集没起来）
+    _log("=" * 60)    # 挂载成功 → 删掉失败标记（有标记 = 采集没起来）
     try:
         fail_marker.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001
         pass
     return {"out": str(out), "cameras": [c["name"] for c in _S["cameras"]], "every": _S["every"]}
+
+
+def _stop_reason() -> str:
+    """本次采集为什么结束。
+
+    优先级：完成检测 > 帧数上限 > 人工。
+    （完成命中后即使随后又因帧数上限停止，也应该记为 task_completed，
+    否则这条好数据会被误筛掉。）
+    """
+    if _S.get("done_info"):
+        return "task_completed"
+    max_frames = _S.get("max_frames")
+    if max_frames and _S["saved"] >= int(max_frames):
+        return "max_frames"
+    return "manual"
+
+
+def request_stop(reason: str = "manual") -> None:
+    """请求结束采集 —— **在 app.update 侧调用，不要在物理步回调里调**。
+
+    完成检测命中后由 ``extension._pump_socket`` 每帧检查 ``_S["done_info"]``，
+    这里只做一件事：判断该不该停，然后调 ``stop_capture()``。
+
+    为什么不在 ``_emit_frame`` 里直接停：``stop_capture`` 会 detach
+    annotator、写 session.json、打日志，在物理步回调里做这些会打断步进。
+    """
+    if not _S["armed"]:
+        return
+    checker = _S.get("done_checker")
+    if checker is None or not checker.stop_on_complete:
+        return
+    if not _S.get("done_info"):
+        return
+    _log(f"完成检测触发自动收尾（{reason}）")
+    stop_capture()
 
 
 def stop_capture() -> dict:
@@ -1153,6 +1310,19 @@ def stop_capture() -> dict:
         "ee_xform_control": sorted(_S.get("ee_prims", {}).keys()),
         "objects_captured": sorted(_S.get("obj_views", {}).keys()),
         "code_stamp": _S.get("code_stamp", "unknown"),
+        # ===== 任务完成检测（半自动数采）=====
+        #
+        # stop_reason 是**筛数据的关键**：
+        #   task_completed  → 编排确实把东西放到位了，可训练
+        #   manual          → 人手停的（可能中途放弃/失败）
+        #   max_frames      → 到上限
+        #   (无该字段)      → 老数据，未做检测
+        "stop_reason": _stop_reason(),
+        "done": _S.get("done_info"),
+        "done_checker": (
+            _S["done_checker"].status()
+            if _S.get("done_checker") is not None else None
+        ),
         # ===== 物理步频：务必区分设定值与实际值 =====
         # 设定值：场景 physxScene:timeStepsPerSecond（仿真时间口径，决定时间轴）
         "physics_dt": _S.get("physics_dt", 0.0),
@@ -1194,7 +1364,12 @@ def stop_capture() -> dict:
     if not info["joint_cmd_recorded"]:
         _log("WARN 没采到 joint_pos_cmd（下发目标）—— 回放只能回退实测值")
 
-    _S.update(armed=False, sub=None, cameras=[], out=None, records=[])
+    _S.update(armed=False, sub=None, cameras=[], out=None, records=[],
+              # 完成检测状态一并清掉：虽然下次 arm_capture 的 _S.update
+              # 也会重置，但这里清掉可以避免「stop 后 status 仍报 done」
+              # 这种让人困惑的中间态（status 在 armed=False 时本就不读它们，
+              # 但保持干净更安全）。
+              done_checker=None, done_info=None, done_at=None)
     # 注意：**不清空 `_rp_cache`**。
     # 我们不 destroy render product（见上面的说明），下次采集时由
     # ``_rp_alive()`` 判断缓存的 rp 是否还有效：

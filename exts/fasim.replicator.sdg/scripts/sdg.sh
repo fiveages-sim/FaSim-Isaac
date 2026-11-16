@@ -46,6 +46,12 @@ usage() {
   status      查看采集进度（帧数、物理步、错误数）
   stop        结束采集并写 session.json
   doctor      环境自检（路径/socket/扩展是否就绪）
+  motion      一键起编排（让 motion-generation 跑一遍任务）
+              --robot <key> --task <key> [--background] [--check]
+              自动带 --no-reset（保住随机化）与 --no-ensure-ros2-stack
+  auto        一键数采（推荐）：随机化→采集→编排→结束→裁剪→打包
+              --robot <key> --task <key> [--rounds N] [--dry-run]
+              产物: run_*/episode_trimmed.npz（留开头 home + 截到回 home）
 
 数据检查与转换（不需要 Isaac python）:
   info        看采集会话里有什么（帧数、相机、关节数、体积）
@@ -143,7 +149,7 @@ case "$CMD" in
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/sdg_menu.py" "$@"
         ;;
-    capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume|list|export|export-check|bench|randomize|randomize-check)
+    capture|status|stop|doctor|info|pack|trim|live|live-status|live-stop|live-pause|live-resume|list|export|export-check|bench|randomize|randomize-check|motion|auto)
         PY="$(pick_python)" || die "找不到带 PyYAML 的 python3（设 SDG_PYTHON）"
         export PYTHONPATH="${EXT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
         exec "$PY" "${SCRIPT_DIR}/cli.py" "$CMD" "$@"

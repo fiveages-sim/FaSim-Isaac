@@ -84,6 +84,43 @@ def default_session_dir(robot: str, task: str, name: str = "") -> Path:
     return data_root() / robot / task / stamp
 
 
+def next_run_dir(robot: str, task: str, width: int = 3) -> Path:
+    """分配下一个 ``run_NNN`` 目录（自动跳过已存在的）。
+
+    为什么需要：``default_session_dir()`` 用时间戳命名（``20261116-175133``），
+    但本项目历史数据都是 ``run_001``、``run_042`` 这种序号 —— 两种混在
+    一起时：
+      - 按名字排序会乱（时间戳跑到 run_* 前面）
+      - 人看列表时分不清"哪个是第几条"
+      - pack/export 的批量脚本若假设 ``run_*`` 前缀会漏掉时间戳目录
+
+    所以自动采集用这个函数，保持 ``run_NNN`` 风格。手动 ``capture --out``
+    仍可任意命名（时间戳是默认值，便于"随手采一条"）。
+
+    Args:
+        width: 序号补零位数（3 → run_001 .. run_999）。
+    """
+    base = data_root() / robot / task
+    existing: set[int] = set()
+    try:
+        for p in base.iterdir():
+            if not p.is_dir():
+                continue
+            nm = p.name
+            if not nm.startswith("run_"):
+                continue
+            tail = nm[4:]
+            if tail.isdigit():
+                existing.add(int(tail))
+    except OSError:
+        pass
+
+    n = 1
+    while n in existing:
+        n += 1
+    return base / f"run_{n:0{width}d}"
+
+
 def list_sessions(
     robot: str | None = None,
     task: str | None = None,

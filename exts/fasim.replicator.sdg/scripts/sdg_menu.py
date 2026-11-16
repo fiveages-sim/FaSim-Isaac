@@ -685,6 +685,207 @@ def menu_tools(robot: str, task: str, state: dict) -> None:
 
 
 
+def _request(payload: dict, timeout: float = 5.0) -> dict:
+    """向 Isaac 扩展发一条指令（菜单内的轻量版，与 cli.py 的 _request 同协议）。
+
+    为什么菜单里还要单独写一份：cli.py 的版本会打印一堆「Isaac 没在跑」
+    之类的引导语，菜单顶部已经有一个环境状态条了，重复提示反而乱。
+    这里只返回结果，由调用方决定怎么显示。
+    """
+    import socket as _sock
+
+    from fasim.replicator.sdg import runtime
+
+    path = runtime.socket_path()
+    if not path.exists():
+        return {"ok": False, "error": "socket 不存在（Isaac 未运行或扩展未就绪）"}
+    s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(path))
+        s.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf.strip():
+            return {"ok": False, "error": "扩展没有返回"}
+        return json.loads(buf.split(b"\n", 1)[0].decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def prompt_positive_int(prompt: str, default: int = 1, min_value: int = 1) -> int:
+    """问一个正整数（回车用默认值）。"""
+    while True:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            v = int(raw)
+        except ValueError:
+            print(f"  {_c('请输入整数', YELLOW)}")
+            continue
+        if v < min_value:
+            print(f"  {_c(f'至少 {min_value}', YELLOW)}")
+            continue
+        return v
+
+
+def menu_auto(robot: str, task: str, state: dict) -> None:
+    """一键数采：随机化 → 采集 → 编排 → 结束 → 裁剪 → 打包。
+
+    每轮独立（各自随机化、各自 run_*/ 目录），产物：
+      run_NNN/episode_trimmed.npz   留开头 home + 截到回 home 的单条轨迹
+      run_NNN/episode.npz           完整原始数据（pack 格式）
+    """
+    from fasim.replicator.sdg import auto_collect, motion_launch as ml
+
+    print(f"\n{_c('=== 一键数采 ===', BOLD)}")
+    print(f"{DIM}  随机化 → 采集 → 编排 → 结束 → 裁剪 → 打包{NC}")
+
+    # 预检
+    st = _request({"cmd": "status"}, timeout=10)
+    if not st.get("ok"):
+        print(f"{_c('  Isaac 扩展没响应 —— 先 cd ~/FaSim-Isaac && ./run.sh', RED)}")
+        return
+    ok, info = ml.preflight(robot_key=robot, task_key=task)
+    if not ok:
+        return
+    try:
+        ctx = auto_collect._resolve_task_ctx(robot, task)
+    except Exception as exc:  # noqa: BLE001
+        print(f"{_c(f'  读任务配置失败: {exc}', RED)}")
+        return
+
+    print(f"  任务        {info['sdg_robot']}/{info['sdg_task']} → {info['robot']}/{info['task_key']}")
+    print(f"  数据目录    {DIM}{ctx['data_dir']}{NC}")
+    if ctx["has_randomize"]:
+        snap = "已存在" if ctx["snapshot_file"].is_file() else "将自动记录"
+        print(f"  随机化      有（快照{snap}）")
+    else:
+        print(f"  {_c('随机化      未配置（每轮物体位置不变）', YELLOW)}")
+
+    rounds = prompt_positive_int("跑几轮", default=1, min_value=1)
+    head = 2.0
+    tail = 1.5
+    ans = input(f"{DIM}  裁剪参数：开头留几秒 home [{head}] / 结尾留几秒 [{tail}]（回车用默认）: {NC}").strip()
+    if ans:
+        parts = ans.replace("/", " ").split()
+        try:
+            if len(parts) >= 1:
+                head = float(parts[0])
+            if len(parts) >= 2:
+                tail = float(parts[1])
+        except ValueError:
+            print(f"{_c('  参数无效，用默认值', YELLOW)}")
+
+    print()
+    print(f"  预计每轮约 1~2 分钟（编排本身约 40s + 采集开销）")
+    if input(f"  开始？[Y/n]: ").strip().lower() not in ("", "y", "yes"):
+        return
+
+    results = auto_collect.run_batch(
+        robot_key=robot,
+        task_key=task,
+        rounds=rounds,
+        head_sec=head,
+        tail_sec=tail,
+    )
+    ok_n = sum(1 for r in results if r.get("ok"))
+    print()
+    if ok_n == len(results):
+        print(f"{GREEN}  ✅ {ok_n} 轮全部成功{NC}")
+    else:
+        print(f"{_c(f'  {ok_n}/{len(results)} 轮成功', YELLOW)}")
+
+
+def menu_motion(robot: str, task: str, state: dict) -> None:
+    """一键起编排：让 motion-generation 跑一遍任务。
+
+    把「切到 lerobot_ros2、source venv、敲一长串参数」收进菜单。
+    两个关键开关固定带上（``--no-reset`` 保随机化、``--no-ensure-ros2-stack``
+    避免起第二套运控），详见 ``fasim/replicator/sdg/motion_launch.py``。
+    """
+    from fasim.replicator.sdg import motion_launch as ml
+
+    print(f"\n{_c('=== 一键起编排 ===', BOLD)}")
+    print(f"{DIM}  让 motion-generation 跑一遍任务（在另一个进程里）{NC}")
+
+    ok, info = ml.preflight(robot_key=robot, task_key=task)
+    if not ok:
+        return
+
+    print(f"  sdg 任务    {info['sdg_robot']}/{info['sdg_task']}")
+    print(f"  编排任务    {info['robot']}/{info['task_key']}")
+    print(f"  仓库        {DIM}{info['repo']}{NC}")
+    print(f"  工作区      {DIM}{info['workspace']}{NC}")
+    if info.get("activate"):
+        print(f"  venv        {DIM}{info['activate']}{NC}")
+    else:
+        print(f"{_c('  WARN 没找到 venv，可能缺 rclpy', YELLOW)}")
+    print(f"{DIM}  固定参数: --no-reset（保随机化） "
+          f"--no-ensure-ros2-stack（运控随 Isaac 启动）{NC}")
+
+    # 采集状态提醒
+    st = _request({"cmd": "status"}, timeout=5)
+    if st.get("ok") and st.get("armed"):
+        print(f"{GREEN}  采集进行中（{st.get('frames',0)} 帧）—— 编排跑的动作会被采下来{NC}")
+        dc = st.get("done_checker")
+        if dc:
+            print(f"{DIM}    完成判据: {dc['object']}→{dc['rack']} "
+                  f"xy<{dc['xy_tol_mm']:.0f}mm dz<{dc['dz_inside_mm']}mm{NC}")
+    else:
+        print(f"{_c('  当前未采集 —— 编排照跑，但采不到数据。建议先「开始采集」', YELLOW)}")
+
+    running = ml.is_running()
+    if running:
+        print(f"{_c(f'  警告: 已有编排在跑 (pid {running[:3]})', YELLOW)}")
+
+    while True:
+        print()
+        sel = pick(
+            "起编排",
+            [
+                ("fg", "前台运行（看输出，Ctrl+C 可中断）"),
+                ("bg", "后台运行（立即返回，日志到 /tmp）"),
+                ("check", "只预检（不真的跑）"),
+            ],
+            1,
+            allow_back=True,
+        )
+        if sel in (BACK, "quit"):
+            return
+
+        if sel == "check":
+            print(f"{GREEN}  预检通过{NC}")
+            continue
+
+        if not st.get("ok") or not st.get("armed"):
+            ans = input(f"{_c('  采集没开，仍要跑？[y/N]: ', YELLOW)}").strip().lower()
+            if ans not in ("y", "yes"):
+                continue
+
+        rc = ml.run_motion(
+            robot_key=robot,
+            task_key=task,
+            background=(sel == "bg"),
+        )
+        if sel == "bg":
+            print(f"{DIM}  用 ./sdg.sh status 看采集进度；"
+                  f"编排日志见上面的路径{NC}")
+            return
+        print(f"{DIM}  编排退出码 {rc}{NC}")
+        return
+
+
 def menu_randomize(robot: str, task: str, state: dict) -> None:
     """随机化物体位姿 —— 纯调试/半自动数采用，不进采集流程。
 
@@ -857,9 +1058,11 @@ def menu_selfcheck(robot: str, task: str, state: dict) -> None:
 
 
 FUNCS = [
+    ("auto", "一键数采（随机化→采集→编排→裁剪→打包）", menu_auto),
     ("capture", "采集", menu_capture),
     ("status", "查看采集进度", None),
     ("stop", "结束采集", None),
+    ("motion", "一键起编排（跑一遍任务）", menu_motion),
     ("tools", "数据工具（pack/shots/diag/trim）", menu_tools),
     ("replay", "回放（关节/末端）", menu_replay),
     ("random", "随机化物体位姿（调试/半自动数采）", menu_randomize),

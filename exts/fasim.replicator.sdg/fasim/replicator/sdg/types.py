@@ -184,6 +184,38 @@ class TaskSpec:
     可行性验证脚本 ``scripts/verify_randomize.py``。
     """
 
+    done_when: dict = field(default_factory=dict)
+    """任务完成判据（``done_when`` 段），用于半自动数采。
+
+    采集期间逐帧判断「物体是不是已经到位」，用于：
+
+    - 把 ``stop_reason=task_completed`` 写进 session.json，事后能筛掉
+      编排超时/插偏的**失败轨迹**（否则混进训练集会教坏策略）；
+    - 需要时自动收尾（默认只标注不停，见 ``stop_on_complete``）。
+
+    ```yaml
+    done_when:
+      object: test_tube              # payload 里 obj/<label>_pos 的 label
+      rack: test_tube_rack           # 目标架（hole 所属刚体）
+      hole_offset: [-0.021, -0.010, 0.110]   # 孔在 rack 局部系的位置（米）
+      xy_tol_m: 0.020                # xy 水平距离阈值
+      consecutive_frames: 8          # 连续多少帧满足才算（防抖）
+      stop_on_complete: false        # true=检测到就停采集
+    ```
+
+    **只看 xy**：孔位的 z 是孔底，试管中心在管身中部，插到位时两者
+    z 差约 -98mm —— 绝对值无意义，只有水平重合才代表「插进这个孔」。
+
+    **随机化适配**：hole 的世界位置每帧按 ``rack`` 当前位姿现算
+    （``hole_world = rack_pos + R(rack_quat) @ hole_offset``），
+    所以架子被随机平移后判据依然成立。
+
+    ``hole_offset`` 是**资产常量**（不随随机化变），省略时用
+    :data:`fasim.replicator.sdg.completion.HOLE_3_LOCAL`（G1D 试管任务实测值）。
+
+    不写这一段就完全不做完成检测（零影响）。
+    """
+
 
 @dataclass
 class RecordResult:

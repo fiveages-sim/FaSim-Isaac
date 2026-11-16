@@ -140,6 +140,7 @@ def _dispatch(req: dict) -> dict:
         if verb == "status":
             s = lc._S
             if s.get("armed"):
+                checker = s.get("done_checker")
                 return {
                     "ok": True,
                     "armed": True,
@@ -150,6 +151,11 @@ def _dispatch(req: dict) -> dict:
                     "cameras": [c["name"] for c in s["cameras"]],
                     "every": s["every"],
                     "what": s.get("what", []),
+                    # 任务完成检测（未配置时 done=None）
+                    "done": s.get("done_info"),
+                    "done_checker": (
+                        checker.status() if checker is not None else None
+                    ),
                 }
             return {"ok": True, "armed": False}
 
@@ -424,6 +430,39 @@ def _pump_control_file() -> None:
 def _on_app_update(_event) -> None:
     _pump_socket()
     _pump_control_file()
+    _pump_auto_stop()
+
+
+def _pump_auto_stop() -> None:
+    """每帧检查「完成检测是否命中且要求自动停」，命中就收尾。
+
+    为什么放在 app.update 而不是物理步回调：stop_capture() 要 detach
+    annotator、写 session.json，在物理步回调里做会打断步进
+    （见 live_capture._emit_frame 的注释）。这里只做一个字典读 + 一次调用，
+    且只在真正命中那一帧才执行重活。
+
+    用模块级的 ``_CAPTURE``（由 ``_ensure_capture()`` 填）而不是直接
+    ``import live_capture``：扩展刚加载时 sys.path 里可能还没加
+    scripts 目录，直接 import 会失败。而 ``_CAPTURE`` 为空时说明采集
+    模块还没加载过 —— 那就不可能在采集，直接返回即可。
+    """
+    if _CAPTURE is None:
+        return
+    try:
+        lc = _CAPTURE
+        if not lc._S.get("armed"):
+            return
+        if not lc._S.get("done_info"):
+            return
+        checker = lc._S.get("done_checker")
+        if checker is None or not getattr(checker, "stop_on_complete", False):
+            return
+        lc.request_stop("task_completed")
+    except Exception as exc:  # noqa: BLE001
+        # 绝不能因为收尾逻辑把扩展搞崩；只记一次
+        if not _SRV.get("autostop_err_logged"):
+            _SRV["autostop_err_logged"] = True
+            _log(f"WARN 自动收尾失败: {exc}")
 
 
 # ---------------------------------------------------------------- 扩展
