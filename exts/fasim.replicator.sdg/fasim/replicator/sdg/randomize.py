@@ -127,58 +127,94 @@ def get_pose(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
         return None
 
 
+def set_pose_service(prim_path: str, pos: np.ndarray, quat: np.ndarray,
+                     *, zero_velocity: bool = True) -> bool:
+    """通过 ``/set_entity_state`` 服务设刚体位姿（**外部进程也能用**）。
+
+    这个服务一次可以同时设 pose 和 twist，正好解决「设了位姿但速度还在 →
+    下一帧被甩飞」的问题。
+
+    为什么必须走服务：``set_pose`` 用的 RigidPrim 需要 isaacsim 模块，
+    在 ``sdg.sh`` 这种外部进程里 import 失败 → 静默不生效（实测：日志显示
+    「2 个物体」但物体根本没动，试管还是崩飞）。
+    """
+    try:
+        from simulation_interfaces.srv import SetEntityState
+
+        req = SetEntityState.Request()
+        req.entity = prim_path
+        pose = req.state.pose
+        pose.position.x = float(pos[0])
+        pose.position.y = float(pos[1])
+        pose.position.z = float(pos[2])
+        pose.orientation.x = float(quat[1])     # quat 传进来是 wxyz
+        pose.orientation.y = float(quat[2])
+        pose.orientation.z = float(quat[3])
+        pose.orientation.w = float(quat[0])
+        req.state.header.frame_id = "world"
+        if zero_velocity:
+            req.state.twist.linear.x = 0.0
+            req.state.twist.linear.y = 0.0
+            req.state.twist.linear.z = 0.0
+            req.state.twist.angular.x = 0.0
+            req.state.twist.angular.y = 0.0
+            req.state.twist.angular.z = 0.0
+        r = _call_service(SetEntityState, "/set_entity_state", req, timeout=5.0)
+        if r is None:
+            return False
+        # 注意：响应的 `result` 字段本身是嵌套的 `Result` 消息
+        # （含 result / error_message），不是数字 —— 直接 int() 会抛
+        # "int() argument must be ... not 'Result'"。
+        res_msg = getattr(r, "result", None)
+        code = int(getattr(res_msg, "result", 0) or 0)
+        if code == 1:                      # RESULT_OK
+            return True
+        msg = getattr(res_msg, "error_message", "") or f"result_code={code}"
+        _log(f"WARN set_entity_state({prim_path}) 失败: {msg}")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN set_entity_state 异常 {prim_path}: {exc}")
+        return False
+
+
 def set_pose(prim_path: str, pos: np.ndarray, quat: np.ndarray,
              *, zero_velocity: bool = True) -> bool:
-    """写刚体世界位姿。
-
-    **注意**：对 ``kinematic=True`` 的刚体无效；对 ``kinematic=False`` 的刚体
-    会与物理求解器竞争（可能在后续步被改写）。所以写完之后必须让物理
-    settle 若干步再读回验证——见 :func:`randomize_once` 的验证环节。
+    """写刚体世界位姿（优先 Isaac 内 RigidPrim，失败退回 ROS 服务）。
 
     ``zero_velocity``：**必须清零速度**（默认开）。
     只设位姿不清速度时，物体保留着「上一轮被机器人拿着移动」的线速度/角速度，
     下一帧物理一跑就被甩出去 —— 实测试管就是这么崩飞的。
-    清零后物体从静止开始 settle，才会稳稳落在孔里/桌面上。
     """
+    # 先试 Isaac 内的高效路径
     try:
         rp = _rigid(prim_path)
         rp.set_world_poses(
             positions=np.asarray(pos, dtype=np.float64).reshape(1, 3),
             orientations=np.asarray(quat, dtype=np.float64).reshape(1, 4),
         )
-    except Exception as exc:  # noqa: BLE001
-        _log(f"WARN 写位姿失败 {prim_path}: {exc}")
-        return False
-
-    if zero_velocity:
-        # API 名称随 Isaac 版本不同，逐个试；都不行也不算失败（只是可能被甩）
-        zeroed = False
-        for meth, args in (
-            ("set_linear_velocities", (np.zeros((1, 3)),)),
-            ("set_velocities", (np.zeros((1, 6)),)),      # 合并接口（线+角）
-        ):
-            fn = getattr(rp, meth, None)
-            if fn is None:
-                continue
-            try:
-                fn(*args)
-                zeroed = True
-                break
-            except Exception:  # noqa: BLE001
-                continue
-        # 角速度单独设（有些版本分开）
-        fn = getattr(rp, "set_angular_velocities", None)
-        if fn is not None:
-            try:
-                fn(np.zeros((1, 3)))
-                zeroed = True
-            except Exception:  # noqa: BLE001
-                pass
-        if not zeroed and not getattr(set_pose, "_vel_warned", False):
-            set_pose._vel_warned = True       # type: ignore[attr-defined]
-            _log("WARN 该 Isaac 版本没有可用的清零速度 API —— "
-                 "物体可能保留上一轮速度而被甩飞")
-    return True
+        if zero_velocity:
+            for meth, args in (
+                ("set_linear_velocities", (np.zeros((1, 3)),)),
+                ("set_velocities", (np.zeros((1, 6)),)),
+            ):
+                fn = getattr(rp, meth, None)
+                if fn is None:
+                    continue
+                try:
+                    fn(*args)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            fn = getattr(rp, "set_angular_velocities", None)
+            if fn is not None:
+                try:
+                    fn(np.zeros((1, 3)))
+                except Exception:  # noqa: BLE001
+                    pass
+        return True
+    except Exception:
+        # 外部进程（无 isaacsim）→ 走 ROS 服务
+        return set_pose_service(prim_path, pos, quat, zero_velocity=zero_velocity)
 
 
 def _quat_mul_wxyz(a, b) -> np.ndarray:
@@ -191,6 +227,100 @@ def _quat_mul_wxyz(a, b) -> np.ndarray:
         aw * by - ax * bz + ay * bw + az * bx,
         aw * bz + ax * by - ay * bx + az * bw,
     ], dtype=np.float64)
+
+
+def _ros_node():
+    """取（或创建）一个共享的 ROS 节点，供本模块所有服务调用复用。
+
+    **三个关键点**（都是踩过的）：
+
+    1. ``use_sim_time=False`` —— 必须用**墙钟**。
+       Isaac 内创建的节点默认可能带 sim time；而 ``/clock`` 在仿真里由
+       Isaac 自己发，节点若不 spin 在 /clock 上，``wait_for_service`` 会
+       永远等下去 —— 表现就是「随机化时卡住」。
+    2. 只创建一次、共享复用。反复 create/destroy 会导致 Isaac 侧
+       sendResponse 报错刷屏（lerobot 侧也有同样注释）。
+    3. ``spin_once`` 轮询而不是 ``spin_until_future_complete`` ——
+       后者在 Isaac 主循环里会阻塞主线程，服务永远等不到响应（死锁）。
+
+    实测：外部进程（sdg.sh）能读到 hole_4，而 Isaac 进程内读不到 ——
+    差别就在这三条。
+    """
+    node = getattr(_ros_node, "_node", None)
+    if node is not None:
+        return node
+    import rclpy
+    from rclpy.node import Node
+
+    if not rclpy.ok():
+        rclpy.init()
+    # 用节点参数 API 设 use_sim_time（避免手工构造 Parameter/ParameterValue
+    # 的 type 字段 —— 那两个消息类型的构造方式在 rclpy 各版本不一致，踩过）。
+    node = rclpy.create_node("sdg_randomize_svc")
+    try:
+        node.set_parameters([rclpy.parameter.Parameter(
+            "use_sim_time", rclpy.Parameter.Type.BOOL, False)])
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 设置 use_sim_time=False 失败（可能影响服务等待）: {exc}")
+    _ros_node._node = node       # type: ignore[attr-defined]
+    return node
+
+
+def _client_for(srv_type, srv_name: str):
+    node = _ros_node()
+    cache = getattr(_client_for, "_cache", None)
+    if cache is None:
+        cache = {}
+        _client_for._cache = cache     # type: ignore[attr-defined]
+    cli = cache.get(srv_name)
+    if cli is None:
+        cli = node.create_client(srv_type, srv_name)
+        cache[srv_name] = cli
+    return node, cli
+
+
+def _call_service(srv_type, srv_name: str, request, *, timeout: float = 5.0):
+    """调一个服务，**用墙钟 + spin_once 轮询**（Isaac 内安全）。
+
+    Returns:
+        响应对象；失败返回 None（调用方自己决定怎么报）。
+    """
+    import time as _t
+
+    import rclpy
+
+    try:
+        node, cli = _client_for(srv_type, srv_name)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 创建服务客户端失败 {srv_name}: {exc}")
+        return None
+
+    # 等服务可用（墙钟轮询）
+    deadline = _t.monotonic() + max(0.5, timeout)
+    while _t.monotonic() < deadline:
+        if cli.service_is_ready():
+            break
+        rclpy.spin_once(node, timeout_sec=0.05)
+    else:
+        if not cli.service_is_ready():
+            _log(f"WARN 服务不可用: {srv_name}")
+            return None
+
+    fut = cli.call_async(request)
+    start = _t.monotonic()
+    while not fut.done():
+        if (_t.monotonic() - start) > max(0.5, timeout):
+            _log(f"WARN 服务超时: {srv_name}")
+            return None
+        rclpy.spin_once(node, timeout_sec=0.01)   # ← 关键：不用 spin_until_future_complete
+    try:
+        if fut.exception() is not None:
+            _log(f"WARN 服务异常 {srv_name}: {fut.exception()}")
+            return None
+        return fut.result()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN 取服务结果失败 {srv_name}: {exc}")
+        return None
 
 
 def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
@@ -211,38 +341,16 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
     try:
         import json as _json
 
-        import rclpy
-        from rclpy.node import Node
         from isaac_ros2_messages.srv import GetPrimAttribute
-
-        own_ctx = False
-        node = getattr(_read_xform_via_service, "_node", None)
-        cli = getattr(_read_xform_via_service, "_cli", None)
-        if node is None or cli is None:
-            if not rclpy.ok():
-                rclpy.init()
-                own_ctx = True
-            node = Node("sdg_randomize_attr")
-            cli = node.create_client(GetPrimAttribute, "/get_prim_attribute")
-            if not cli.wait_for_service(timeout_sec=5.0):
-                _log("WARN /get_prim_attribute 服务不可用")
-                node.destroy_node()
-                if own_ctx:
-                    rclpy.shutdown()
-                return None
-            _read_xform_via_service._node = node      # type: ignore[attr-defined]
-            _read_xform_via_service._cli = cli        # type: ignore[attr-defined]
 
         def _ask(attr: str):
             req = GetPrimAttribute.Request()
             req.path = prim_path
             req.attribute = attr
-            fut = cli.call_async(req)
-            rclpy.spin_until_future_complete(node, fut, timeout_sec=3.0)
-            r = fut.result()
-            if r is None or not r.success:
+            r = _call_service(GetPrimAttribute, "/get_prim_attribute", req, timeout=3.0)
+            if r is None or not getattr(r, "success", False):
                 return None
-            raw = (r.value or "").strip()
+            raw = (getattr(r, "value", "") or "").strip()
             if not raw:
                 return None
             try:
@@ -251,10 +359,10 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
                 return None
 
         t = _ask("xformOp:translate")
-        o = _ask("xformOp:orient")
-        s = _ask("xformOp:scale")
         if t is None:
             return None
+        o = _ask("xformOp:orient")
+        s = _ask("xformOp:scale")
         tv = np.asarray(t, dtype=np.float64).reshape(-1)[:3]
         ov = (np.asarray(o, dtype=np.float64).reshape(-1)[:4]
               if o is not None else np.array([1.0, 0.0, 0.0, 0.0]))
@@ -274,37 +382,18 @@ def get_pose_service(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
 
     与 :func:`get_pose` 的区别：那个用 RigidPrim（只能在 Isaac 进程内跑）。
     本函数走 ROS 服务，所以 ``sdg.sh randomize`` 这种外部调用也能读。
+    内部用 :func:`_call_service`（墙钟 + spin_once），Isaac 内也安全。
     """
     try:
-        import rclpy
-        from rclpy.node import Node
         from simulation_interfaces.srv import GetEntityState
-
-        node = getattr(get_pose_service, "_node", None)
-        cli = getattr(get_pose_service, "_cli", None)
-        if node is None or cli is None:
-            if not rclpy.ok():
-                rclpy.init()
-            node = Node("sdg_randomize_state")
-            cli = node.create_client(GetEntityState, "/get_entity_state")
-            if not cli.wait_for_service(timeout_sec=5.0):
-                _log("WARN /get_entity_state 服务不可用")
-                node.destroy_node()
-                return None
-            get_pose_service._node = node      # type: ignore[attr-defined]
-            get_pose_service._cli = cli        # type: ignore[attr-defined]
 
         req = GetEntityState.Request()
         req.entity = prim_path
-        fut = cli.call_async(req)
-        rclpy.spin_until_future_complete(node, fut, timeout_sec=3.0)
-        r = fut.result()
+        r = _call_service(GetEntityState, "/get_entity_state", req, timeout=3.0)
         if r is None or not getattr(r, "result", None):
             return None
         st = getattr(r, "state", None)
-        if st is None:
-            return None
-        pose = getattr(st, "pose", None)
+        pose = getattr(st, "pose", None) if st is not None else None
         if pose is None:
             return None
         p = pose.position
@@ -337,44 +426,52 @@ def get_subframe_world_pose(parent_prim: str, frame: str) -> tuple[np.ndarray, n
     frame，代表「孔的中心 + 朝向」。要做「把试管放进这个孔」，就得拿到这个
     frame 的**世界**位姿，而不是靠猜相对偏移。
 
-    实现：**自底向上合成整条 xform 链**（都是通过 ``/get_prim_attribute``
-    服务读，因为本环境的 XformPrim 读不到值 —— 见 _read_xform_via_service）。
+    ### 为什么不能只合成 USD xform 链
 
-        world = T(/World) · T(/World/room) · T(/World/room/scene)
-                · T(rack_01) · T(hole_4)
+    第一版实现是「把 /World → /World/room → scene → rack → hole_4 的
+    xformOp:translate 逐级串起来」。这是**错的**，因为：
 
-    实测这条链：/World/room/scene 有 T=[1.8,0,0] O=90°aboutX；
-    rack_01 有 T=[-0.244,0.1005,0.736] O=90°aboutX；hole_4 有 T=[0.021,-0.01,0.11]。
+      ``set_entity_state``（服务）只改 **PhysX 里的刚体位姿**，
+      **不写回 USD 的 xformOp:translate**。
+
+    所以架子被随机平移后，从服务读到的 ``rack_01`` translate 仍是**旧值**
+    （实测：架子实际在 y=0.278，服务读到 0.1005）。串出来的 hole_4 世界
+    坐标自然也是旧的 → 试管被放到错误位置。
+
+    ### 正确做法
+
+      hole_4 世界位姿 = parent 的**当前**世界位姿 ⊗ hole_4 的**局部** TRS
+
+    其中 parent 当前位姿来自 ``/get_entity_state``（PhysX 真值），
+    hole_4 局部 TRS 来自 ``/get_prim_attribute``（authoring stage 里的常量）。
+    —— 局部量确实是不变的，只有父级的**世界**位姿会因随机化而变。
     """
     path = f"{parent_prim.rstrip('/')}/{frame}"
-    # 先确认这个 frame 存在（能读到 translate 就认为存在）
-    if _read_xform_via_service(path) is None:
+    local = _read_xform_via_service(path)
+    if local is None:
         _log(f"WARN 子 frame 不存在或读不到: {path}")
         return None
+    t_local, q_local, _s_local = local
 
-    # 构建祖先链：/World → /World/room → ... → rack_01 → hole_4
-    parts = [p for p in path.strip("/").split("/") if p]
-    chain = ["/" + "/".join(parts[:i + 1]) for i in range(len(parts))]
+    # 父级当前世界位姿（PhysX 真值，含随机化后的平移）
+    parent = get_pose_any(parent_prim)
+    if parent is None:
+        _log(f"WARN 读不到父级 {parent_prim} 的世界位姿")
+        return None
+    p_parent, q_parent = parent
 
-    P = np.zeros(3, dtype=np.float64)
-    Q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    for p in chain:
-        got = _read_xform_via_service(p)
-        if got is None:
-            continue                      # 该级没有 xform（如 /World）→ 视为恒等
-        t, o, s = got
-        if not np.allclose(s, 1.0):
-            _log(f"WARN {p} 的 scale={s.tolist()} 非 1，合成时按 1 处理")
-        # 先按父级姿态旋转子级平移，再叠加
-        P = P + _quat_rotate(Q, t)
-        Q = _quat_mul_wxyz(Q, o)
-        n = np.linalg.norm(Q)
-        if n > 1e-9:
-            Q = Q / n
+    # world = parent_world ⊗ local
+    pos = np.asarray(p_parent, dtype=np.float64) + _quat_rotate(q_parent, t_local)
+    quat = _quat_mul_wxyz(np.asarray(q_parent, dtype=np.float64),
+                          np.asarray(q_local, dtype=np.float64))
+    n = np.linalg.norm(quat)
+    if n > 1e-9:
+        quat = quat / n
 
-    _log(f"  {path} 世界位姿 = pos {np.round(P, 4).tolist()} "
-         f"quat(wxyz) {np.round(Q, 4).tolist()}")
-    return P, Q
+    _log(f"  {path} 世界位姿 = pos {np.round(pos, 4).tolist()} "
+         f"quat(wxyz) {np.round(quat, 4).tolist()}  "
+         f"(父级 {np.round(p_parent, 4).tolist()} + 局部 {np.round(t_local, 4).tolist()})")
+    return pos, quat
 
 
 # ------------------------------------------------------------------ 配置解析
@@ -574,36 +671,38 @@ def restore_and_randomize(
                 f"{prim}: 读不到 {target}/{frame} 的世界位姿 —— 检查 frame 名是否存在")
             continue
         pos, quat = got
-        # 对齐参考点：物体自身也可能有子 frame（如 test_tube 的 tube_bottom）。
-        # 语义：把 <prim>/<align> 这个 frame 对齐到目标 frame。
-        #   不写 align → 用物体原点（很多物体原点就是几何中心/底部）
-        #   写 align: tube_bottom → 物体被「往下挪一个管长」，管底正好落在孔口
+        # ---- 用「快照时的相对偏移」定位（而不是 align 子 frame）----
         #
-        # 为什么需要：实测 hole_4 的世界位姿 z=0.8465，而试管初始 z=0.7430 ——
-        # 差 103mm，正好是 tube_grasp 的高度（0.1307）。说明 hole_4 的点在
-        # 「孔口上方/管身中部」，不是管底。用 align: tube_bottom 抵消。
-        align = str(po.get("align") or "").strip()
-        if align:
-            # 语义：让 <prim>/<align> 这个子 frame 落在目标 frame 上。
-            #
-            # 计算：目标原点 = 目标点 − （对齐参考点相对物体原点的偏移）
-            #
-            # ⚠ 这个「偏移」必须用**快照时的位姿**算，不能用当前位置：
-            #   物体可能已经被上一轮弄飞（实测试管掉到 [1.47, 0.69, 0.007]
-            #   趴在地上），拿它的当前位姿算 delta 会得到荒谬的结果。
-            #   快照位姿是「物体正确摆放时」的基准，偏移在局部几何上是常量。
-            src = get_subframe_world_pose(prim, align)
-            base_pos = None
-            if isinstance(rec, dict) and rec.get("pos"):
-                base_pos = np.asarray(rec["pos"], dtype=np.float64)
-            if base_pos is None:
-                warnings.append(
-                    f"{prim}: 没有快照位姿，无法计算 {align} 的局部偏移")
+        # 为什么不用 align 子 frame：实测 test_tube/tube_bottom 的局部
+        # translate 是 [0,0,0]（与管原点重合），拿它对齐毫无作用。
+        #
+        # 正确公式（纯平移，因为随机化只动 xy 不平移旋转）：
+        #
+        #   rel          = 试管快照位姿 − 目标快照位姿   ← 正确摆放时的相对位置
+        #   试管目标位姿 = 目标当前位姿 + rel            ← 目标搬到哪就跟到哪
+        #
+        # 这个相对偏移天然包含「管底比孔口低一个管长」，不需要知道
+        # hole_4 的语义。而且**只用快照**（不用物体当前位置 —— 它可能正在飞）。
+        rec_self = (snap.get("objects") or {}).get(prim)
+        rec_target = (snap.get("objects") or {}).get(target)
+        if (isinstance(rec_self, dict) and rec_self.get("pos")
+                and isinstance(rec_target, dict) and rec_target.get("pos")):
+            base_self = np.asarray(rec_self["pos"], dtype=np.float64)
+            base_target = np.asarray(rec_target["pos"], dtype=np.float64)
+            cur_target = get_pose_any(target)
+            if cur_target is None:
+                warnings.append(f"{prim}: 读不到 {target} 的当前位姿")
                 continue
-            delta = np.asarray(src[0], dtype=np.float64) - base_pos
-            pos = pos - delta
-            _log(f"  place_on 对齐 {prim}/{align}: 局部偏移 "
-                 f"{np.round(delta, 4).tolist()} → 目标原点 {np.round(pos, 4).tolist()}")
+            rel = base_self - base_target
+            pos = np.asarray(cur_target[0], dtype=np.float64) + rel
+            _log(f"  place_on {prim}: 快照相对偏移 {np.round(rel, 4).tolist()} "
+                 f"+ 目标当前 {np.round(cur_target[0], 4).tolist()} "
+                 f"→ 目标 {np.round(pos, 4).tolist()}")
+        else:
+            warnings.append(
+                f"{prim}: 快照缺 {prim} 或 {target} 的位姿 —— "
+                "只能按 frame 绝对位置放置（会偏高半个管长）。"
+                "请在物体正确摆放时重新「记录初始位姿」")
         off = po.get("offset") or [0.0, 0.0, 0.0]
         try:
             off_v = np.asarray([float(x) for x in off][:3], dtype=np.float64)
