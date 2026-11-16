@@ -233,6 +233,32 @@ def _dispatch(req: dict) -> dict:
                 out["error"] = "; ".join(res.get("warnings") or []) or "随机化失败（无细节）"
             return out
 
+        if verb == "randomize_verify_snapshot":
+            # 校验快照是否可信（与 USD 资产关系交叉验证）
+            from fasim.replicator.sdg import randomize as rnd
+
+            req.pop("cmd", None)
+            data_dir = str(req.pop("data_dir", "") or "")
+            if not data_dir:
+                return {"ok": False, "error": "缺少 data_dir"}
+            cfg = req.pop("cfg", None)
+            if cfg is None:
+                try:
+                    from fasim.replicator.sdg.config_io import load_task_config
+                    rk = str(req.get("robot_key") or "")
+                    tk = str(req.get("task_key") or "")
+                    if rk and tk:
+                        cfg = rnd.load_config(load_task_config(rk, tk))
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": f"读任务配置失败: {exc}"}
+            if not cfg:
+                return {"ok": False, "error": "没有 randomize 配置"}
+            snap = rnd.load_snapshot(data_dir)
+            if snap is None:
+                return {"ok": False, "error": "没有快照文件，先跑 --snapshot"}
+            probs = rnd.validate_snapshot(cfg, snap, data_dir)
+            return {"ok": True, "problems": probs}
+
         if verb == "randomize_snapshot":
             # 记录初始位姿（第一轮采集开始前调一次）
             from fasim.replicator.sdg import randomize as rnd

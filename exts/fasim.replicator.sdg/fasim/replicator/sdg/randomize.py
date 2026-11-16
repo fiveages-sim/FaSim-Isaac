@@ -681,6 +681,88 @@ def isaac_channel_selftest() -> dict:
     return out
 
 
+def validate_snapshot(
+    cfg: dict, snap: dict, data_dir: str | Path | None = None
+) -> list[str]:
+    """校验快照是否「看起来正确」，返回问题列表（空 = 通过）。
+
+    ### 为什么需要（方案 C）
+    快照的**记录时机**极其关键：必须在「所有物体正确摆放」时拍。
+    若在物体已崩飞/已随机化之后记录，rel 会全错，但**不会报错** ——
+    只是每轮位置都不对，非常难排查（本次调试就因此浪费了很多轮）。
+
+    这里做三层检查：
+
+    1. **存在性**：每个物体都有快照；``place_on`` 的 frame 也有
+    2. **与 USD 交叉验证**：快照的 rel 与「资产推出」的 rel 应当接近。
+       允许的偏差来自物理沉降（z 方向可达 5cm），所以 x/y 严格（50mm）、
+       z 宽松（150mm）。若 x/y 差得多，说明快照拍在了错误状态。
+    3. **合理性**：物体不应离目标过远（超过 2m 说明可能掉到场景外了）
+    """
+    problems: list[str] = []
+    objs = snap.get("objects") or {}
+    frames = snap.get("frames") or {}
+
+    for obj in (cfg.get("objects") or []):
+        prim = str(obj.get("prim") or "")
+        if not prim:
+            continue
+        rec = objs.get(prim)
+        if not isinstance(rec, dict) or not rec.get("pos"):
+            problems.append(f"{prim}: 快照缺失（重新跑 --snapshot）")
+            continue
+        if rec.get("pos") and all(abs(x) < 1e-9 for x in rec["pos"]):
+            problems.append(f"{prim}: 快照位姿全为 0，像是没读到")
+
+        po = obj.get("place_on")
+        if not isinstance(po, dict):
+            continue
+        target = str(po.get("target") or "").strip()
+        frame = str(po.get("frame") or "").strip()
+        if not target or not frame:
+            problems.append(f"{prim}: place_on 缺 target/frame")
+            continue
+        fkey = f"{target.rstrip('/')}/{frame}"
+        frec = frames.get(fkey)
+        if not isinstance(frec, dict) or not frec.get("pos"):
+            problems.append(
+                f"{prim}: frame 快照缺失 {fkey}（该快照可能是旧版本产物，"
+                "重新跑 --snapshot）")
+            continue
+
+        # ---- 与 USD 资产关系交叉验证 ----
+        usd_self = get_world_pose_from_usd(prim)
+        usd_frame = get_world_pose_from_usd(fkey)
+        if usd_self is not None and usd_frame is not None:
+            rel_snap = np.asarray(rec["pos"], dtype=np.float64) - \
+                       np.asarray(frec["pos"], dtype=np.float64)
+            rel_usd = np.asarray(usd_self[0], dtype=np.float64) - \
+                      np.asarray(usd_frame[0], dtype=np.float64)
+            d = np.abs(rel_snap - rel_usd)
+            # x/y 严格（物理沉降基本只在 z 上）
+            if d[0] > 0.05 or d[1] > 0.05:
+                problems.append(
+                    f"{prim}: 快照 rel_xy 与资产关系差 "
+                    f"({d[0]*1000:.0f}, {d[1]*1000:.0f})mm —— "
+                    "快照很可能是在物体已移动/崩飞后记录的！"
+                    f" 快照 rel={np.round(rel_snap,4).tolist()} "
+                    f"资产 rel={np.round(rel_usd,4).tolist()}")
+            elif d[2] > 0.15:
+                problems.append(
+                    f"{prim}: 快照 rel_z 与资产关系差 {d[2]*1000:.0f}mm"
+                    "（>150mm）—— z 偏差过大，检查物体是否悬空")
+
+        # ---- 合理性：离目标不要太远 ----
+        dist = float(np.linalg.norm(
+            np.asarray(rec["pos"], dtype=np.float64)
+            - np.asarray(frec["pos"], dtype=np.float64)))
+        if dist > 2.0:
+            problems.append(
+                f"{prim}: 距目标 frame {dist:.2f}m（>2m）—— 可能已跑到场景外")
+
+    return problems
+
+
 def get_prim_local_trs(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
     """读 prim 的**局部** translate/orient（authoring stage 的常量）。
 
@@ -851,11 +933,22 @@ def snapshot_path(data_dir: str | Path) -> Path:
 def save_snapshot(cfg: dict, data_dir: str | Path) -> dict[str, Any]:
     """记录所有待随机化物体的**当前**世界位姿（第一轮开始前调用一次）。
 
-    ``place_on`` 的物体**也要记录** —— 它需要快照位姿来算「对齐参考 frame
-    相对物体原点的局部偏移」（见 restore_and_randomize 里的 align 逻辑）。
-    只是它不参与「归位 + 随机偏移」，由 place_on 精确放置。
+    三类都要记：
+
+    1. 普通物体（有 ``axes``）—— 归位基准
+    2. ``follow`` 物体 —— 归位基准
+    3. ``place_on`` 物体**及其目标 frame** —— 定位基准：
+         rel = 物体快照 − **frame 快照**
+
+       注意是「frame」而不是「target 物体」：这样 ``frame: hole_4`` 才
+       名副其实，同一个架子上不同孔位可以各自独立使用（方案 B）。
+
+    **前提**：必须在「所有物体都在正确摆放状态」时调用 —— 通常就是仿真刚
+   加载、还没跑过任何任务/随机化的时候。若在物体已崩飞后记录，rel 会全错
+    且不报错（方案 C 的 ``validate_snapshot`` 负责兜这个）。
     """
-    snap: dict[str, Any] = {"taken_at": time.time(), "objects": {}}
+    snap: dict[str, Any] = {"taken_at": time.time(), "objects": {},
+                            "frames": {}}
     for obj in (cfg.get("objects") or []):
         prim = str(obj.get("prim") or "")
         if not prim:
@@ -872,6 +965,25 @@ def save_snapshot(cfg: dict, data_dir: str | Path) -> dict[str, Any]:
             "place_on": isinstance(obj.get("place_on"), dict),
         }
         _log(f"快照 {prim}: pos={np.round(pos, 4).tolist()}")
+
+        # place_on 的「目标 frame」也要记 —— 它是定位基准（方案 B）
+        po = obj.get("place_on")
+        if isinstance(po, dict):
+            target = str(po.get("target") or "").strip()
+            frame = str(po.get("frame") or "").strip()
+            if target and frame:
+                fkey = f"{target.rstrip('/')}/{frame}"
+                fw = get_subframe_world_pose(target, frame)
+                if fw is None:
+                    snap["frames"][fkey] = None
+                    _log(f"WARN 快照读不到 frame {fkey}")
+                else:
+                    snap["frames"][fkey] = {
+                        "pos": [float(x) for x in fw[0]],
+                        "quat": [float(x) for x in fw[1]],
+                    }
+                    _log(f"快照 frame {fkey}: pos={np.round(fw[0], 4).tolist()}")
+
     p = snapshot_path(data_dir)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -928,6 +1040,19 @@ def restore_and_randomize(
         msg = f"没有初始位姿快照（{snapshot_path(data_dir)}）—— 先调 save_snapshot"
         _log(f"ERROR {msg}")
         return {"ok": False, "applied": [], "warnings": [msg], "seed": seed}
+
+    # ---- 方案 C：启动时校验快照是否可信 ----
+    #
+    # 快照必须在「所有物体正确摆放」时记录。若记在物体已崩飞/已随机化之后，
+    # rel 会全错但**不报错**，只是每轮位置都不对 —— 本次调试就因此浪费了
+    # 很多轮。这里做交叉验证（与 USD 资产关系比对）并明确报出来。
+    snap_problems = validate_snapshot(cfg, snap, data_dir)
+    if snap_problems:
+        for p in snap_problems:
+            _log(f"WARN 快照校验: {p}")
+        warnings.extend(snap_problems)
+        if cfg.get("strict_snapshot", False):
+            return {"ok": False, "applied": [], "warnings": warnings, "seed": seed}
 
     objects = cfg.get("objects") or []
 
@@ -1020,34 +1145,36 @@ def restore_and_randomize(
         # 目标 frame 的**局部** TRS（用于 offset 的旋转参考）
         pos = np.asarray(got[0], dtype=np.float64)
         quat = np.asarray(got[1], dtype=np.float64)
-        # ---- 定位：用**快照的相对偏移** ----
+        # ---- 定位：用**快照的相对偏移**，基准点是「目标 frame」（方案 B）----
         #
-        # rel = 试管快照位姿 − 目标快照位姿
+        # rel = 物体快照位姿 − **frame 快照位姿**
         #
-        # ### 为什么不用「每轮从 USD 算」
-        # USD 理论上更"干净"（资产原值），但实测有两个坑：
-        #   ① get_world_pose_from_usd() 读的是**当前 stage 值**，而
-        #      set_pose_usd_api() 会往 stage 写 —— 若首次读取晚于任何一次
-        #      写入，rel 就被污染。实测拿到 rel=[0.0036, 0.0174]，
-        #      而正确值是 [-0.0208, -0.0095]，差了 24/27mm 且**每轮固定**
-        #      → 试管永远停在孔边（正是用户看到的现象）。
-        #   ② 进程级 rel 缓存一旦存了错值，之后全部失效。
+        # ### 为什么基准用 frame 而不是 target 物体
+        #   1. 语义与配置一致：`frame: hole_4` 才真正参与计算，不再是「只用来
+        #      校验存在」。同一个架子上不同孔位（hole_1..6）可以各自独立使用。
+        #   2. 更通用：以后「放进传送带的某个槽位 / 托盘的第 3 格」也是同一套。
         #
-        # ### 为什么用快照
-        # 快照是「第一轮随机化之前、物体处于正确摆放状态」时记录的，
-        # 天然就是这个任务的正确相对关系。实测交叉验证：
-        #   快照 rel  = [-20.8, -9.5, +8.0] mm
-        #   资产推出  = [-20.8, -9.5, +60.7] mm   ← x/y 完全一致，z 差沉降量
-        # 所以快照的 rel 更优（且 z 已经是落稳后的正确值）。
+        # 等价性：对「物体直接贴着目标」的场景，frame 基准与 target 基准
+        # 算出的 rel 只差一个常量（frame 在 target 局部系里的固定偏移），
+        # 结果完全一样。但 frame 基准语义更准、可扩展到多孔位。
         #
-        # 前提：快照必须在「物体正确摆放」时记录 —— 菜单第一项就是它。
+        # ### 为什么用快照而不是「每轮从 USD 算」
+        # get_world_pose_from_usd() 读的是**当前 stage 值**，而
+        # set_pose_usd_api() 会往 stage 写 —— 只要首读晚于任何写入，rel 就被
+        # 污染。实测拿到 rel=[0.0036,0.0174] 而正确值 [-0.0208,-0.0095]
+        # （差 24/27mm ≈ 孔半径），试管永远停在孔边。
+        #
+        # 快照是「随机化之前、物体正确摆放」时记录的，天然干净。
+        # 交叉验证：快照 rel 与资产推出的 rel 在 x/y 上一致到 0.04mm，
+        # z 差 52.7mm（= 悬浮 vs 物理落稳之差，快照的 z 更准）。
+        fkey = f"{target.rstrip('/')}/{frame}"
         rec_self = (snap.get("objects") or {}).get(prim)
-        rec_target = (snap.get("objects") or {}).get(target)
+        rec_frame = (snap.get("frames") or {}).get(fkey)
         rel = None
         if (isinstance(rec_self, dict) and rec_self.get("pos")
-                and isinstance(rec_target, dict) and rec_target.get("pos")):
+                and isinstance(rec_frame, dict) and rec_frame.get("pos")):
             rel = (np.asarray(rec_self["pos"], dtype=np.float64)
-                   - np.asarray(rec_target["pos"], dtype=np.float64))
+                   - np.asarray(rec_frame["pos"], dtype=np.float64))
 
         cur_target = get_pose_any(target)
         if cur_target is None:
@@ -1057,28 +1184,62 @@ def restore_and_randomize(
         # **优先用第一遍刚写入的值**：写 USD 后 PhysX 要一帧才同步，
         # 立刻重读是旧值 → 试管错位一个偏移量、落在孔边。
         tgt_pos = written.get(target)
-        if tgt_pos is not None:
-            cur_target = (np.asarray(tgt_pos, dtype=np.float64), cur_target[1])
 
-        if rel is None:
-            # 没快照：退回资产关系（x/y 可靠，z 会偏高约 53mm）
-            usd_self = get_world_pose_from_usd(prim)
-            usd_target = get_world_pose_from_usd(target)
-            if usd_self is not None and usd_target is not None:
-                rel = (np.asarray(usd_self[0], dtype=np.float64)
-                       - np.asarray(usd_target[0], dtype=np.float64))
-                warnings.append(
-                    f"{prim}: 没有快照，用资产关系（z 会偏高约 53mm）。"
-                    "建议先在物体正确摆放时跑一次 --snapshot")
+        if rel is not None:
+            # frame 世界位姿 = target 本轮位置 + (frame 局部相对 target 的偏移)
+            # 由于随机化只平移 target（不旋转），frame 的偏移保持不变，
+            # 所以可以「用 target 的写入值 + (frame快照 − target快照)」得到。
+            rec_target = (snap.get("objects") or {}).get(target)
+            if (tgt_pos is not None and isinstance(rec_target, dict)
+                    and rec_target.get("pos")):
+                f_off = (np.asarray(rec_frame["pos"], dtype=np.float64)
+                         - np.asarray(rec_target["pos"], dtype=np.float64))
+                frame_now = np.asarray(tgt_pos, dtype=np.float64) + f_off
             else:
+                fw = get_subframe_world_pose(target, frame)
+                if fw is None:
+                    warnings.append(f"{prim}: 读不到 {fkey} 的当前世界位姿")
+                    continue
+                frame_now = np.asarray(fw[0], dtype=np.float64)
+            pos = frame_now + rel
+            _log(f"  place_on {prim.split('/')[-1]}: frame {frame} "
+                 f"{np.round(frame_now, 4).tolist()} + rel "
+                 f"{np.round(rel, 4).tolist()} = {np.round(pos, 4).tolist()}")
+        else:
+            # 没有 frame 快照 → 退回「target 物体快照」基准（旧行为，
+            # 对「物体贴着 target」的任务等价）。并提示重新记录快照。
+            rec_target = (snap.get("objects") or {}).get(target)
+            if (isinstance(rec_self, dict) and rec_self.get("pos")
+                    and isinstance(rec_target, dict) and rec_target.get("pos")):
+                rel = (np.asarray(rec_self["pos"], dtype=np.float64)
+                       - np.asarray(rec_target["pos"], dtype=np.float64))
+                base = (np.asarray(tgt_pos, dtype=np.float64)
+                        if tgt_pos is not None
+                        else np.asarray(cur_target[0], dtype=np.float64))
+                pos = base + rel
                 warnings.append(
-                    f"{prim}: 既没有快照也读不到资产关系 —— 无法定位，跳过")
-                continue
-
-        pos = np.asarray(cur_target[0], dtype=np.float64) + rel
-        _log(f"  place_on {prim.split('/')[-1]}: "
-             f"{target.split('/')[-1]} {np.round(cur_target[0], 4).tolist()} "
-             f"+ rel {np.round(rel, 4).tolist()} = {np.round(pos, 4).tolist()}")
+                    f"{prim}: 缺 frame 快照 {fkey}，退回 target 基准"
+                    "（建议重新跑 --snapshot）")
+                _log(f"  place_on {prim.split('/')[-1]}: (fallback) "
+                     f"{base.round(4).tolist()} + rel {np.round(rel, 4).tolist()}"
+                     f" = {np.round(pos, 4).tolist()}")
+            else:
+                # 连物体快照都没有 → 退回纯资产关系
+                usd_self = get_world_pose_from_usd(prim)
+                usd_frame = get_world_pose_from_usd(fkey)
+                if usd_self is not None and usd_frame is not None:
+                    rel = (np.asarray(usd_self[0], dtype=np.float64)
+                           - np.asarray(usd_frame[0], dtype=np.float64))
+                    base = (np.asarray(tgt_pos, dtype=np.float64)
+                            if tgt_pos is not None
+                            else np.asarray(cur_target[0], dtype=np.float64))
+                    pos = base + rel
+                    warnings.append(
+                        f"{prim}: 没有快照，用资产关系（z 会偏高约 53mm）")
+                else:
+                    warnings.append(
+                        f"{prim}: 既没有快照也读不到资产关系 —— 无法定位，跳过")
+                    continue
 
         off = po.get("offset") or [0.0, 0.0, 0.0]
         try:

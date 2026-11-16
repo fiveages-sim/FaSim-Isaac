@@ -617,6 +617,22 @@ def cmd_randomize(args: argparse.Namespace) -> int:
         _log(f"\n  ⇒ {'✅ USD 通道可用，随机化应该正常' if ok else '❌ USD 通道不可用 —— 会退回服务并超时'}")
         return 0 if ok else 1
 
+    if getattr(args, "verify_snapshot", False):
+        resp = _request({"cmd": "randomize_verify_snapshot", "data_dir": data_dir,
+                         "cfg": cfg}, timeout=60)
+        if not resp.get("ok"):
+            _log(f"ERROR {resp.get('error', '未知错误')}")
+            return 1
+        probs = resp.get("problems") or []
+        if not probs:
+            _log("✅ 快照校验通过（与资产关系一致）")
+            return 0
+        _log(f"❌ 发现 {len(probs)} 个问题：")
+        for p in probs:
+            _log(f"  - {p}")
+        _log("\n建议：重启仿真（物体回到资产原值）→ 重新跑 --snapshot")
+        return 1
+
     if getattr(args, "snapshot", False):
         resp = _request({"cmd": "randomize_snapshot", "data_dir": data_dir, "cfg": cfg},
                         timeout=60)
@@ -2135,6 +2151,10 @@ def main(argv: list[str] | None = None) -> int:
                      help="只记录初始位姿（第一轮前跑一次）")
     rnd.add_argument("--selftest", action="store_true",
                      help="自检：在 Isaac 回调内各条读/写通道是否可用（排查随机化不生效）")
+    rnd.add_argument("--verify-snapshot", dest="verify_snapshot",
+                     action="store_true",
+                     help="校验快照是否可信（与 USD 资产关系交叉验证）。"
+                          "若快照是在物体已崩飞后记录的，这里会报出来")
     rnd.add_argument("--rounds", type=int, default=1, help="连续随机几轮")
     rnd.add_argument("--range-x", dest="range_x", type=float, default=None,
                      help="临时覆盖 x 半幅（米）")
