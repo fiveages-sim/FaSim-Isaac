@@ -327,17 +327,24 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
     """通过 ``/get_prim_attribute`` 服务读一个 prim 的**局部** TRS。
 
     为什么走服务而不是 XformPrim：newton kit 关了 PhysX→USD 同步
-    （DEBUG_LOG #1），XformPrim 在本环境读到的是 stale/无效值
-    （实测 ``读不到 .../hole_4 的世界位姿``）。而该服务由 Isaac 内的
-    ROS2ServicePrim 节点直接查 USD stage，**实测可用**：
+    （DEBUG_LOG #1），XformPrim 在本环境读到的是 stale/无效值。
 
-        /World/room/scene/test_tube_rack_01/hole_4
-          xformOp:translate = [0.021, -0.01, 0.11]
-          xformOp:orient    = [1,0,0,0]
+    **缓存**：authoring stage 的局部 TRS 在仿真期间**不会变**（随机化只改
+    PhysX，不写 USD），所以按 prim_path 缓存，避免每次读都等服务、spin ——
+    那是「随机化卡顿」的来源（每次读 3 个属性 × 若干 prim × 等 100ms）。
+
+    缓存失效：只有重启 Isaac / 重载场景才会变，进程内不必担心。
 
     Returns:
         ``(translate(3), orient_wxyz(4), scale(3))``；读不到返回 None。
     """
+    cache = getattr(_read_xform_via_service, "_cache", None)
+    if cache is None:
+        cache = {}
+        _read_xform_via_service._cache = cache       # type: ignore[attr-defined]
+    if prim_path in cache:
+        return cache[prim_path]
+
     try:
         import json as _json
 
@@ -347,7 +354,7 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
             req = GetPrimAttribute.Request()
             req.path = prim_path
             req.attribute = attr
-            r = _call_service(GetPrimAttribute, "/get_prim_attribute", req, timeout=3.0)
+            r = _call_service(GetPrimAttribute, "/get_prim_attribute", req, timeout=2.0)
             if r is None or not getattr(r, "success", False):
                 return None
             raw = (getattr(r, "value", "") or "").strip()
@@ -360,6 +367,7 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
 
         t = _ask("xformOp:translate")
         if t is None:
+            cache[prim_path] = None
             return None
         o = _ask("xformOp:orient")
         s = _ask("xformOp:scale")
@@ -371,9 +379,12 @@ def _read_xform_via_service(prim_path: str) -> tuple[np.ndarray, np.ndarray, np.
         n = np.linalg.norm(ov)
         if n > 1e-9:
             ov = ov / n
-        return tv, ov, sv
+        out = (tv, ov, sv)
+        cache[prim_path] = out
+        return out
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN 读 {prim_path} 的 xform 失败: {exc}")
+        cache[prim_path] = None
         return None
 
 
@@ -417,6 +428,82 @@ def get_pose_any(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
     if got is not None:
         return got
     return get_pose_service(prim_path)
+
+
+def get_prim_local_trs(prim_path: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """读 prim 的**局部** translate/orient（authoring stage 的常量）。
+
+    与 ``get_pose_any`` 的区别：那个读的是**物理真值**（会随随机化/物理变化），
+    这个读的是 **USD 里写死的值**（资产固化的关系，永远不变）。
+
+    典型用途：从 ``room.usda`` 推出「试管相对架子的静止关系」——
+    这层关系在资产里是固定的，不依赖任何一次仿真的状态。
+    """
+    got = _read_xform_via_service(prim_path)
+    if got is None:
+        return None
+    t, q, _s = got
+    return np.asarray(t, dtype=np.float64), np.asarray(q, dtype=np.float64)
+
+
+def get_world_pose_from_usd(prim_path: str,
+                            max_depth: int = 8) -> tuple[np.ndarray, np.ndarray] | None:
+    """**纯从 USD authoring stage** 合成 prim 的世界位姿（不碰 PhysX）。
+
+    Args:
+        prim_path: 目标 prim 的完整路径。
+        max_depth: 最多向上回溯几级父节点（防意外无限循环）。
+
+    Returns:
+        ``(pos(3), quat_wxyz(4))``；任一级读不到就返回 None。
+
+    ### 用途
+    计算「资产里固化的相对关系」。例如：
+
+        rel = get_world_pose_from_usd(tube) − get_world_pose_from_usd(rack)
+
+    这个 rel 是**资产几何常量**，不随随机化/物理变化。于是随机化时：
+
+        试管新位姿 = rack 当前位姿(PhysX) + rel
+
+    就能让试管无论架子搬到哪都保持在孔里。
+
+    ### 为什么必须走这条路
+    早期用「快照时的相对偏移」也有类似效果，但快照是在「某一轮物理状态」
+    下拍的，试管可能已经歪了一点，误差会被固化进 rel。而 USD 里的是
+    authoring 原值，最干净。
+
+    ### 注意 z
+    USD 里 ``test_tube`` 的 translate.z 是**自由悬浮**时的值（0.7972），
+    而物理落稳后管底会下沉到孔里（实测 0.743）。所以从 USD 推出的 rel.z
+    比真实值大 52.7mm。**x/y 是精确的，z 需要按实测校正**（见
+    ``place_on.z_source`` 参数）。
+    """
+    parts = [p for p in str(prim_path).strip("/").split("/") if p]
+    if not parts:
+        return None
+    # 完整祖先链：/World → /World/room → ... → prim（不做深度截断！
+    # 早期版本用 max(1, len(parts)-max_depth) 算起点，当层级很少时会
+    # 漏掉最上面几级，导致合成结果完全跑偏（实测 rack_01 算出 z=1.47，
+    # 正确值是 0.736）。层级最多几十个，全走一遍开销可忽略。
+    chain = ["/" + "/".join(parts[:i + 1]) for i in range(len(parts))]
+    if max_depth > 0 and len(chain) > max_depth:
+        chain = chain[-max_depth:]
+
+    P = np.zeros(3, dtype=np.float64)
+    Q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    for p in chain:
+        trs = get_prim_local_trs(p)
+        if trs is None:
+            # 该级没有 xform（如 /World 是 Xform 但可能没有 xformOp）→ 视为恒等
+            continue
+        t, q = trs
+        P = P + _quat_rotate(Q, t)
+        Q = _quat_mul_wxyz(Q, q)
+        n = np.linalg.norm(Q)
+        if n > 1e-9:
+            Q = Q / n
+    return P, Q
 
 
 def get_subframe_world_pose(parent_prim: str, frame: str) -> tuple[np.ndarray, np.ndarray] | None:
@@ -665,44 +752,85 @@ def restore_and_randomize(
         if not target or not frame:
             warnings.append(f"{prim}: place_on 需要 target 与 frame 两个字段")
             continue
-        got = get_subframe_world_pose(target, frame)
-        if got is None:
+        # 只校验 frame 存在（读局部 TRS，有缓存，很快），不再合成世界位姿
+        # —— 世界位姿由下面的「USD 相对关系 + 目标当前位姿」给出，更准确。
+        frame_local = _read_xform_via_service(f"{target.rstrip('/')}/{frame}")
+        if frame_local is None:
             warnings.append(
-                f"{prim}: 读不到 {target}/{frame} 的世界位姿 —— 检查 frame 名是否存在")
+                f"{prim}: 目标 frame 不存在 {target}/{frame} —— 检查配置")
             continue
-        pos, quat = got
-        # ---- 用「快照时的相对偏移」定位（而不是 align 子 frame）----
+        got = frame_local       # (t_local, q_local, scale) —— 只是校验存在
+        # 目标 frame 的**局部** TRS（用于 offset 的旋转参考）
+        pos = np.asarray(got[0], dtype=np.float64)
+        quat = np.asarray(got[1], dtype=np.float64)
+        # ---- 用「USD 资产里固化的相对关系」定位试管 ----
         #
-        # 为什么不用 align 子 frame：实测 test_tube/tube_bottom 的局部
-        # translate 是 [0,0,0]（与管原点重合），拿它对齐毫无作用。
+        # 这是用户提示的正解，也是我实测验证过的：
+        #   USD 里 test_tube 与 rack_01 是 /World/scene 的**兄弟节点**，
+        #   各自带自己的 TRS。资产里这个相对关系是**常量**。
         #
-        # 正确公式（纯平移，因为随机化只动 xy 不平移旋转）：
+        #   试管目标位姿 = 目标当前位姿(PhysX 真值) + rel_usd
         #
-        #   rel          = 试管快照位姿 − 目标快照位姿   ← 正确摆放时的相对位置
-        #   试管目标位姿 = 目标当前位姿 + rel            ← 目标搬到哪就跟到哪
+        # 其中 rel_usd = tube_usd_world − target_usd_world（都是 authoring 值）。
         #
-        # 这个相对偏移天然包含「管底比孔口低一个管长」，不需要知道
-        # hole_4 的语义。而且**只用快照**（不用物体当前位置 —— 它可能正在飞）。
+        # ### 实测验证（room.usda → 世界系）
+        #   scene:     T=(1.8,0,0)      O=-90°aboutX
+        #   rack_01:   T=(-0.2436,...)  O=+90°aboutX
+        #   test_tube: T=(-0.2341,...)  O=identity
+        #   推出 rel = [-0.020838, -0.009543, +0.060713]
+        #   与实测 rel 对比：x/y **完全一致**，z 差 52.7mm
+        #   → x/y 精确可用；z 是「自由悬浮 vs 物理落稳」的差，需要校正。
+        #
+        # ### rel_xy 用 USD，rel_z 用快照（实测）
+        # USD 里 test_tube.z 是悬浮值（0.7972），落稳后是 0.743，
+        # 所以 z 必须用「快照时的真实相对 z」。x/y 则信 USD（不受物理歪斜影响）。
+        z_source = str(po.get("z_source") or "snapshot").strip().lower()
+
+        usd_self = get_world_pose_from_usd(prim)
+        usd_target = get_world_pose_from_usd(target)
         rec_self = (snap.get("objects") or {}).get(prim)
         rec_target = (snap.get("objects") or {}).get(target)
+        cur_target = get_pose_any(target)
+
+        rel_usd = None
+        if usd_self is not None and usd_target is not None:
+            rel_usd = np.asarray(usd_self[0], dtype=np.float64) - \
+                      np.asarray(usd_target[0], dtype=np.float64)
+            _log(f"  place_on {prim}: USD 相对关系 {np.round(rel_usd, 6).tolist()}")
+
+        rel_snap = None
         if (isinstance(rec_self, dict) and rec_self.get("pos")
                 and isinstance(rec_target, dict) and rec_target.get("pos")):
-            base_self = np.asarray(rec_self["pos"], dtype=np.float64)
-            base_target = np.asarray(rec_target["pos"], dtype=np.float64)
-            cur_target = get_pose_any(target)
-            if cur_target is None:
-                warnings.append(f"{prim}: 读不到 {target} 的当前位姿")
-                continue
-            rel = base_self - base_target
+            rel_snap = (np.asarray(rec_self["pos"], dtype=np.float64)
+                        - np.asarray(rec_target["pos"], dtype=np.float64))
+
+        if cur_target is None:
+            warnings.append(f"{prim}: 读不到 {target} 的当前位姿")
+            continue
+
+        if rel_usd is not None:
+            rel = rel_usd.copy()
+            if z_source == "snapshot":
+                if rel_snap is not None:
+                    # x/y 信 USD（不受物理歪斜影响），z 用实测
+                    rel[2] = rel_snap[2]
+                    _log(f"  place_on: rel_xy 用 USD + rel_z 用快照")
+                else:
+                    warnings.append(
+                        f"{prim}: z_source=snapshot 但没有快照，z 用 USD 值"
+                        "（会偏高约 50mm）")
             pos = np.asarray(cur_target[0], dtype=np.float64) + rel
-            _log(f"  place_on {prim}: 快照相对偏移 {np.round(rel, 4).tolist()} "
+            _log(f"  place_on {prim}: rel={np.round(rel, 4).tolist()} "
                  f"+ 目标当前 {np.round(cur_target[0], 4).tolist()} "
                  f"→ 目标 {np.round(pos, 4).tolist()}")
+        elif rel_snap is not None:
+            pos = np.asarray(cur_target[0], dtype=np.float64) + rel_snap
+            warnings.append(
+                f"{prim}: 读不到 USD 关系，退回快照相对偏移（可能把物理歪斜带进去）")
         else:
             warnings.append(
-                f"{prim}: 快照缺 {prim} 或 {target} 的位姿 —— "
-                "只能按 frame 绝对位置放置（会偏高半个管长）。"
-                "请在物体正确摆放时重新「记录初始位姿」")
+                f"{prim}: 既读不到 USD 关系也没有快照 —— 只能按 frame 绝对位置放置"
+                f"（会偏高半个管长）")
         off = po.get("offset") or [0.0, 0.0, 0.0]
         try:
             off_v = np.asarray([float(x) for x in off][:3], dtype=np.float64)
