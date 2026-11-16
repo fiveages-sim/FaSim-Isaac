@@ -45,17 +45,19 @@ randomize:
   settle_steps: 60        # 200Hz 下 60 步 = 0.3s，够物体落稳
   verify_tol_m: 0.05      # 读回验证容差
   objects:
-    # 右侧试管架（有试管的那只）：只在桌面内平移。
-    # z 不随机 —— 物体在桌面上，z 由桌面高度决定。
-    - prim: /World/room/scene/test_tube_rack
-      axes: {x: 0.04, y: 0.03}
-    # 左侧空架子：独立随机
+    # 右手边的架子（**试管初始放在这个架子上**）。
+    # 实测：初始时试管离本架 24mm、离对面架 201mm。
     - prim: /World/room/scene/test_tube_rack_01
       axes: {x: 0.03, y: 0.03}
-    # 试管：**跟随右架一起搬**（保持插在孔里的相对位置）
-    # 不写 axes 表示它自己不单独随机，只跟随。
+    # 左手边的空架子（任务终点：试管被插在这里）
+    - prim: /World/room/scene/test_tube_rack
+      axes: {x: 0.04, y: 0.03}
+    # 试管：**跟随它初始所在的架子（01）**一起搬，保持相对位置。
+    # 不写 axes 表示不单独随机，只跟随。
+    # （注意：任务结束时试管会被插到另一只架子上，但每轮随机化都是
+    #   「先恢复到初始快照」再偏移，所以跟随 01 号架始终正确。）
     - prim: /World/room/scene/test_tube
-      follow: /World/room/scene/test_tube_rack
+      follow: /World/room/scene/test_tube_rack_01
 
 # ---------------------------------------------------------------------------
 # 相机

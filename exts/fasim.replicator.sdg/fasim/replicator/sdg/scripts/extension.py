@@ -219,7 +219,12 @@ def _dispatch(req: dict) -> dict:
                     app.update()
 
             res = rnd.restore_and_randomize(cfg, data_dir=data_dir, settle_fn=_settle)
-            return {"ok": bool(res.get("ok")), **res}
+            out = dict(res)
+            out["ok"] = bool(res.get("ok"))
+            if not out["ok"]:
+                # 把 warning 提升为 error，方便 CLI 显示具体原因
+                out["error"] = "; ".join(res.get("warnings") or []) or "随机化失败（无细节）"
+            return out
 
         if verb == "randomize_snapshot":
             # 记录初始位姿（第一轮采集开始前调一次）

@@ -684,6 +684,113 @@ def menu_tools(robot: str, task: str, state: dict) -> None:
             run([str(SDG_SH), "info", str(sess)])
 
 
+
+def menu_randomize(robot: str, task: str, state: dict) -> None:
+    """随机化物体位姿 —— 纯调试/半自动数采用，不进采集流程。
+
+    设计意图：**足够独立**。不依赖采集是否在跑，可以反复按、反复看效果，
+    用来验证「随机化后仿真会不会崩」「物体位置是否合理」，也可以人工
+    挑位置后手动开始采集（半自动数采）。
+
+    每次都从「初始快照位姿 + 随机偏移」算起，所以：
+      - 第一次用必须先「记录初始位姿」（本菜单第 1 项会自动检测并提示）
+      - 反复随机不会累积漂移（每次都从快照重新算）
+    """
+    from fasim.replicator.sdg import config_io
+
+    try:
+        task_cfg = config_io.load_task_config(robot, task)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"{_c(f'读任务配置失败: {exc}', RED)}")
+        return
+
+    cfg = dict(getattr(task_cfg, "randomize", {}) or {})
+    if not cfg:
+        _log(f"{_c('该任务的 yaml 里没有 randomize: 段 —— 无可随机化的物体', YELLOW)}")
+        _log(f"{DIM}  在 configs/{robot}/tasks/{task}.yaml 里加一段 randomize: 即可{NC}")
+        return
+
+    objs = cfg.get("objects") or []
+    print(f"\n{_c('=== 随机化物体 ===', BOLD)}")
+    print(f"{DIM}  任务: {robot}/{task}{NC}")
+    want_w = max((len(str(o.get("prim", ""))) for o in objs), default=10)
+    print(f"{DIM}  配置声明的物体（{len(objs)} 个）:{NC}")
+    for o in objs:
+        prim = str(o.get("prim", ""))
+        ax = o.get("axes") or {}
+        follow = o.get("follow")
+        if follow:
+            desc = f"follow {follow}"
+        elif ax:
+            desc = " ".join(f"{k}±{float(v)*1000:.0f}mm" for k, v in ax.items())
+        else:
+            desc = "不动"
+        print(f"    {prim:<{want_w}}  {desc}")
+
+    # 快照状态检查
+    import os
+    snap = os.path.join(str(getattr(task_cfg, "output_dir", "") or ""),
+                        "scene_initial_poses.json")
+    has_snap = os.path.isfile(snap)
+    print()
+    if has_snap:
+        print(f"{GREEN}  初始位姿快照: 已有{NC} {DIM}({snap}){NC}")
+    else:
+        print(f"{_c('  初始位姿快照: 还没有 —— 先选「1) 记录初始位姿」', YELLOW)}")
+
+    while True:
+        sel = pick(
+            "操作",
+            [
+                ("snapshot", "1) 记录初始位姿（第一轮前必须做一次）"),
+                ("once", "2) 随机一次（看效果）"),
+                ("multi", "3) 连续随机 N 次（验证会不会崩）"),
+                ("range", "4) 改随机范围（临时，不改 yaml）"),
+            ],
+            2 if has_snap else 1,
+            allow_back=True,
+        )
+        if sel == BACK or sel == "quit":
+            return
+
+        if sel == "snapshot":
+            run([str(SDG_SH), "randomize", "--robot", robot, "--task", task, "--snapshot"])
+            has_snap = True
+            continue
+
+        if sel == "once":
+            if not has_snap:
+                _log(f"{_c('先记录初始位姿（第 1 项）', YELLOW)}")
+                continue
+            run([str(SDG_SH), "randomize", "--robot", robot, "--task", task])
+            continue
+
+        if sel == "multi":
+            if not has_snap:
+                _log(f"{_c('先记录初始位姿（第 1 项）', YELLOW)}")
+                continue
+            n = ask("连续随机几轮", "10")
+            try:
+                n_i = max(1, int(n))
+            except ValueError:
+                _log(f"{_c('要整数', RED)}")
+                continue
+            rng = ask("临时覆盖范围？如 0.04,0.03,0 表示 x±40 y±30 z±0（回车用配置）", "")
+            cmd = [str(SDG_SH), "randomize", "--robot", robot, "--task", task, "--rounds", str(n_i)]
+            if rng.strip():
+                parts = [x.strip() for x in rng.replace("，", ",").split(",") if x.strip()]
+                for name, val in zip(("--range-x", "--range-y", "--range-z"), parts):
+                    cmd += [name, val]
+            run(cmd)
+            _log(f"{DIM}  想看更严格的报告（含读回误差/越界统计）就在 Isaac Script Editor 里跑：{NC}")
+            _log(f"{DIM}    exec(open('{SCRIPT_DIR}/verify_randomize.py').read()){NC}")
+            continue
+
+        if sel == "range":
+            _log("临时改范围只对本次「连续随机」有效；要长期生效请改任务 yaml 的 randomize.objects[].axes")
+            continue
+
+
 def menu_replay(robot: str, task: str, state: dict) -> None:
     """回放：关节 / 末端。"""
     ep = pick_session(state, robot, task, need_episode=True, kind="episode")
@@ -755,6 +862,7 @@ FUNCS = [
     ("stop", "结束采集", None),
     ("tools", "数据工具（pack/shots/diag/trim）", menu_tools),
     ("replay", "回放（关节/末端）", menu_replay),
+    ("random", "随机化物体位姿（调试/半自动数采）", menu_randomize),
     ("selfcheck", "环境自检", menu_selfcheck),
     ("context", "切换机器人/任务", None),
     ("quit", "退出", None),

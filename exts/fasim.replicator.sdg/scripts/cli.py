@@ -544,6 +544,127 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------- 随机化
+
+
+def cmd_randomize(args: argparse.Namespace) -> int:
+    """在正在运行的仿真里随机化物体位姿（先归位再叠加偏移）。
+
+    两种用法：
+      sdg.sh randomize --snapshot        记录初始位姿（第一轮前跑一次）
+      sdg.sh randomize                    按任务配置随机化一轮
+      sdg.sh randomize --rounds 5         连续随机 5 轮（验证会不会崩）
+      sdg.sh randomize --check            跑可行性验证（带报告）
+
+    配置来自任务的 ``randomize:`` 段；命令行 ``--range-x/--range-y/--range-z``
+    可以临时覆盖（调试用，不改 yaml）。
+    """
+    import json as _json
+
+    robot = str(getattr(args, "robot", "") or "")
+    task = str(getattr(args, "task", "") or "")
+    if not robot or not task:
+        _log("ERROR 需要 --robot 与 --task（或用菜单里的上下文）")
+        return 1
+
+    # 输出目录：会话数据的父目录（快照存在这里）
+    from fasim.replicator.sdg import config_io, runtime as _rt
+
+    try:
+        task_cfg = config_io.load_task_config(robot, task)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"ERROR 读任务配置失败: {exc}")
+        return 1
+    data_dir = str(getattr(task_cfg, "output_dir", "") or _rt.data_root())
+
+    cfg = dict(getattr(task_cfg, "randomize", {}) or {})
+    if not cfg:
+        _log(f"ERROR 任务 {robot}/{task} 的 yaml 里没有 randomize: 段")
+        _log("       需要至少一段 objects 声明（见 configs/*/tasks/*.yaml 示例）")
+        return 1
+
+    # 命令行覆盖范围（调试方便，不改 yaml）
+    rx = getattr(args, "range_x", None)
+    ry = getattr(args, "range_y", None)
+    rz = getattr(args, "range_z", None)
+    if any(v is not None for v in (rx, ry, rz)):
+        for obj in (cfg.get("objects") or []):
+            if obj.get("follow"):
+                continue          # follow 的物体不单独随机
+            ax = dict(obj.get("axes") or {})
+            for name, val in (("x", rx), ("y", ry), ("z", rz)):
+                if val is not None:
+                    ax[name] = float(val)
+            obj["axes"] = ax
+        _log(f"已覆盖随机范围: x={rx} y={ry} z={rz}（None 表示用配置值）")
+
+    if getattr(args, "snapshot", False):
+        resp = _request({"cmd": "randomize_snapshot", "data_dir": data_dir, "cfg": cfg},
+                        timeout=60)
+        if not resp.get("ok"):
+            _log(f"ERROR {resp.get('error', '未知错误')}")
+            return 1
+        snap = resp.get("snapshot") or {}
+        objs = snap.get("objects") or {}
+        _log(f"已记录 {len(objs)} 个物体的初始位姿 → {data_dir}/scene_initial_poses.json")
+        for prim, rec in objs.items():
+            pos = rec.get("pos") if rec else None
+            _log(f"  {prim}: {[round(v,4) for v in pos] if pos else '读取失败'}")
+        return 0
+
+    rounds = int(getattr(args, "rounds", 1) or 1)
+    ok_n = 0
+    warns: list[str] = []
+    for i in range(rounds):
+        resp = _request({"cmd": "randomize", "data_dir": data_dir, "cfg": cfg},
+                        timeout=120)
+        if not resp.get("ok"):
+            _log(f"ERROR 第 {i+1} 轮失败: {resp.get('error', '未知错误')}")
+            warns.extend([str(resp.get("error"))])
+            continue
+        ok_n += 1
+        w = resp.get("warnings") or []
+        warns.extend(w)
+        applied = resp.get("applied") or []
+        _log(f"第 {i+1}/{rounds} 轮: {len(applied)} 个物体, seed={resp.get('seed')}"
+             + (f", {len(w)} 条告警" if w else ""))
+        for a in applied:
+            _log(f"    {a['prim']}: offset={a.get('offset')}"
+                 + (f" verify_err={a.get('verify_err_m')}m" if "verify_err_m" in a else ""))
+        for msg in w:
+            _log(f"    WARN {msg}")
+
+    _log(f"完成 {ok_n}/{rounds} 轮，告警 {len(warns)} 条")
+    if warns:
+        _log("提示：出现告警说明物体被物理改写/碰撞。建议收窄范围或加大 --settle-steps")
+    return 0 if ok_n == rounds else 1
+
+
+def cmd_randomize_check(args: argparse.Namespace) -> int:
+    """可行性验证：连续随机 N 轮，看会不会崩/越界。
+
+    结果写到 /tmp/sdg_randomize_check/report.json。
+    这是接入自动采集之前的**必经检查**。
+    """
+    _log("注意：本命令会真的移动物体。建议先保存场景或确认可重载。")
+    robot = str(getattr(args, "robot", "") or "")
+    task = str(getattr(args, "task", "") or "")
+    if not robot or not task:
+        _log("ERROR 需要 --robot 与 --task")
+        return 1
+    # 复用 verify_randomize（它需要在 Isaac 内跑，这里通过 socket 不支持，
+    # 所以直接提示用户在 Script Editor 执行）
+    _log("可行性验证需要在 **Isaac 的 Script Editor** 里执行（它要逐物理步推进）：")
+    _log("")
+    _log("    exec(open('/home/fiveages/FaSim-Isaac/exts/fasim.replicator.sdg/"
+         "scripts/verify_randomize.py').read())")
+    _log("")
+    _log("或在 sdg 菜单里选「随机化 → 可行性验证」，它会给出同样的指令。")
+    _log(f"（当前上下文: {robot}/{task}；默认 10 轮、settle 60 步）")
+    return 0
+
+
 def cmd_diag_replay(args: argparse.Namespace) -> int:
     """体检一次回放：回放实际到达的末端 vs 编排时到达的末端。
 
@@ -1989,6 +2110,19 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("-y", "--yes", action="store_true", help="跳过确认")
     c.set_defaults(func=cmd_capture)
 
+    rnd = sub.add_parser("randomize", help="随机化物体位姿（先归位再叠加偏移）")
+    rnd.add_argument("--robot", default="", help="机器人 key（默认用菜单上下文）")
+    rnd.add_argument("--task", default="", help="任务 key")
+    rnd.add_argument("--snapshot", action="store_true",
+                     help="只记录初始位姿（第一轮前跑一次）")
+    rnd.add_argument("--rounds", type=int, default=1, help="连续随机几轮")
+    rnd.add_argument("--range-x", dest="range_x", type=float, default=None,
+                     help="临时覆盖 x 半幅（米）")
+    rnd.add_argument("--range-y", dest="range_y", type=float, default=None)
+    rnd.add_argument("--range-z", dest="range_z", type=float, default=None)
+    rnd.set_defaults(func=cmd_randomize)
+    sub.add_parser("randomize-check", help="随机化可行性验证（会给出 Script Editor 指令）").set_defaults(
+        func=cmd_randomize_check)
     sub.add_parser("status", help="查看采集进度").set_defaults(func=cmd_status)
     sub.add_parser("stop", help="结束采集").set_defaults(func=cmd_stop)
     sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
