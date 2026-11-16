@@ -65,6 +65,12 @@ randomize:
       place_on:
         target: /World/room/scene/test_tube_rack_01
         frame: hole_4
+        # 对齐参考点：把 test_tube/tube_bottom（管底）放到 hole_4 上。
+        #
+        # 为什么必须写：hole_4 的点在**孔口上方/管身中部**（实测它的世界 z
+        # 比试管正确位置高 103mm ≈ tube_grasp 的高度）。不写 align 会让
+        # 试管悬空半个管长然后自由落体，可能弹跳/歪倒。
+        align: tube_bottom
         offset: [0.0, 0.0, 0.0]   # 需要微调时在这里加（frame 局部系，米）
 
 # ---------------------------------------------------------------------------
