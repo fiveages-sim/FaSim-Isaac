@@ -1020,86 +1020,66 @@ def restore_and_randomize(
         # 目标 frame 的**局部** TRS（用于 offset 的旋转参考）
         pos = np.asarray(got[0], dtype=np.float64)
         quat = np.asarray(got[1], dtype=np.float64)
-        # ---- 用「资产固化的相对关系」定位试管 ----
+        # ---- 定位：用**快照的相对偏移** ----
         #
-        # 试管目标 = 目标当前位姿(PhysX) + rel
+        # rel = 试管快照位姿 − 目标快照位姿
         #
-        # ⚠️ rel 必须**只算一次并缓存**。
-        #   `get_world_pose_from_usd()` 读的是**当前 stage 的值**，而
-        #   `set_pose_usd_api()` 会往 stage 写位姿 —— 所以从第二轮起，
-        #   stage 里已经不是资产原值了。若每轮重算 rel，就会得到
-        #   「上一轮的相对位置」，误差逐轮固化（实测症状：每轮随机化后
-        #   试管都和 rack_01 保持一个固定的错误偏移，永远回不到孔里）。
+        # ### 为什么不用「每轮从 USD 算」
+        # USD 理论上更"干净"（资产原值），但实测有两个坑：
+        #   ① get_world_pose_from_usd() 读的是**当前 stage 值**，而
+        #      set_pose_usd_api() 会往 stage 写 —— 若首次读取晚于任何一次
+        #      写入，rel 就被污染。实测拿到 rel=[0.0036, 0.0174]，
+        #      而正确值是 [-0.0208, -0.0095]，差了 24/27mm 且**每轮固定**
+        #      → 试管永远停在孔边（正是用户看到的现象）。
+        #   ② 进程级 rel 缓存一旦存了错值，之后全部失效。
         #
-        #   × 正确：第一轮（stage ≡ 资产原值）算一次，之后复用。
-        #   ✓ 备选：用快照（第一轮随机化之前记录的，同样是原始状态）。
-        rel = None
-        cache_key = f"{prim}|{target}"
-        rel_cache = getattr(restore_and_randomize, "_rel_cache", None)
-        if rel_cache is None:
-            rel_cache = {}
-            restore_and_randomize._rel_cache = rel_cache    # type: ignore[attr-defined]
-        if cache_key in rel_cache:
-            rel = rel_cache[cache_key]
-        else:
-            usd_self = get_world_pose_from_usd(prim)
-            usd_target = get_world_pose_from_usd(target)
-            if usd_self is not None and usd_target is not None:
-                rel = np.asarray(usd_self[0], dtype=np.float64) - \
-                      np.asarray(usd_target[0], dtype=np.float64)
-                rel_cache[cache_key] = rel
-                _log(f"  place_on {prim}: 首次从资产算 rel = "
-                     f"{np.round(rel, 6).tolist()}（缓存，后续轮复用）")
-
-        # ---- z 用快照校正 ----
-        # USD 里 test_tube.z 是**自由悬浮**值（0.7972），物理落稳后管底
-        # 会沉进孔里（实测 0.743），差 52.7mm。所以 z 用快照的实测相对 z。
-        z_source = str(po.get("z_source") or "snapshot").strip().lower()
+        # ### 为什么用快照
+        # 快照是「第一轮随机化之前、物体处于正确摆放状态」时记录的，
+        # 天然就是这个任务的正确相对关系。实测交叉验证：
+        #   快照 rel  = [-20.8, -9.5, +8.0] mm
+        #   资产推出  = [-20.8, -9.5, +60.7] mm   ← x/y 完全一致，z 差沉降量
+        # 所以快照的 rel 更优（且 z 已经是落稳后的正确值）。
+        #
+        # 前提：快照必须在「物体正确摆放」时记录 —— 菜单第一项就是它。
         rec_self = (snap.get("objects") or {}).get(prim)
         rec_target = (snap.get("objects") or {}).get(target)
-        rel_snap = None
+        rel = None
         if (isinstance(rec_self, dict) and rec_self.get("pos")
                 and isinstance(rec_target, dict) and rec_target.get("pos")):
-            rel_snap = (np.asarray(rec_self["pos"], dtype=np.float64)
-                        - np.asarray(rec_target["pos"], dtype=np.float64))
+            rel = (np.asarray(rec_self["pos"], dtype=np.float64)
+                   - np.asarray(rec_target["pos"], dtype=np.float64))
 
         cur_target = get_pose_any(target)
         if cur_target is None:
             warnings.append(f"{prim}: 读不到 {target} 的当前位姿")
             continue
 
-        # **优先用第一遍刚写入的值**，而不是重读：
-        # 写 USD 后 PhysX 要一帧才同步，立刻重读会拿到旧值，
-        # 于是试管被放到「架子旧位置 + 偏移」→ 落在孔边、和架子重叠（实测）。
+        # **优先用第一遍刚写入的值**：写 USD 后 PhysX 要一帧才同步，
+        # 立刻重读是旧值 → 试管错位一个偏移量、落在孔边。
         tgt_pos = written.get(target)
         if tgt_pos is not None:
             cur_target = (np.asarray(tgt_pos, dtype=np.float64), cur_target[1])
-            _log(f"  place_on: 用第一遍写入的 {target.split('/')[-1]} 位置 "
-                 f"{np.round(tgt_pos, 4).tolist()}（避免重读到旧值）")
-        else:
-            # 目标没被本轮的 axes 处理（如没配 axes）→ 必须重读
-            _log(f"  place_on: {target.split('/')[-1]} 不在本轮 axes 列表，"
-                 f"用读到的位置 {np.round(cur_target[0], 4).tolist()}")
 
         if rel is None:
-            if rel_snap is not None:
-                rel = rel_snap
+            # 没快照：退回资产关系（x/y 可靠，z 会偏高约 53mm）
+            usd_self = get_world_pose_from_usd(prim)
+            usd_target = get_world_pose_from_usd(target)
+            if usd_self is not None and usd_target is not None:
+                rel = (np.asarray(usd_self[0], dtype=np.float64)
+                       - np.asarray(usd_target[0], dtype=np.float64))
                 warnings.append(
-                    f"{prim}: 读不到资产关系，退回快照相对偏移"
-                    "（可能把物理歪斜带进去）")
+                    f"{prim}: 没有快照，用资产关系（z 会偏高约 53mm）。"
+                    "建议先在物体正确摆放时跑一次 --snapshot")
             else:
                 warnings.append(
-                    f"{prim}: 既读不到资产关系也没有快照 —— 无法定位，跳过")
+                    f"{prim}: 既没有快照也读不到资产关系 —— 无法定位，跳过")
                 continue
 
-        rel = np.asarray(rel, dtype=np.float64).copy()
-        if z_source == "snapshot" and rel_snap is not None:
-            rel[2] = rel_snap[2]
         pos = np.asarray(cur_target[0], dtype=np.float64) + rel
         _log(f"  place_on {prim.split('/')[-1]}: "
-             f"目标位姿 {np.round(cur_target[0], 4).tolist()} "
-             f"+ rel {np.round(rel, 4).tolist()} = {np.round(pos, 4).tolist()}"
-             f"   [rel 期望 x≈-0.0208 y≈-0.0095 z≈0.008]")
+             f"{target.split('/')[-1]} {np.round(cur_target[0], 4).tolist()} "
+             f"+ rel {np.round(rel, 4).tolist()} = {np.round(pos, 4).tolist()}")
+
         off = po.get("offset") or [0.0, 0.0, 0.0]
         try:
             off_v = np.asarray([float(x) for x in off][:3], dtype=np.float64)
