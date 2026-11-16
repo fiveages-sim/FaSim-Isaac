@@ -934,6 +934,10 @@ def restore_and_randomize(
     # ---- 第一遍：把每个物体搬回初始位姿 ----
     # 先全部归位再做偏移，避免"A 挪了、B 还用旧相对位置去算"的错位。
     offsets: dict[str, np.ndarray] = {}
+    #: 本轮**写入**的目标位姿（prim → pos）。第三遍 place_on 必须用它，
+    #: 而不是重读 —— 写入 USD 后 PhysX 需要一帧才同步，立刻重读会拿到旧值
+    #: （实测：试管按「架子旧位置 + 偏移」放，落在孔边、和架子重叠）。
+    written: dict[str, np.ndarray] = {}
     for obj in objects:
         prim = str(obj.get("prim") or "")
         if not prim:
@@ -954,6 +958,7 @@ def restore_and_randomize(
         target = np.asarray(rec["pos"], dtype=np.float64) + off
         quat = np.asarray(rec["quat"], dtype=np.float64)
         if set_pose(prim, target, quat):
+            written[prim] = target
             applied.append({
                 "prim": prim,
                 "offset": [round(float(v), 4) for v in off],
@@ -978,6 +983,7 @@ def restore_and_randomize(
         target = np.asarray(rec["pos"], dtype=np.float64) + off
         quat = np.asarray(rec["quat"], dtype=np.float64)
         if set_pose(prim, target, quat):
+            written[prim] = target
             applied.append({
                 "prim": prim,
                 "follow": src,
@@ -1062,6 +1068,19 @@ def restore_and_randomize(
             warnings.append(f"{prim}: 读不到 {target} 的当前位姿")
             continue
 
+        # **优先用第一遍刚写入的值**，而不是重读：
+        # 写 USD 后 PhysX 要一帧才同步，立刻重读会拿到旧值，
+        # 于是试管被放到「架子旧位置 + 偏移」→ 落在孔边、和架子重叠（实测）。
+        tgt_pos = written.get(target)
+        if tgt_pos is not None:
+            cur_target = (np.asarray(tgt_pos, dtype=np.float64), cur_target[1])
+            _log(f"  place_on: 用第一遍写入的 {target.split('/')[-1]} 位置 "
+                 f"{np.round(tgt_pos, 4).tolist()}（避免重读到旧值）")
+        else:
+            # 目标没被本轮的 axes 处理（如没配 axes）→ 必须重读
+            _log(f"  place_on: {target.split('/')[-1]} 不在本轮 axes 列表，"
+                 f"用读到的位置 {np.round(cur_target[0], 4).tolist()}")
+
         if rel is None:
             if rel_snap is not None:
                 rel = rel_snap
@@ -1077,9 +1096,10 @@ def restore_and_randomize(
         if z_source == "snapshot" and rel_snap is not None:
             rel[2] = rel_snap[2]
         pos = np.asarray(cur_target[0], dtype=np.float64) + rel
-        _log(f"  place_on {prim}: rel={np.round(rel, 4).tolist()} "
-             f"+ 目标当前 {np.round(cur_target[0], 4).tolist()} "
-             f"→ 目标 {np.round(pos, 4).tolist()}")
+        _log(f"  place_on {prim.split('/')[-1]}: "
+             f"目标位姿 {np.round(cur_target[0], 4).tolist()} "
+             f"+ rel {np.round(rel, 4).tolist()} = {np.round(pos, 4).tolist()}"
+             f"   [rel 期望 x≈-0.0208 y≈-0.0095 z≈0.008]")
         off = po.get("offset") or [0.0, 0.0, 0.0]
         try:
             off_v = np.asarray([float(x) for x in off][:3], dtype=np.float64)
