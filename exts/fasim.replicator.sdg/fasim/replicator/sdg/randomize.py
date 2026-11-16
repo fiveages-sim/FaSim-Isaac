@@ -1014,74 +1014,72 @@ def restore_and_randomize(
         # 目标 frame 的**局部** TRS（用于 offset 的旋转参考）
         pos = np.asarray(got[0], dtype=np.float64)
         quat = np.asarray(got[1], dtype=np.float64)
-        # ---- 用「USD 资产里固化的相对关系」定位试管 ----
+        # ---- 用「资产固化的相对关系」定位试管 ----
         #
-        # 这是用户提示的正解，也是我实测验证过的：
-        #   USD 里 test_tube 与 rack_01 是 /World/scene 的**兄弟节点**，
-        #   各自带自己的 TRS。资产里这个相对关系是**常量**。
+        # 试管目标 = 目标当前位姿(PhysX) + rel
         #
-        #   试管目标位姿 = 目标当前位姿(PhysX 真值) + rel_usd
+        # ⚠️ rel 必须**只算一次并缓存**。
+        #   `get_world_pose_from_usd()` 读的是**当前 stage 的值**，而
+        #   `set_pose_usd_api()` 会往 stage 写位姿 —— 所以从第二轮起，
+        #   stage 里已经不是资产原值了。若每轮重算 rel，就会得到
+        #   「上一轮的相对位置」，误差逐轮固化（实测症状：每轮随机化后
+        #   试管都和 rack_01 保持一个固定的错误偏移，永远回不到孔里）。
         #
-        # 其中 rel_usd = tube_usd_world − target_usd_world（都是 authoring 值）。
-        #
-        # ### 实测验证（room.usda → 世界系）
-        #   scene:     T=(1.8,0,0)      O=-90°aboutX
-        #   rack_01:   T=(-0.2436,...)  O=+90°aboutX
-        #   test_tube: T=(-0.2341,...)  O=identity
-        #   推出 rel = [-0.020838, -0.009543, +0.060713]
-        #   与实测 rel 对比：x/y **完全一致**，z 差 52.7mm
-        #   → x/y 精确可用；z 是「自由悬浮 vs 物理落稳」的差，需要校正。
-        #
-        # ### rel_xy 用 USD，rel_z 用快照（实测）
-        # USD 里 test_tube.z 是悬浮值（0.7972），落稳后是 0.743，
-        # 所以 z 必须用「快照时的真实相对 z」。x/y 则信 USD（不受物理歪斜影响）。
-        z_source = str(po.get("z_source") or "snapshot").strip().lower()
+        #   × 正确：第一轮（stage ≡ 资产原值）算一次，之后复用。
+        #   ✓ 备选：用快照（第一轮随机化之前记录的，同样是原始状态）。
+        rel = None
+        cache_key = f"{prim}|{target}"
+        rel_cache = getattr(restore_and_randomize, "_rel_cache", None)
+        if rel_cache is None:
+            rel_cache = {}
+            restore_and_randomize._rel_cache = rel_cache    # type: ignore[attr-defined]
+        if cache_key in rel_cache:
+            rel = rel_cache[cache_key]
+        else:
+            usd_self = get_world_pose_from_usd(prim)
+            usd_target = get_world_pose_from_usd(target)
+            if usd_self is not None and usd_target is not None:
+                rel = np.asarray(usd_self[0], dtype=np.float64) - \
+                      np.asarray(usd_target[0], dtype=np.float64)
+                rel_cache[cache_key] = rel
+                _log(f"  place_on {prim}: 首次从资产算 rel = "
+                     f"{np.round(rel, 6).tolist()}（缓存，后续轮复用）")
 
-        usd_self = get_world_pose_from_usd(prim)
-        usd_target = get_world_pose_from_usd(target)
+        # ---- z 用快照校正 ----
+        # USD 里 test_tube.z 是**自由悬浮**值（0.7972），物理落稳后管底
+        # 会沉进孔里（实测 0.743），差 52.7mm。所以 z 用快照的实测相对 z。
+        z_source = str(po.get("z_source") or "snapshot").strip().lower()
         rec_self = (snap.get("objects") or {}).get(prim)
         rec_target = (snap.get("objects") or {}).get(target)
-        cur_target = get_pose_any(target)
-
-        rel_usd = None
-        if usd_self is not None and usd_target is not None:
-            rel_usd = np.asarray(usd_self[0], dtype=np.float64) - \
-                      np.asarray(usd_target[0], dtype=np.float64)
-            _log(f"  place_on {prim}: USD 相对关系 {np.round(rel_usd, 6).tolist()}")
-
         rel_snap = None
         if (isinstance(rec_self, dict) and rec_self.get("pos")
                 and isinstance(rec_target, dict) and rec_target.get("pos")):
             rel_snap = (np.asarray(rec_self["pos"], dtype=np.float64)
                         - np.asarray(rec_target["pos"], dtype=np.float64))
 
+        cur_target = get_pose_any(target)
         if cur_target is None:
             warnings.append(f"{prim}: 读不到 {target} 的当前位姿")
             continue
 
-        if rel_usd is not None:
-            rel = rel_usd.copy()
-            if z_source == "snapshot":
-                if rel_snap is not None:
-                    # x/y 信 USD（不受物理歪斜影响），z 用实测
-                    rel[2] = rel_snap[2]
-                    _log(f"  place_on: rel_xy 用 USD + rel_z 用快照")
-                else:
-                    warnings.append(
-                        f"{prim}: z_source=snapshot 但没有快照，z 用 USD 值"
-                        "（会偏高约 50mm）")
-            pos = np.asarray(cur_target[0], dtype=np.float64) + rel
-            _log(f"  place_on {prim}: rel={np.round(rel, 4).tolist()} "
-                 f"+ 目标当前 {np.round(cur_target[0], 4).tolist()} "
-                 f"→ 目标 {np.round(pos, 4).tolist()}")
-        elif rel_snap is not None:
-            pos = np.asarray(cur_target[0], dtype=np.float64) + rel_snap
-            warnings.append(
-                f"{prim}: 读不到 USD 关系，退回快照相对偏移（可能把物理歪斜带进去）")
-        else:
-            warnings.append(
-                f"{prim}: 既读不到 USD 关系也没有快照 —— 只能按 frame 绝对位置放置"
-                f"（会偏高半个管长）")
+        if rel is None:
+            if rel_snap is not None:
+                rel = rel_snap
+                warnings.append(
+                    f"{prim}: 读不到资产关系，退回快照相对偏移"
+                    "（可能把物理歪斜带进去）")
+            else:
+                warnings.append(
+                    f"{prim}: 既读不到资产关系也没有快照 —— 无法定位，跳过")
+                continue
+
+        rel = np.asarray(rel, dtype=np.float64).copy()
+        if z_source == "snapshot" and rel_snap is not None:
+            rel[2] = rel_snap[2]
+        pos = np.asarray(cur_target[0], dtype=np.float64) + rel
+        _log(f"  place_on {prim}: rel={np.round(rel, 4).tolist()} "
+             f"+ 目标当前 {np.round(cur_target[0], 4).tolist()} "
+             f"→ 目标 {np.round(pos, 4).tolist()}")
         off = po.get("offset") or [0.0, 0.0, 0.0]
         try:
             off_v = np.asarray([float(x) for x in off][:3], dtype=np.float64)
