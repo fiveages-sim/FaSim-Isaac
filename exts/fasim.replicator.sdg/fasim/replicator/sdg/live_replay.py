@@ -333,10 +333,32 @@ def play_episode(
                             s: np.asarray(getattr(episode, f"{s}_quat"))[0]
                             for s in fk.ee_frames
                         }
-                        fk.solve_base_from_rest(rest, restq)
-                        got = fk.tcp_poses(
-                            np.asarray(jpc), episode.joint_names, to_world=True
-                        )
+                        # 逐帧基座（与 pack 一致）：G1 的 pelvis 随站立策略摆动，
+                        # 冻结首帧会让世界系末端指令偏 mean≈12mm / max≈47mm。
+                        got = None
+                        try:
+                            bt, bR = fk.solve_base_track(
+                                {s: np.asarray(getattr(episode, f"{s}_pos"))
+                                 for s in fk.ee_frames},
+                                {s: np.asarray(getattr(episode, f"{s}_quat"))
+                                 for s in fk.ee_frames},
+                                np.asarray(episode.joint_pos),
+                                episode.joint_names,
+                            )
+                            got = fk.tcp_poses_with_base(
+                                np.asarray(jpc), episode.joint_names, (bt, bR)
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _log(f"  WARN 逐帧基座反解失败（退回固定基座）: {exc}")
+                        if got is None:
+                            fk.solve_base_from_rest(
+                                rest, restq,
+                                rest_joint_pos=np.asarray(episode.joint_pos)[0],
+                                rest_joint_names=episode.joint_names,
+                            )
+                            got = fk.tcp_poses(
+                                np.asarray(jpc), episode.joint_names, to_world=True
+                            )
                         for s, (p, q) in got.items():
                             ee_pos[s], ee_quat[s] = p, q
                         _log(f"  已现场用 FK 反算指令位姿（URDF="

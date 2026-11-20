@@ -345,7 +345,7 @@ def pack_episode(
     if joint_pos_cmd is not None:
         try:
             from .config_io import CONFIG_ROOT, load_robot_config
-            from .fk import make_fk
+            from .fk import make_fk, rotations_to_wxyz
 
             rk = robot_key
             if not rk:
@@ -389,14 +389,48 @@ def pack_episode(
                         rest[side] = np.asarray(pv)[0]
                         if qv is not None:
                             restq[side] = np.asarray(qv)[0]
+
+                # ---- 逐帧基座（关键）----
+                # 基座会因为腿部站立策略而摆动（实测 13~17mm / 1.8~2.4°）。
+                # 冻结在首帧会给世界系末端指令标签引入 mean≈12mm、max≈47mm
+                # 的系统误差，超过插孔容差 —— 逐帧反解后残差降到 mean≈3mm。
+                # 详见 fk.py 的 solve_base_track 说明。
+                base_track = None
                 if rest:
-                    fk.solve_base_from_rest(rest, restq or None)
-                cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
+                    full_pos = {s: np.asarray(payload[f"{s}_pos"])
+                                for s in rest if f"{s}_pos" in payload}
+                    full_quat = {s: np.asarray(payload[f"{s}_quat"])
+                                 for s in restq if f"{s}_quat" in payload} or None
+                    try:
+                        base_track = fk.solve_base_track(
+                            full_pos, full_quat, joint_pos, names
+                        )
+                        fk.base_t, fk.base_R = base_track[0][0], base_track[1][0]
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"  WARN 逐帧基座反解失败，退回固定基座: {exc}")
+                        base_track = None
+                        fk.solve_base_from_rest(
+                            rest, restq or None,
+                            rest_joint_pos=joint_pos[0],
+                            rest_joint_names=names,
+                        )
+
+                if base_track is not None:
+                    cmd_poses = fk.tcp_poses_with_base(
+                        joint_pos_cmd, names, base_track
+                    )
+                    payload["base_pos"] = np.asarray(base_track[0], dtype=np.float32)
+                    payload["base_quat"] = rotations_to_wxyz(base_track[1]).astype(np.float32)
+                    _log(f"  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算"
+                         f"（URDF={Path(fk.urdf_path).name}，**逐帧基座**）")
+                else:
+                    cmd_poses = fk.tcp_poses(joint_pos_cmd, names, to_world=True)
+                    _log(f"  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算"
+                         f"（URDF={Path(fk.urdf_path).name}，固定基座）")
+
                 for side, (pos, quat) in cmd_poses.items():
                     payload[f"{side}_cmd_pos"] = pos
                     payload[f"{side}_cmd_quat"] = quat
-                _log(f"  末端指令位姿: 已由 joint_pos_cmd 经 FK 反算"
-                     f"（URDF={Path(fk.urdf_path).name}）")
                 for side in fk.ee_frames:
                     pv = payload.get(f"{side}_pos")
                     if pv is None:
@@ -406,9 +440,9 @@ def pack_episode(
                     ) * 1000
                     if np.isfinite(cmd_err).any():
                         dv = payload[f"{side}_cmd_pos"] - np.asarray(pv)
-                        _log(f"    {side}: 实测比指令低 mean={np.nanmean(cmd_err):.1f}mm "
+                        _log(f"    {side}: 指令↔实测 差 mean={np.nanmean(cmd_err):.1f}mm "
                              f"max={np.nanmax(cmd_err):.1f}mm "
-                             f"dz={np.nanmean(dv[:, 2])*1000:+.1f}mm（物理稳态误差）")
+                             f"dz={np.nanmean(dv[:, 2])*1000:+.1f}mm（关节跟踪误差）")
         except Exception as exc:  # noqa: BLE001
             _log(f"  WARN 反算末端指令位姿失败（EE 回放会偏下）: {exc}")
 

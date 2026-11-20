@@ -254,6 +254,50 @@ def run_orchestration(robot_key: str, task_key: str, scene: str = "default",
     )
 
 
+#: 编排失败后用来把机器人拉回 HOME 的兜底任务（见 task_configs 里的 home_only.yaml）。
+HOME_ONLY_TASK = "home_only"
+
+
+def recover_home(robot_key: str, task_key: str, scene: str = "default",
+                 motion_launch_mod=None) -> int:
+    """编排中途失败后，强制让机器人回 HOME 再允许进入下一轮。
+
+    为什么必须有
+    ------------
+    task_queue 是「顺序执行、失败即 abort」：任何一块失败（比如 block 7
+    insert 的悬空对齐超限），后面的 block 8（抬离）和 block 9
+    （FSM HOME → HOLD）都**不会执行**。机器人就停在半空，而 `sdg.sh auto`
+    立刻开下一轮 → 下一轮首帧是半空姿态 → 抓取失败 → 连锁失败。
+
+    实测（G1，2026-11-19，run_004/005 失败后）：
+      - 下一轮首帧手臂 |q| 均值 849 mrad（正常 home 57 mrad）
+      - pack 的 FK 反解 base 跟着偏，末端动作标签错 175~185mm
+
+    现在 fk.py 已改成用首帧真实关节角反解（那种情况下标签也准），但
+    「从半空姿态开始动作」本身依然会让抓取失败，所以恢复归位仍然必要。
+
+    设计取舍：只在编排**非用户中断**失败时跑。rc==130 是用户 Ctrl+C，
+    此时不应再拉起一个子进程去动机器人。
+    """
+    if motion_launch_mod is None:
+        from fasim.replicator.sdg import motion_launch as motion_launch_mod
+
+    _log(f"   [恢复] 编排失败 → 跑 {HOME_ONLY_TASK}（FSM HOME → HOLD），"
+         "保证下一轮从归位姿态开始")
+    rc = motion_launch_mod.run_motion(
+        robot_key=robot_key,
+        task_key=HOME_ONLY_TASK,
+        scene=scene,
+        background=False,
+    )
+    if rc == 0:
+        _log("   [恢复] 已归位")
+    else:
+        _log(f"   [恢复] WARN 归位任务退出码 {rc}；下一轮可能从非 home 姿态开始")
+    return rc
+
+
+
 def stop_capture() -> tuple[bool, dict]:
     """结束采集。返回 (ok, 结果)。"""
     resp = _request({"cmd": "stop"}, timeout=DEFAULT_TIMEOUT_STOP)
@@ -703,6 +747,11 @@ def run_round(
     summary["motion_rc"] = rc
     if rc != 0:
         _log(f"   WARN 编排退出码 {rc}（可能超时/中断，但仍会收尾保存数据）")
+    # **不要用 rc 判断编排是否成功**：motion-generation 的 runner.py 是
+    #   except Exception as err: print(f"[ERROR] Task queue failed: {err}")
+    # 把异常吞掉后正常返回，所以任务队列失败时进程退出码仍是 0
+    # （实测 run_011：日志有 [ERROR] Task queue failed，但 motion_rc=0）。
+    # 真正的判据是采集端的完成检测（stop_reason），见下面的 5b。
 
     # ---- 5. 结束采集 ----
     _log("[5/5] 结束采集")
@@ -715,6 +764,39 @@ def run_round(
     summary["frames"] = stop_resp.get("frames_saved", 0)
     summary["stop_reason"] = stop_resp.get("stop_reason", "")
     summary["done"] = stop_resp.get("done")
+
+    # ---- 任务是否真的完成 ----
+    # 完成检测命中 → stop_reason=task_completed（与 stop_on_complete 无关，
+    # 那个开关只控制"要不要提前停采集"）。没命中就是 manual / max_frames。
+    task_done = str(summary.get("stop_reason") or "")
+    has_done_detector = bool((ctx.get("cfg") is not None)
+                             and getattr(ctx["cfg"], "done_when", None))
+    if has_done_detector:
+        task_ok = (task_done == "task_completed")
+    else:
+        # 没配 done_when 的任务只能信退出码（否则会把所有轮都判失败）。
+        task_ok = (rc == 0)
+    summary["task_done"] = task_done
+
+    # ---- 5b. 失败后归位（保证下一轮从 home 开始） ----
+    # 失败即 abort 的 task_queue 不会执行最后一块 FSM HOME，机器人停在半空。
+    # 不归位的话，下一轮从半空/扭曲姿态起步，几乎必然再失败（连锁失败）。
+    #
+    # 触发条件用「任务没完成」而不是退出码（理由见第 4 步的注释）：
+    #   - 成功轮不做多余的 6s 归位
+    #   - rc==130 是用户 Ctrl+C —— 用户要停，不要再去动机器人
+    #   - 必须在 stop_capture() 之后，否则这 6s 的 HOME 插值会被录进本轮数据
+    need_recovery = (not task_ok) and rc != 130
+    if need_recovery:
+        if summary["frames"] <= 0:
+            _log("   本轮没采到帧，跳过归位（多半是采集没起来，先查 Isaac）")
+        else:
+            summary["recover_rc"] = recover_home(robot_key, task_key, scene=scene)
+
+    summary["task_success"] = bool(summary["frames"] > 0 and task_ok)
+    if summary["frames"] > 0 and not task_ok:
+        _log(f"   判为失败轮（stop_reason={task_done or '?'}）"
+             "—— 不导出、不参与批量导出")
     # RTF：墙钟每秒物理步数。**逐轮下降是长跑的主要问题**（实测 5 轮 -33%），
     # 记下来便于在汇总/提醒里观察劣化趋势。
     summary["rtf_hz"] = stop_resp.get("physics_hz_wall")
@@ -732,7 +814,8 @@ def run_round(
                 tail_sec=tail_sec,
                 do_trim=do_trim,
                 do_pack=do_pack,
-                do_export=do_export,
+                # 失败轮仍然 trim + pack（episode.npz 留着复盘），但不导 LeRobot。
+                do_export=(do_export and task_ok),
                 prune_keep=prune_keep,
                 robot_type=robot_type or robot_key,
             )
@@ -743,6 +826,13 @@ def run_round(
     else:
         _log("WARN 一帧都没采到 —— 检查 Isaac 的 timeline 是否 PLAY")
 
+    # ---- 结束判定 ----
+    # 两个概念，别混：
+    #   task_success : 任务几何上真的完成了（试管插进孔里）→ 闸门是"要不要导出"
+    #   ok           : 这一轮采到了可用数据（基础设施正常）
+    #                  → auto 循环的重试/stop_on_fail 用它
+    # 若把 task_success 直接当 ok，一旦某轮没插好就会被 stop_on_fail 判成
+    # "环境坏了"并中止整个批次 —— 实测失败率 30~50%，那样根本跑不完 10 轮。
     summary["ok"] = summary["frames"] > 0
     summary["elapsed_sec"] = round(time.monotonic() - t0, 1)
     return summary
@@ -820,6 +910,8 @@ def run_batch(
         r["attempts"] = attempt + 1
         results.append(r)
         tag = "OK" if r.get("ok") else f"失败@{r.get('failed_at')}"
+        if r.get("ok") and r.get("task_success") is False:
+            tag = f"任务失败(stop_reason={r.get('task_done') or '?'})"
         _log(f"第 {i + 1} 轮结束: {tag}，用时 {r.get('elapsed_sec', 0)}s"
              + (f"（重试 {attempt} 次）" if attempt else ""))
         if not r.get("ok") and stop_on_fail:
@@ -856,14 +948,34 @@ def run_batch(
     # 代价：攒着期间每轮占约 5G。导出成功后立刻清理（每包留 prune_keep 帧）。
     # --no-export 只关 LeRobot。每轮的 trim / pack（episode.npz）不受影响。
     if do_export and batch_export and prune_keep >= 0:
+        # 只导**任务真的成功**的轮次。采到帧但没插进孔的数据训练价值为负：
+        # 动作分布里混进大量「抓空/插偏后乱动」的片段。
         ok_sessions = [r["out_dir"] for r in results
-                       if r.get("ok") and r.get("out_dir")
+                       if r.get("ok") and r.get("task_success", True)
+                       and r.get("out_dir")
                        and Path(r["out_dir"], "frames").is_dir()]
+        skipped = [r for r in results
+                   if r.get("ok") and r.get("task_success") is False]
+        if skipped:
+            _log(f"   跳过 {len(skipped)} 轮失败数据（不参与导出）："
+                 + ", ".join(Path(r["out_dir"]).name for r in skipped))
         if ok_sessions:
             _log("=" * 62)
             _log(f"批量导出：{len(ok_sessions)} 轮 → 一个 LeRobot 数据集")
             _log("=" * 62)
-            ds_name = f"{task_key}_{len(ok_sessions)}eps"
+            # 数据集名必须带机器人前缀。
+            #
+            # 【2026-11-19】原来只写 f"{task_key}_{N}eps"，两台机器人跑同一个
+            # 任务（G1 与 G1D 都是 sinopec_test_tube）时会导出到**同一个目录**
+            # → 后一次把前一次覆盖掉，或者两者被误合并。
+            #
+            # 目录布局也随之对齐 raw 数据的 <robot>/<task> 两级：
+            #   ~/lerobot_datasets/<robot>_<task>_<N>eps
+            # 例如 unitree_g1_sinopec_test_tube_10eps /
+            #      unitree_g1d_sinopec_test_tube_10eps
+            #
+            # 回退：把下面两行换回 ds_name = f"{task_key}_{len(ok_sessions)}eps"
+            ds_name = f"{robot_key}_{task_key}_{len(ok_sessions)}eps"
             be = export_rounds_as_one_dataset(
                 ok_sessions,
                 ds_name,

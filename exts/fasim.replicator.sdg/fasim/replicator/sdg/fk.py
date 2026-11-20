@@ -448,22 +448,173 @@ class TcpFK:
             res[side] = (T[:3, 3], _rot_to_wxyz(T[:3, :3]))
         return res
 
+    def tcp_poses_with_base(
+        self,
+        joint_pos: np.ndarray,
+        joint_names: list[str],
+        base_track: tuple[np.ndarray, np.ndarray],
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """用**逐帧** ``world_from_base`` 算 tcp 位姿。
+
+        与 :meth:`tcp_poses` 的唯一区别是基座位姿每帧不同。见
+        :meth:`solve_base_track` 的说明：G1 的基座会随站立策略摆动
+        10~17mm / 1.8~2.4°，把基座冻结在首帧会给世界系末端标签引入
+        mean≈12mm、max≈47mm 的系统误差。
+
+        Args:
+            joint_pos: ``(N, J)`` 关节角。
+            joint_names: 对应 J 列的名字。
+            base_track: ``(base_t (N,3), base_R (N,3,3))``，来自
+                :meth:`solve_base_track`。
+
+        Returns:
+            ``{side: (pos (N,3), quat_wxyz (N,4))}``。
+        """
+        q = np.asarray(joint_pos, dtype=np.float64)
+        cols = self.map_from_joint_names(joint_names)
+        bt, bR = base_track
+        bt = np.asarray(bt, dtype=np.float64)
+        bR = np.asarray(bR, dtype=np.float64)
+        n = q.shape[0]
+        out: dict[str, tuple[np.ndarray, np.ndarray]] = {
+            s: (np.full((n, 3), np.nan), np.full((n, 4), np.nan))
+            for s in self.ee_frames
+        }
+        # 保存/恢复，避免改动调用方依赖的 self.base_*
+        saved = (self.base_t, self.base_R)
+        try:
+            for i in range(min(n, len(bt))):
+                row = q[i][cols]
+                if not np.all(np.isfinite(row)):
+                    continue
+                T_wb = _homogeneous(bR[i], bt[i])
+                for side in self.ee_frames:
+                    T = T_wb @ self._chain_fk(side, row)
+                    out[side][0][i] = T[:3, 3]
+                    out[side][1][i] = _rot_to_wxyz(T[:3, :3])
+        finally:
+            self.base_t, self.base_R = saved
+        return out
+
+    # ------------------------------------------------------------ base 反解
+
+    def solve_base_track(
+        self,
+        rec_pos: dict[str, np.ndarray],
+        rec_quat: dict[str, np.ndarray] | None,
+        joint_pos: np.ndarray,
+        joint_names: list[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """**逐帧**反解 ``world_from_base``，返回 ``(base_t (N,3), base_R (N,3,3))``。
+
+        为什么需要
+        ----------
+        基座不是静止的：G1 用宇树站立策略，pelvis 每帧都在小幅摆动。实测
+        （G1，2026-11-19，run_002/003/006）：
+
+            pelvis 平移摆动  13.9 ~ 17.2 mm
+            pelvis 旋转摆动   1.78 ~ 2.38 °
+
+        把基座冻结在第 0 帧，会让世界系末端**指令**标签产生
+        mean≈12mm、max≈47mm 的系统误差（≈ 摆动量 + 力臂 × 旋转量）。
+        这个量级已经超过插孔的容差（±5mm），会直接让策略学不准。
+
+        实测对比（FK(joint_pos_cmd) 与实测末端的距离，就是标签误差）：
+
+            固定基座   mean 8.6~16.8mm   max 26~47mm   ← 改前
+            逐帧基座   mean 2.7~ 3.4mm   max 18~26mm   ← 改后
+
+        剩下那 ~3mm 才是真正的关节跟踪误差。
+
+        输入：**实测**末端位姿 + **实测**关节角（每帧都用自己那一帧的）。
+        输出：该帧的基座位姿。用它去变换**指令**关节角是自洽的 —— 基座是
+        机器人整体的属性，与手臂发的是 cmd 还是实测无关。
+
+        实现：直接复用 :meth:`solve_base_from_rest`（左右手各解一次再平均）。
+        测量来源是 PhysX 刚体直读，噪声极小，无需额外平滑。单帧反解失败
+        （NaN）时，沿用上一个有效基座。
+
+        Args:
+            rec_pos: ``{side: (N,3)}`` 实测末端位置。
+            rec_quat: ``{side: (N,4)}`` 实测末端四元数 xyzw；可缺省。
+            joint_pos: ``(N, J)`` 实测关节角。
+            joint_names: 对应 J 列的名字。
+
+        Returns:
+            ``(base_t, base_R)``，长度 N。
+        """
+        q = np.asarray(joint_pos, dtype=np.float64)
+        n = q.shape[0]
+        bt = np.full((n, 3), np.nan)
+        bR = np.full((n, 3, 3), np.nan)
+        for i in range(n):
+            pos_i = {s: p[i] for s, p in rec_pos.items() if np.all(np.isfinite(p[i]))}
+            quat_i = None
+            if rec_quat:
+                quat_i = {s: c[i] for s, c in rec_quat.items()
+                          if s in pos_i and np.all(np.isfinite(c[i]))}
+                quat_i = quat_i or None
+            if not pos_i:
+                continue
+            try:
+                t_i, R_i = self.solve_base_from_rest(
+                    pos_i, quat_i,
+                    rest_joint_pos=q[i],
+                    rest_joint_names=joint_names,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if not (np.all(np.isfinite(t_i)) and np.all(np.isfinite(R_i))):
+                continue
+            bt[i] = t_i
+            bR[i] = R_i
+
+        # NaN 帧用**前一个**有效基座补齐；开头没有前值时用第一个有效值。
+        valid = np.isfinite(bt).all(axis=1) & np.isfinite(bR).all(axis=(1, 2))
+        if not valid.any():
+            raise ValueError("逐帧基座反解全部失败：实测末端位姿缺失或不可用")
+        first = int(np.argmax(valid))
+        src = np.maximum.accumulate(np.where(valid, np.arange(n), -1))
+        src = np.where(src < 0, first, src).astype(np.int64)
+        return bt[src], bR[src]
+
+
     # ------------------------------------------------------------ base 反解
 
     def solve_base_from_rest(
         self,
         rest_pos: dict[str, np.ndarray],
         rest_quat: dict[str, np.ndarray] | None = None,
+        rest_joint_pos: np.ndarray | None = None,
+        rest_joint_names: list[str] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """用静止姿态（q≈0）的 tcp 世界位姿反解 ``world_from_base``。
+        """用参考帧的 tcp 世界位姿反解 ``world_from_base``。
 
-        机器人上电时关节角全 ~0，tcp 相对 base 是固定几何量，所以一帧静止
-        姿态就够。左右手各解一次再平均，抵消单侧噪声。
+        原理：tcp 相对 base 是关节角的确定函数，所以只要知道参考帧的
+        **关节角**和**实测 tcp 世界位姿**，就能解出 ``world_from_base``。
+        左右手各解一次再平均，抵消单侧噪声。
+
+        参数 ``rest_joint_pos`` / ``rest_joint_names``
+        ------------------------------------------------
+        参考帧的关节角。**强烈建议传**（对应参考帧的第一行）。
+
+        不传时退化成「假定参考帧 q≈0」——这是早期假设，只在机器人上电静止
+        （关节确实全 0）时成立。一旦参考帧不是零位就会解错 base：
+
+        - 抓试管这种任务是 FSM HOME 姿态（G1 的 ``home_1`` 里
+          ``shoulder_roll=0.2``），本来就**不是零位**，实测末端标签偏
+          ~16mm（G1D 只有 7mm，因为它的 home 更接近零位）。
+        - 采集失败后没回 HOME 就开始下一轮时，参考帧手臂在 0.85rad 左右，
+          base 直接解偏 0.4m，末端标签整体错 175~185mm —— 数据全废。
+
+        传了关节角后上面两种情况都只是「精确解」，与 home 姿态无关。
 
         Returns:
             ``(base_t, base_R)``，同时写回 ``self``。
         """
         q0 = np.zeros(len(self.joint_order))
+        if rest_joint_pos is not None:
+            q0 = self._coerce_rest_joint_pos(rest_joint_pos, rest_joint_names)
         fk0 = {}
         for side in self.ee_frames:
             T = self._chain_fk(side, q0)
@@ -501,6 +652,35 @@ class TcpFK:
         self.base_R = R_wb
         self.base_t = np.mean(np.stack(diffs), axis=0)
         return self.base_t, self.base_R
+
+    def _coerce_rest_joint_pos(
+        self,
+        rest_joint_pos: np.ndarray,
+        rest_joint_names: list[str] | None,
+    ) -> np.ndarray:
+        """把参考帧关节角整理成 ``self.joint_order`` 顺序的 1-D 向量。
+
+        接受 (D,) 或 (T,D)（取第一行），并按名字重排；没有名字时按
+        ``self.joint_order`` 的前 N 个位置直取（与 pack 的 joint_pos 列序一致
+        的前提是同一个 URDF，风险可接受，但不传名字会在长度不符时报错）。
+        """
+        vals = np.asarray(rest_joint_pos, dtype=np.float64)
+        if vals.ndim > 1:
+            vals = vals.reshape(vals.shape[0], -1)[0]
+        vals = vals.reshape(-1)
+        if rest_joint_names:
+            idx = self.map_from_joint_names([str(n) for n in rest_joint_names])
+            if idx.max(initial=-1) >= vals.size:
+                raise ValueError(
+                    f"参考帧关节角只有 {vals.size} 维，但 URDF 需要第 {int(idx.max())} 列"
+                )
+            return vals[idx]
+        if vals.size < len(self.joint_order):
+            raise ValueError(
+                f"参考帧关节角只有 {vals.size} 维，URDF 需要 {len(self.joint_order)} 维；"
+                "请一起传 rest_joint_names，或检查 joint_pos 的列顺序"
+            )
+        return vals[: len(self.joint_order)]
 
     # ------------------------------------------------------------ 自检
 
@@ -566,6 +746,14 @@ def _wxyz_to_rot(q: np.ndarray) -> np.ndarray:
     ])
 
 
+def rotations_to_wxyz(Rs: np.ndarray) -> np.ndarray:
+    """``(N,3,3)`` 旋转 → ``(N,4)`` 四元数（wxyz）。供记录逐帧基座位姿用。"""
+    R = np.asarray(Rs, dtype=np.float64)
+    if R.ndim == 2:
+        return _rot_to_wxyz(R)
+    return np.stack([_rot_to_wxyz(r) for r in R])
+
+
 def _rot_to_wxyz(R: np.ndarray) -> np.ndarray:
     R = np.asarray(R, dtype=np.float64)
     tr = R[0, 0] + R[1, 1] + R[2, 2]
@@ -612,14 +800,28 @@ def analyze_episode(path: str | Path, urdf_path: str | Path | None = None) -> di
     rec = {s: z[f"{s}_pos"] for s in fk.ee_frames if f"{s}_pos" in z.files}
     recq = {s: z[f"{s}_quat"] for s in fk.ee_frames if f"{s}_quat" in z.files}
     base_src = "unset"
+    base_track = None
     if rec:
-        fk.solve_base_from_rest(
-            {s: p[0] for s, p in rec.items()},
-            {s: v[0] for s, v in recq.items()} if recq else None,
-        )
-        base_src = "录制静止帧"
+        # 逐帧基座：G1 的 pelvis 会随站立策略摆动 13~17mm，冻结首帧会污染
+        # 世界系末端（详见 solve_base_track）。诊断口径也应当与 pack 一致。
+        try:
+            base_track = fk.solve_base_track(rec, recq or None, q, names)
+            fk.base_t, fk.base_R = base_track[0][0], base_track[1][0]
+            base_src = "录制帧逐帧反解"
+        except Exception:  # noqa: BLE001
+            fk.solve_base_from_rest(
+                {s: p[0] for s, p in rec.items()},
+                {s: v[0] for s, v in recq.items()} if recq else None,
+                rest_joint_pos=q[0],
+                rest_joint_names=names,
+            )
+            base_src = "录制静止帧"
 
-    poses = fk.tcp_poses(q, names, to_world=True)
+    poses = (
+        fk.tcp_poses_with_base(q, names, base_track)
+        if base_track is not None
+        else fk.tcp_poses(q, names, to_world=True)
+    )
     out: dict[str, Any] = {
         "episode": str(path),
         "frames": int(q.shape[0]),
@@ -666,17 +868,31 @@ def compute_cmd_poses(
     fk = TcpFK(urdf_path)
     names = [str(x) for x in z["joint_names"]]
     q_cmd = np.asarray(z["joint_pos_cmd"], dtype=np.float64)
+    q_meas = np.asarray(z["joint_pos"], dtype=np.float64)
 
     if to_world:
         rest: dict[str, np.ndarray] = {}
         restq: dict[str, np.ndarray] = {}
+        full: dict[str, np.ndarray] = {}
+        fullq: dict[str, np.ndarray] = {}
         for side in fk.ee_frames:
             if f"{side}_pos" in z.files:
                 rest[side] = z[f"{side}_pos"][0]
+                full[side] = np.asarray(z[f"{side}_pos"])
                 if f"{side}_quat" in z.files:
                     restq[side] = z[f"{side}_quat"][0]
+                    fullq[side] = np.asarray(z[f"{side}_quat"])
         if rest:
-            fk.solve_base_from_rest(rest, restq or None)
+            # 逐帧基座（与 pack 口径一致）。失败时退回首帧固定基座。
+            try:
+                bt, bR = fk.solve_base_track(full, fullq or None, q_meas, names)
+                return fk.tcp_poses_with_base(q_cmd, names, (bt, bR))
+            except Exception:  # noqa: BLE001
+                fk.solve_base_from_rest(
+                    rest, restq or None,
+                    rest_joint_pos=q_meas[0],
+                    rest_joint_names=names,
+                )
 
     return fk.tcp_poses(q_cmd, names, to_world=to_world)
 
@@ -714,7 +930,11 @@ def compare_replay(
                 if f"{side}_quat" in ep.files:
                     restq[side] = ep[f"{side}_quat"][0]
         if rest:
-            fk.solve_base_from_rest(rest, restq or None)
+            fk.solve_base_from_rest(
+                rest, restq or None,
+                rest_joint_pos=np.asarray(ep["joint_pos"], dtype=np.float64)[0],
+                rest_joint_names=[str(x) for x in ep["joint_names"]],
+            )
             base_src = "录制静止帧"
 
     tgt_pose = fk.tcp_poses(target, dof_names, to_world=True)

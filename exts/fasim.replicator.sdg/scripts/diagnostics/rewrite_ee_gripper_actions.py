@@ -141,8 +141,23 @@ def actions_from_joint_fk(ds: Path) -> np.ndarray:
         "left": ee[0, 3:7].copy(),
         "right": ee[0, 10:14].copy(),
     }
-    fk.solve_base_from_rest(rest_pos, rest_quat)
-    poses = fk.tcp_poses(q, names, to_world=True)
+    # 逐帧基座（与 pack 口径一致）：基座会摆动，冻结首帧会让世界系末端指令
+    # 偏 mean≈12mm / max≈47mm。ee 列本身是实测末端（14 维），可直接逐帧反解。
+    poses = None
+    try:
+        bt, bR = fk.solve_base_track(
+            {"left": ee[:, 0:3], "right": ee[:, 7:10]},
+            {"left": ee[:, 3:7], "right": ee[:, 10:14]},
+            q,
+            names,
+        )
+        poses = fk.tcp_poses_with_base(q, names, (bt, bR))
+    except Exception as exc:  # noqa: BLE001
+        _log(f"  WARN 逐帧基座反解失败，退回首帧固定基座: {exc}")
+    if poses is None:
+        fk.solve_base_from_rest(rest_pos, rest_quat,
+                                rest_joint_pos=q[0], rest_joint_names=names)
+        poses = fk.tcp_poses(q, names, to_world=True)
 
     with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -184,15 +199,29 @@ def validate_fk_against_run046() -> None:
     names = [str(x) for x in z["joint_names"]]
     rest_pos = {"left": np.asarray(z["left_pos"][0]), "right": np.asarray(z["right_pos"][0])}
     rest_quat = {"left": np.asarray(z["left_quat"][0]), "right": np.asarray(z["right_quat"][0])}
-    fk.solve_base_from_rest(rest_pos, rest_quat)
+    # 用首帧真实关节角反解 base（与 rewrite_run_042_actions 一致）。
+    # 旧版假定首帧 q≈0，对 home 姿态会系统性偏 10~16mm。
+    fk.solve_base_from_rest(
+        rest_pos, rest_quat,
+        rest_joint_pos=np.asarray(z["joint_pos"], dtype=np.float64)[0],
+        rest_joint_names=names,
+    )
+
+    # 真值校验：FK(实测关节角) 必须复现实测末端位姿。
+    # 这条与 episode 里存的 *_cmd_pos 无关，所以不受 base 解算口径变化影响。
+    meas = fk.tcp_poses(np.asarray(z["joint_pos"], dtype=np.float64), names, to_world=True)
+    m_err = float(np.nanmax(np.linalg.norm(meas["left"][0] - np.asarray(z["left_pos"]), axis=1))) * 1000
+    m_err_r = float(np.nanmax(np.linalg.norm(meas["right"][0] - np.asarray(z["right_pos"]), axis=1))) * 1000
+    _log(f"FK 真值校验 run_046：左 {m_err:.2f}mm / 右 {m_err_r:.2f}mm（轴关节长链，>20mm 视为异常）")
+    if max(m_err, m_err_r) > 20.0:
+        raise RuntimeError(f"FK 复现实测末端差 {max(m_err, m_err_r):.2f}mm，停止")
+
+    # 与历史（q≈0 口径）存的 cmd 位姿对拍：口径变了，只能看量级，不能当断言。
     poses = fk.tcp_poses(np.asarray(z["joint_pos_cmd"]), names, to_world=True)
     err = np.linalg.norm(poses["left"][0] - np.asarray(z["left_cmd_pos"]), axis=1)
     err_r = np.linalg.norm(poses["right"][0] - np.asarray(z["right_cmd_pos"]), axis=1)
-    worst = float(max(np.nanmax(err), np.nanmax(err_r))) * 1000
-    _log(f"FK 对拍 run_046：左 {np.nanmean(err)*1000:.3f}mm / 右 {np.nanmean(err_r)*1000:.3f}mm"
-         f"（最大 {worst:.3f}mm）")
-    if worst > 1.0:
-        raise RuntimeError(f"FK 与 episode.npz 的 cmd 位姿差 {worst:.2f}mm，停止")
+    _log(f"  （相对旧口径 *_cmd_pos：左 {np.nanmean(err)*1000:.2f}mm / 右 {np.nanmean(err_r)*1000:.2f}mm "
+         f"—— 差异来自 base 解算口径修正，属预期）")
 
 
 def _replace_action_column(table: pa.Table, actions: np.ndarray) -> pa.Table:
