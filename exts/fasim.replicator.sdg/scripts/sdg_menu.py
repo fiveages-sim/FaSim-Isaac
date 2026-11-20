@@ -1134,11 +1134,18 @@ def main() -> int:
 
     robot = state.get("robot")
     task = state.get("task")
-    if not (robot and task):
-        robot, task = choose_context(state)
-    else:
-        show_context(robot, task)
-        print(f"{DIM}  （要换机器人/任务：主菜单选「切换机器人/任务」）{NC}")
+    # 每次启动都先确认上下文。
+    #
+    # 为什么不再"记住后直接进主菜单"：
+    #   先选上下文、再选功能，否则用户会在一堆功能选项里凭印象点，
+    #   很容易在上一台机器人（比如刚测完的 G1D）上误执行采集 ——
+    #   采到一半才发现机器人不对，数据白采。
+    # 上下文本身仍会记住：choose_context 把上次的选择排在默认位并标 (上次)，
+    # 回车即沿用，多按一次回车的成本换来不会选错机器人。
+    if robot and task:
+        print(f"{DIM}  上次用过 {robot} / {task}（回车沿用）{NC}")
+    robot, task = choose_context(state)
+    show_context(robot, task)
 
     while True:
         print()

@@ -580,6 +580,33 @@ cleanup_zenoh() {
     fi
 }
 
+# rmw_zenoh 的 router 固定监听 7447，一台机器只能有一个。
+#
+# 为什么需要检测：router 是用 setsid 起的（为了 Ctrl+C 时不被信号打断），
+# 代价是它会脱离终端并挂到 systemd --user 下。cleanup_zenoh 只在 run.sh
+# 正常退出（EXIT/INT/TERM）时触发；如果 run.sh 被 kill -9、终端被直接关掉、
+# 或机器休眠后会话被回收，trap 不执行，router 就变成孤儿常驻。
+# 下一次 ./run.sh 再起一个，就会因为 7447 被占用而报
+#   "Can not create a new TCP listener bound to tcp/[::]:7447:
+#    Address already in use (os error 98)"
+# 然后 Isaac 侧所有 ROS 桥都连不上。
+#
+# 检测到已占用时的策略是**复用**而不是报错：本机所有 rmw_zenoh 进程本来就
+# 应该共用一个 router，复用不会改变语义；而且这样 run.sh 变成可重入的。
+# 复用的 router 不归本次 run.sh 所有，退出时不能杀（ZENOH_PID 留空）。
+zenoh_router_running() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -qE '(:|\]:)7447[[:space:]]'
+        return $?
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:7447 -sTCP:LISTEN >/dev/null 2>&1
+        return $?
+    fi
+    # 没有检测工具时按"没占用"处理，让 ros2 run 自己报错。
+    return 1
+}
+
 apply_streaming_isolation() {
     local signal_port stream_port domain_id
     signal_port=$((STREAM_SIGNAL_PORT_BASE + FA_SIM_INSTANCE * STREAM_PORT_STEP))
@@ -713,12 +740,20 @@ set_cpu_performance
 source_ros_workspaces
 
 if [ "${RMW_IMPLEMENTATION:-}" = "rmw_zenoh_cpp" ]; then
-    print_info "检测到 RMW_IMPLEMENTATION=rmw_zenoh_cpp，启动 Zenoh router..."
-    setsid ros2 run rmw_zenoh_cpp rmw_zenohd &
-    ZENOH_PID=$!
-    print_info "Zenoh router 已在后台启动（进程组 PID: $ZENOH_PID）"
-    trap cleanup_zenoh EXIT INT TERM
-    sleep 1
+    if zenoh_router_running; then
+        print_warn "Zenoh router 端口 7447 已被占用 —— 复用现有 router，不再启动新的"
+        print_warn "  若确认是上次异常退出的残留，先清理再重启："
+        print_warn "    pkill -9 -f 'rmw_zenoh_cpp/rmw_zenohd'"
+        print_warn "  本次退出时不会停止它（不是本进程启动的）"
+        ZENOH_PID=""
+    else
+        print_info "检测到 RMW_IMPLEMENTATION=rmw_zenoh_cpp，启动 Zenoh router..."
+        setsid ros2 run rmw_zenoh_cpp rmw_zenohd &
+        ZENOH_PID=$!
+        print_info "Zenoh router 已在后台启动（进程组 PID: $ZENOH_PID）"
+        trap cleanup_zenoh EXIT INT TERM
+        sleep 1
+    fi
 else
     print_warn "当前未使用 rmw_zenoh_cpp（RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-未设置}）"
 fi
