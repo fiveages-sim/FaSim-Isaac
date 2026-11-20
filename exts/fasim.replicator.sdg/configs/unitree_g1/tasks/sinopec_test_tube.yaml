@@ -1,0 +1,168 @@
+# Unitree G1 + Sinopec 试管抓取 —— 任务级配置
+#
+# 场景：FaSim-Isaac environment/fa-project-usd/Sinopec/2026-10 Test Tube Picking/env/G1/room.usda
+# 三个相机：头部 + 左右手腕
+#
+# 与 G1D 的任务**完全相同**（同一场景模板、同一物体、同一完成判据），
+# 差异只在机器人相关的四处：scene_usda、variant_selection、相机 prim 前缀、
+# 以及 G1 多一个腿部站立策略、所以 articulation 在 pelvis。
+#
+# 所有判据/阈值/随机化参数的理由见 unitree_g1d/tasks/sinopec_test_tube.yaml
+# 的详细注释，这里只标出与 G1D 不同的地方，避免重复。
+
+task_key: sinopec_test_tube
+
+# 相对 FaSim-Isaac 仓库根目录；也可写绝对路径
+scene_usda: environment/fa-project-usd/Sinopec/2026-10 Test Tube Picking/env/G1/room.usda
+
+# 打开场景后要切的 variant
+#
+# 与 G1D 的差别：
+#   - G1D 用 Camera=enable 控制相机发布，ROS/EE_* 控制运控与末端
+#   - G1 原本**没有 Camera 变体**（2026-11-19 接入时补上，见
+#     G1/payloads/Camera/），现在两者结构一致
+#   - G1 的 Robot=robot 让 robotJoints/robotLinks 关系指向 pelvis 起的
+#     articulation（与 G1D 指向机器人 Xform 不同）
+variant_selection:
+  ROS: fiveages
+  Camera: enable
+  EE_Left: dex1
+  EE_Right: dex1
+  Sensor: sensors
+  Robot: robot
+
+# 需要记录位姿的物体（只录会被机器人移动的刚体）
+#
+# 与 G1D 完全相同的 prim 路径 —— 两个场景都 payload
+# environment/fa-project-usd/.../scene/room.usda，物体在 /World/room/scene 下。
+tracked_prims:
+  test_tube: /World/room/scene/test_tube
+  test_tube_rack: /World/room/scene/test_tube_rack
+  test_tube_rack_01: /World/room/scene/test_tube_rack_01
+
+# ---------------------------------------------------------------------------
+# 运行时物体随机化
+# ---------------------------------------------------------------------------
+# 每轮采集前：物体先恢复到初始快照位姿，再叠加随机偏移。
+#
+# 参数与 G1D 完全相同 —— 随机量是「架子平动 + 试管按 place_on 跟到孔里」，
+# 与机器人无关。可行性验证：./scripts/sdg.sh randomize-check
+randomize:
+  seed: 0                 # 0 = 每次用时间戳
+  settle_steps: 60        # 200Hz 下 60 步 = 0.3s，够物体落稳
+  verify_tol_m: 0.05
+  objects:
+    # ① 右手边的架子（试管初始放在这个架子上）
+    - prim: /World/room/scene/test_tube_rack_01
+      axes: {x: 0.02, y: 0.03}
+    # ② 左手边的空架子（任务终点：试管被插在这里）
+    - prim: /World/room/scene/test_tube_rack
+      axes: {x: 0.02, y: 0.03}
+    # ③ 试管：精确放进 01 号架的 hole_4
+    #
+    # 用 place_on（不是 follow）：任务结束时试管已被拿走/插到另一只架子上，
+    # 「按当前相对位置平移」还原不出「在孔里」这个状态。实现是「快照相对偏移」：
+    #   试管目标位姿 = rack_01 当前位姿 + (试管快照 − rack_01 快照)
+    # 顺序天然正确：place_on 在 axes 之后执行。
+    - prim: /World/room/scene/test_tube
+      place_on:
+        target: /World/room/scene/test_tube_rack_01
+        frame: hole_4
+        offset: [0.0, 0.0, 0.0]
+
+# ---------------------------------------------------------------------------
+# 任务完成判据
+# ---------------------------------------------------------------------------
+# 采集期间逐帧判断「试管是不是已经插进左侧架子的 hole_3」，写进 session.json
+# 的 stop_reason / done 字段。判据与 G1D 相同（任务与孔位完全相同）：
+#   ① xy 水平距离 < xy_tol_m      ② dz <= dz_inside_mm      ③ tilt < max_tilt_deg
+# 三条同时连续 N 帧才算完成。
+done_when:
+  object: test_tube
+  rack: test_tube_rack
+  hole_offset: [-0.021, -0.010, 0.110]   # hole_3 在 rack 局部系（资产常量）
+  xy_tol_m: 0.025                        # 只用于排除「别的孔」，非精度要求
+  dz_inside_mm: -60.0                    # 试管中心相对孔底的高度上限
+  max_tilt_deg: 30.0                     # 倾角上限（识别碰倒/横躺）
+  consecutive_frames: 8                  # 连续 8 帧(0.4s)满足才算，防抖
+  stop_on_complete: false
+
+# ---------------------------------------------------------------------------
+# 相机
+# ---------------------------------------------------------------------------
+# prim 路径：注意根是 /World/G1（G1D 是 /World/G1D），其余层级完全相同 ——
+# 两者共用同一套组件资产（G1_Arms / G1_Body / Dex1）。
+#
+#   头部 d435_link/head_camera —— G1_Body 的 Sensor=sensors 变体提供
+#   手腕 dex1_{left,right}_camera —— Dex1 的 Sensor=camera 变体提供
+#
+# 实测确认（2026-11-19）：三路话题 /head_camera/rgb、/left_hand_camera/rgb、
+# /right_hand_camera/rgb 均在 46~50Hz 发布。
+cameras:
+  - name: head
+    prim: /World/G1/G1_Body/torso_link/d435_link/head_camera
+    resolution: [640, 480]
+    annotators: [rgb, camera_params]
+    depth: true
+
+  - name: wrist_left
+    prim: /World/G1/G1_Arms/left_wrist_yaw_link/left_tcp/Dex1/Geometry/dex1_base_link/dex1_camera_link/dex1_camera_optical_frame/dex1_left_camera
+    resolution: [640, 480]
+    annotators: [rgb, camera_params]
+    depth: true
+
+  - name: wrist_right
+    prim: /World/G1/G1_Arms/right_wrist_yaw_link/right_tcp/Dex1/Geometry/dex1_base_link/dex1_camera_link/dex1_camera_optical_frame/dex1_right_camera
+    resolution: [640, 480]
+    annotators: [rgb, camera_params]
+    depth: true
+
+# ---------------------------------------------------------------------------
+# 输出（与 _default.yaml 的 output.dir 拼接为 <dir>/<robot>/<task>/）
+# ---------------------------------------------------------------------------
+output:
+  # 必须与 runtime.data_root() 一致（默认 ~/fasim_data）！
+  # 若要用别的目录，改这里的同时也要设 FASIM_SDG_DATA 环境变量。
+  dir: /home/fiveages/fasim_data
+
+record:
+  capture_fps: 30
+  # 物理步频（设定值）—— 必须与场景 USD 的 physxScene:timeStepsPerSecond 一致。
+  # G1 的 room.usda 与 G1D 同为 200 Hz（PhysicsScene 已确认），所以 dt=5ms。
+  physics_hz: 200
+  physics_dt: 0.005
+  max_frames: 2000
+
+# ---------------------------------------------------------------------------
+# 采集预设 —— 保证多批次数据格式对齐
+# ---------------------------------------------------------------------------
+# 故意与 G1D 用**同一组名字与参数**：两台机器人采集的数据要能对齐比较，
+# 任何参数差异都会让 capture_profile 的门禁拦下合并。
+capture_presets:
+  # ACT 训练主力：20fps、原分辨率 640x480、全字段
+  act_train:
+    desc: "ACT 训练（20fps / 640x480 / camera+joint+ee+object）"
+    what: [camera, joint, ee, object]
+    camera: all
+    target_fps: 20
+    depth: true
+
+  # 高分辨率
+  act_hires:
+    desc: "ACT 高分辨率（15fps / 1280x720）"
+    what: [camera, joint, ee, object]
+    camera: all
+    target_fps: 15
+    width: 1280
+    height: 720
+    depth: true
+
+  # 快速冒烟：只验证流水线通不通
+  smoke:
+    desc: "冒烟测试（10fps / 320x240 / 无深度）"
+    what: [camera, joint]
+    camera: head
+    target_fps: 10
+    width: 320
+    height: 240
+    depth: false

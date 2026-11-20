@@ -1,0 +1,94 @@
+# Unitree G1 —— 机器人级配置（跨任务复用）
+#
+# 只描述"这台机器人是什么"，不含任何场景/任务信息。
+#
+# 与 G1D 的差别（只列必须改的，其余结构完全相同）：
+#   1. articulation_prim / base_prim：G1 的 ArticulationRoot 在
+#      /World/G1/G1_Lower/pelvis（G1D 在 /World/G1D，即机器人 Xform 本身）。
+#      G1 没有 G1D_Chassis 那种「浮动 hub」，整个 articulation 从 pelvis 起。
+#   2. 没有底盘/里程计：G1 是双腿人形，不需要 base_link 的里程计语义。
+#   3. expected_dof_count：G1 是 29 个关节（14 臂 + 3 腰 + 12 腿），
+#      G1D 是 32（多了 LZ_mt/LZ_it 升降低 + 2 轮）。
+#   4. 腿由外部站立策略驱动，不属于本运控，也不参与 FK/Label。
+
+robot_key: unitree_g1
+
+# articulation（IsaacSimSystem / createArticulationView 的 targetPrim）
+#
+# 注意：**不是** /World/G1。G1 的 PhysicsArticulationRootAPI 打在
+# components/G1_Lower/payloads/Physics/physx.usda 的 pelvis 上
+# （G1D 打在机器人 Xform 上）。必须与 fiveages.usda 里
+# ROS2ControlLaunch.targetPrim、以及 xacro 的 isaac_prim_path 三者一致。
+articulation_prim: /World/G1/G1_Lower/pelvis
+
+# 基座：用于把世界坐标换算到机体系。
+# G1 没有 base_footprint，base_link 就在骨盆（URDF base_link_joint 是 identity）。
+base_prim: /World/G1/G1_Lower/pelvis
+
+# 录制阶段的状态来源。
+# ROS=fiveages 时由进程内 joint_state_broadcaster 发布（不是 /isaac/joint_states）。
+joint_state_topic: /joint_states
+
+# 末端 prim（名义 tcp frame，纯 Xform）
+#
+# 与 G1D 同样的问题：newton kit 关了 PhysX→USD/Fabric 同步，直接读这个 prim
+# 只会得到 authoring 静态值。真正的动态位姿从 ee_links 读。
+ee_prims:
+  left: /World/G1/G1_Arms/left_wrist_yaw_link/left_tcp
+  right: /World/G1/G1_Arms/right_wrist_yaw_link/right_tcp
+
+# 末端位姿的**动态**来源：读父刚体 + 叠固定偏移。
+#
+# tcp 相对手腕的固定变换（unitree_g1_description/xacro/arm.xacro）：
+#     <joint name="${prefix}tcp_joint" type="fixed">
+#         <origin xyz="0.0415 0 0"/>
+#         <parent link="${prefix}wrist_yaw_link"/>
+#         <child link="${prefix}tcp"/>
+#     </joint>
+# 即 tcp 在 wrist_yaw_link 系里沿 +X 平移 41.5mm，无旋转。G1 与 G1D 同构同值。
+ee_links:
+  left:
+    link: /World/G1/G1_Arms/left_wrist_yaw_link
+    offset: [0.0415, 0.0, 0.0]
+  right:
+    link: /World/G1/G1_Arms/right_wrist_yaw_link
+    offset: [0.0415, 0.0, 0.0]
+
+gripper_joints:
+  - left_gripper_joint
+  - right_gripper_joint
+
+# 关节总数（含夹爪），仅用于事后自检（不参与校验，只打日志）。
+#
+# 实测构成（USD physx 变体）：
+#   G1_Lower  12 腿 + waist_yaw + waist_roll        = 14
+#   BodyHead  waist_pitch                            =  1
+#   G1_Arms   左右各 7                               = 14
+#   Dex1      每侧 gripper_joint + gripper_joint1    =  4
+#   合计                                             = 33
+#
+# 注意：SDG 采的是 articulation 的**全部 DOF**（get_dof_positions），
+# 不是 /joint_states 话题子集 —— 后者只发布控制器声明过的关节。
+# 首次 capture 的日志会打印 "关节标签: N 个 DOF"，与这里不一致时以实测为准。
+expected_dof_count: 33
+
+# ---------------------------------------------------------------------------
+# 运动学（只用于「把关节指令角换算成末端指令位姿」）
+# ---------------------------------------------------------------------------
+# 采集只记 joint_pos_cmd，但 EE 回放要发**末端指令位姿**。若直接发实测末端，
+# 运控会再掉一次稳态误差。
+#
+# 迁移到新机器人：
+#   1) 确认运控能跑（缓存目录里有 <robot>/planning_urdf/*.urdf）
+#   2) 改 ee_frames 为运控 .info 里的 eeFrame / eeFrame1
+#   3) 一般不用改 urdf：默认从运控缓存自动找
+planning:
+  # auto = 从运控缓存自动找最新的 planning_urdf（推荐）
+  # G1 的运控（ocs2_arm_controller）会把缓存写到
+  #   /tmp/ocs2_ros2/unitree_g1/planning_urdf/<hash>.urdf
+  urdf: auto
+  cache_dir: ""
+  # 与 G1 的 isaac_waist.info / task.info 里 eeFrame / eeFrame1 一致
+  ee_frames:
+    left: left_tcp
+    right: right_tcp

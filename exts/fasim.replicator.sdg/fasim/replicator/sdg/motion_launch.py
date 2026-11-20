@@ -68,6 +68,7 @@ DEFAULT_REPO = Path.home() / "lerobot_ros2"
 #: 名字不一定相同，所以显式映射。没有映射时按同名处理。
 DEFAULT_MAP: dict[tuple[str, str], tuple[str, str]] = {
     ("unitree_g1d", "sinopec_test_tube"): ("unitree_g1d", "pick_tube_full"),
+    ("unitree_g1", "sinopec_test_tube"): ("unitree_g1", "pick_tube_full"),
 }
 
 
