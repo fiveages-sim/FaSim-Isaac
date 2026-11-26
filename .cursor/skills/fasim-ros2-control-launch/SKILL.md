@@ -37,7 +37,23 @@ the **node + synth + ATM** playbook from G1/G1D bring-up.
 | Pattern | ArtRoot on | `targetPrim` / CM | Synth joint scope | When |
 |---------|------------|------------------|-------------------|------|
 | **W2** | `/FiveAges_W2/base_link` | same (createArticulationView) | node expands to `/FiveAges_W2` | DOFs under sibling `joints/` + arms; nested Head/Torso/EE ArtRoot must be deleted |
+| **TRON2B_DACH** | `/tron2b_dach/Torso/.../base_link` | same | expands to `/tron2b_dach` | Arms are robot-root children `Arm_Left`/`Arm_Right`; EE on each arm |
 | **G1D composite** | `/G1D` (robot Xform) | `/G1D` | same | Stub hub `/G1D/base_link` is Assembler-only — ArtRoot there → `Pattern did not match` |
+
+### EE variant placement (discovery)
+
+`_resolve_ee_launch_types` walks ArtRoot **ancestors** plus
+`{robot_root}/{Left_Arm|Arm_Left}` / `{Right_Arm|Arm_Right}` `EE` — same
+paths W2 already uses; no Body_* special-case in the node.
+
+| Machine class | Put EE where | Variant | Example |
+|---------------|--------------|---------|---------|
+| Dual-arm / swappable arms | Each arm as robot-root child | `EE` | W2 `Left_Arm.EE=Xhand1`; TRON2 `Arm_Left.EE=tron2_gripper` |
+| Fixed-morphology humanoid | Robot root | `EE_Left` / `EE_Right` | G1, G1D, Star1 |
+
+Do **not** put EE on `Body_Upper` (or other Body containers) — ancestor walk
+never sees ArtRoot siblings. Name EE after the **effector** (`tron2_gripper`,
+`RG75`), not the platform SKU (`dach`).
 
 ### W2 / W2R: `Robot` variant == description stem
 
@@ -277,7 +293,7 @@ robots must follow the same `ROS_Clock` pattern — never bind `/clock` to
 - [ ] targetPrim = ArtRoot prim (G1D: /World/G1D; W2: /World/FiveAges_W2/base_link)
 - [ ] mode = full_body | split_body | demo
 - [ ] robot = unitree_g1d / … OR empty + Robot=fiveages_w2|fiveages_w2r (name == package stem)
-- [ ] enableArmsTargetManager; type empty → EE / EE_Left|Right / Left_Arm|Right_Arm EE → 运控 key (PascalCase→lower except CR5 AG2F*)
+- [ ] enableArmsTargetManager; type empty → EE on arms (W2/TRON2) or EE_Left|Right on robot root (G1/Star1) → 运控 key (PascalCase→lower except CR5 AG2F*); never Body_* EE
 - [ ] Physics=physx pinned; ROS=fiveages; PhysX-only PhysicsScene; /clock if useSimTime
 - [ ] `ROS=fiveages` clock node `resetOnStop=1` (sim time restarts on Stop)
 - [ ] `/clock` comes from the on-demand `ROS_Clock` graph (`OnPhysicsStep` → `PublishClock`), **not** `ROS_Control/OnPlaybackTick` (see §4.1)
